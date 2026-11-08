@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper-computer"
+version = "0.0.0"
+description = "computer: connect chat clients (ChatGPT first) to this PC's computer-use MCP server"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+# agent-tools libs are consumed as direct git URLs pinned to one SHA (no registry serves them, and their own agent-tools deps do
+# not resolve transitively, so every needed dist is listed). agenttools-log lives under lib/, the others under lib/<pkg>.
+dependencies = [
+  "agenttools-errors @ git+https://git.hyperide.ai/ultrabricks/agent-tools.git@ab527cc8b040969af8de5939b719905a0569a20c#subdirectory=lib/agenttools_errors",
+]
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/chatgpt-computer-use-plugin"
+
+[project.scripts]
+computer = "computerlib.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff==0.16.10", "pyright>=1.1.400"]
+
+[tool.setuptools.packages.find]
+include = ["computerlib*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs the real machine (COMPUTER_LIVE=1)", "integration: runs real binaries on scratch ports (COMPUTER_INTEGRATION=1)"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py313"
+extend-exclude = ["ci"]
+
+[tool.ruff.lint]
+extend-select = ["E501", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["computerlib", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"

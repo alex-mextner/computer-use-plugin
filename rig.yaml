@@ -1,0 +1,24 @@
+# rig.yaml — repo-level config. Machine-wide installs live in ~/.config/rig/config.yaml.
+# Apply: rig apply commit.  Drift: rig status.
+version: 1
+
+agent_hooks:
+  worktree_only: true
+
+# Issues are GitHub issues of this repo (bare #NNN); gh ship's review gate keys them on this code
+# (written to .ship-config as SHIP_TASK_CODE_PREFIX). Same form as ~/.files/rig.yaml.
+task:
+  code_prefix: CCU
+
+# The private repo cannot run Actions minutes (account billing), so `gh ship` falls back to the local gate in
+# .ship-config. The workflows are still installed/written so the gates run on any runner that is available.
+# The tests/lint/types gate is hand-written in .github/workflows/ci.yml (the rig `tests` slot runs bare pytest without installing
+# the package and its git dependency).
+ci:
+  enabled: true
+  target: .github/workflows
+  all: false
+  items:
+    secret-scan:
+      enabled: true
+      tier: block

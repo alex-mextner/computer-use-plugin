@@ -1,0 +1,5 @@
+# .ship-config — audited, committed knobs for `gh ship` (agent-tools ci/ship/ship.sh).
+# Private repo: Actions minutes are blocked by account billing, so ship detects CI as structurally down and runs this local
+# gate instead. It is the same trio the CI workflows run.
+SHIP_LOCAL_TEST_CMD=uv run --group dev ruff check . && uv run --group dev pyright && uv run --group dev pytest -q && gitleaks dir . --redact --no-banner --exit-code 1
+SHIP_TASK_CODE_PREFIX=CCU

@@ -1,0 +1,25 @@
+# Lint, types, tests and reachability of the git dependency host. Secret scan is the separate rig-installed secret-scan workflow.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v6.5.0
+      - name: git.hyperide.ai is reachable (agent-tools libs are git dependencies)
+        run: git ls-remote https://git.hyperide.ai/ultrabricks/agent-tools.git HEAD
+      - run: uv sync --group dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
+      - run: uv run pytest -q

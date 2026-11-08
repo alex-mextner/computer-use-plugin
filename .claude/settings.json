@@ -1,0 +1,99 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      },
+      {
+        "matcher": "Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      },
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      },
+      {
+        "matcher": "Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PreToolUse",
+            "timeout": 1200
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge PostToolUse",
+            "timeout": 1200
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=/home/ultra/xp/agent-tools/lib python3 -m cc_hook_bridge Stop",
+            "timeout": 1200
+          }
+        ]
+      }
+    ]
+  }
+}
