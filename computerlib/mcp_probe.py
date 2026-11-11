@@ -47,26 +47,32 @@ def _send(proc: subprocess.Popen[bytes], message: dict[str, object]) -> None:
         raise HandshakeError(f"server closed its input (exit {proc.poll()})") from exc
 
 
+def _pop_reply(buffer: bytearray, request_id: int) -> dict[str, object] | None:
+    """Consume complete lines from `buffer` until the response to `request_id` appears; noise and other messages are dropped."""
+    while b"\n" in buffer:
+        raw, _, rest = bytes(buffer).partition(b"\n")
+        buffer[:] = rest
+        try:
+            loaded: object = json.loads(raw)
+        except ValueError:
+            continue
+        message = as_dict(loaded)
+        # A server-to-client request (roots/list, sampling) may reuse our id; only a response has no "method".
+        if type(message.get("id")) is int and message["id"] == request_id and "method" not in message:
+            return message
+    return None
+
+
 def _await_reply(proc: subprocess.Popen[bytes], buffer: bytearray, request_id: int, deadline: float) -> dict[str, object]:
     assert proc.stdout is not None
     fd = proc.stdout.fileno()
     while True:
-        while b"\n" in buffer:
-            raw, _, rest = bytes(buffer).partition(b"\n")
-            buffer[:] = rest
-            try:
-                loaded: object = json.loads(raw)
-                message = as_dict(loaded)
-            except ValueError:
-                continue
-            # A server-to-client request (roots/list, sampling) may reuse our id; only a response has no "method".
-            if type(message.get("id")) is int and message["id"] == request_id and "method" not in message:
-                return message
+        reply = _pop_reply(buffer, request_id)
+        if reply is not None:
+            return reply
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise HandshakeError("timed out waiting for the server")
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
+        ready, _, _ = select.select([fd], [], [], max(remaining, 0))
+        if remaining <= 0 or not ready:
             raise HandshakeError("timed out waiting for the server")
         chunk = os.read(fd, 65536)
         if not chunk:

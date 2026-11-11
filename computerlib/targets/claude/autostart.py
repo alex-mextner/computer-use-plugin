@@ -66,6 +66,36 @@ def find_binary() -> str | None:
     return shutil.which("claude-desktop")
 
 
+def _with_enabled_key(rewritten: list[str]) -> list[str]:
+    """Insert the enabled key right under the `[Desktop Entry]` header (or at the end when the header is missing)."""
+    header = next((i for i, line in enumerate(rewritten) if line.strip() == "[Desktop Entry]"), None)
+    position = len(rewritten) if header is None else header + 1
+    return [*rewritten[:position], "X-GNOME-Autostart-enabled=true", *rewritten[position:]]
+
+
+def _reenable(path: Path) -> None:
+    backup(path)
+    lines = path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    inside = list(_entry_lines(lines))
+    hidden = {i for i, line in inside if _HIDDEN_TRUE.match(line)}
+    enabled = {i for i, line in inside if _ENABLED_KEY.match(line)}
+    rewritten = ["X-GNOME-Autostart-enabled=true" if i in enabled else line for i, line in enumerate(lines) if i not in hidden]
+    atomic_write(path, "\n".join(rewritten if enabled else _with_enabled_key(rewritten)) + "\n")
+
+
+def _create(path: Path) -> None:
+    binary = find_binary()
+    if binary is None:
+        raise MissingTargetError(
+            what="cannot create the Claude Desktop autostart entry",
+            why="the Claude Desktop launcher was not found (not at /usr/lib/claude-desktop/claude-desktop, not on PATH)",
+            fix="install Claude Desktop, then re-run `computer claude install` (the Claude config entry was already written)",
+        )
+    atomic_write(
+        path, f'[Desktop Entry]\nType=Application\nName=Claude\nExec="{binary}" --startup\nX-GNOME-Autostart-enabled=true\n'
+    )
+
+
 def ensure() -> str:
     """Create or re-enable the autostart entry when needed; returns a one-line report."""
     path = autostart_path()
@@ -79,26 +109,7 @@ def ensure() -> str:
     if current is AutostartState.ENABLED:
         return f"autostart already enabled ({path})"
     if current is AutostartState.DISABLED:
-        backup(path)
-        lines = path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
-        inside = list(_entry_lines(lines))
-        hidden = {i for i, line in inside if _HIDDEN_TRUE.match(line)}
-        enabled = {i for i, line in inside if _ENABLED_KEY.match(line)}
-        rewritten = [
-            "X-GNOME-Autostart-enabled=true" if i in enabled else line for i, line in enumerate(lines) if i not in hidden
-        ]
-        if not enabled:
-            header = next((i for i, line in enumerate(rewritten) if line.strip() == "[Desktop Entry]"), None)
-            rewritten.insert(header + 1 if header is not None else len(rewritten), "X-GNOME-Autostart-enabled=true")
-        atomic_write(path, "\n".join(rewritten) + "\n")
+        _reenable(path)
         return f"autostart was disabled; re-enabled ({path})"
-    binary = find_binary()
-    if binary is None:
-        raise MissingTargetError(
-            what="cannot create the Claude Desktop autostart entry",
-            why="the Claude Desktop launcher was not found (not at /usr/lib/claude-desktop/claude-desktop, not on PATH)",
-            fix="install Claude Desktop, then re-run `computer claude install` (the Claude config entry was already written)",
-        )
-    text = f'[Desktop Entry]\nType=Application\nName=Claude\nExec="{binary}" --startup\nX-GNOME-Autostart-enabled=true\n'
-    atomic_write(path, text)
+    _create(path)
     return f"autostart created ({path})"

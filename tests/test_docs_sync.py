@@ -8,17 +8,18 @@ from computerlib.cli import build_parser
 README = Path(__file__).resolve().parent.parent / "README.md"
 
 
-def command_lines(parser: argparse.ArgumentParser) -> list[str]:
-    """Every `computer <target> <command>` the parser registers, discovered from the parser itself."""
-    lines: list[str] = []
+def subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    """The sub-parsers one level below `parser`, discovered from the parser itself."""
+    found: dict[str, argparse.ArgumentParser] = {}
     for action in parser._actions:  # pyright: ignore[reportPrivateUsage]
-        if not isinstance(action, argparse._SubParsersAction):  # pyright: ignore[reportPrivateUsage,reportUnknownVariableType]
-            continue
-        for target, target_parser in action.choices.items():  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-            for inner in target_parser._actions:  # pyright: ignore[reportUnknownMemberType,reportPrivateUsage,reportUnknownVariableType]
-                if isinstance(inner, argparse._SubParsersAction):  # pyright: ignore[reportPrivateUsage,reportUnknownVariableType]
-                    lines.extend(f"computer {target} {name}" for name in inner.choices)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-    return lines
+        if isinstance(action, argparse._SubParsersAction):  # pyright: ignore[reportPrivateUsage,reportUnknownVariableType]
+            found.update(action.choices)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+    return found
+
+
+def command_lines(parser: argparse.ArgumentParser) -> list[str]:
+    """Every `computer <target> <command>` the parser registers."""
+    return [f"computer {target} {name}" for target, sub in subcommands(parser).items() for name in subcommands(sub)]
 
 
 def test_readme_documents_every_command() -> None:
