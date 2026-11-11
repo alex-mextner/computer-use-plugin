@@ -14,25 +14,14 @@ from collections.abc import Sequence
 from agenttools_errors import guard
 
 from computerlib import package_version
+from computerlib.commandtree import EXIT_CODES_EPILOG
 from computerlib.targets import discover_targets
-
-EXIT_CODES_EPILOG = """\
-exit codes:
-  0    ok
-  1    internal error or a failed gate
-  2    usage or configuration error
-  3    status/doctor found the stack unhealthy
-  5    a file or binary the command needs is missing
-  7    network failure (download, tunnel, DNS)
-  8    permission or credential failure
-  127  a required external tool (node, systemctl, ...) is not installed
-"""
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="computer",
-        description="Give a chat client (ChatGPT first) a shell and files on this PC through an MCP server.",
+        description="Give a chat client (Claude Desktop today) a shell and files on this PC through MCP (Desktop Commander).",
         epilog=EXIT_CODES_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
