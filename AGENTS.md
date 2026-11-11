@@ -1,7 +1,8 @@
 # AGENTS.md — chatgpt-computer-use-plugin
 
 `computer` is a Python CLI that gives a chat client a shell and files on this PC through an MCP server (Desktop Commander).
-Today there is one target, `chatgpt`: `computer chatgpt <command>`. The tree is built to take more targets.
+Targets today: `mcp` (the client-neutral core: pinned Desktop Commander install and stdio launcher) and `claude` (the Claude Desktop
+adapter). `computer <target> <command>`; the tree is built to take more client adapters (a ChatGPT one is planned, not built).
 
 Python-only (agent-tools "Python-only tools" rule): Desktop Commander (npm), mcp-auth-proxy (Go), cloudflared and tunnel-client are
 external pinned processes this tool installs and drives, never source in this repo. Shell glue over 40 lines is not allowed.
@@ -11,8 +12,11 @@ external pinned processes this tool installs and drives, never source in this re
 ```
 computerlib/            import package; dist name `hyper-computer`, command `computer`
   cli.py                build_parser()/main(argv)->int, --version from package metadata
+  commandtree.py        Command + command_target(): a target package builds its TARGET from its commands/ modules
+  desktop_commander.py  managed pinned install (install.json, flock, npm --prefix) and launch_spec; pins.py is the one pin table
+  mcp_probe.py          real MCP handshake used by every adapter's status
   targets/<name>/       one package per target, exposes TARGET (self-registered, no registry to edit)
-    chatgpt/commands/   one module per command (init, start, ...), self-registered the same way
+    <name>/commands/    one module per command exposing COMMAND (mcp: install, serve; claude: install, status, uninstall)
 tests/                  pytest, hermetic
 ```
 
