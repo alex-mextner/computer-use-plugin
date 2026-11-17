@@ -1,8 +1,9 @@
-# AGENTS.md — chatgpt-computer-use-plugin
+# AGENTS.md — computer-use-plugin
 
 `computer` is a Python CLI that gives a chat client a shell and files on this PC through an MCP server (Desktop Commander).
-Targets today: `mcp` (the client-neutral core: pinned Desktop Commander install and stdio launcher) and `claude` (the Claude Desktop
-adapter). `computer <target> <command>`; the tree is built to take more client adapters (a ChatGPT one is planned, not built).
+Targets: `mcp` (the client-neutral core: pinned Desktop Commander install and stdio launcher), `claude` (the Claude Desktop adapter)
+and `chatgpt` (the ChatGPT adapter: Cloudflare named tunnel -> shim -> mcp-auth-proxy -> `computer mcp serve`, systemd user units).
+`computer <target> <command>`; each client target has ONE `install` command that sets everything up.
 
 Python-only (agent-tools "Python-only tools" rule): Desktop Commander (npm), mcp-auth-proxy (Go), cloudflared and tunnel-client are
 external pinned processes this tool installs and drives, never source in this repo. Shell glue over 40 lines is not allowed.
@@ -14,9 +15,11 @@ computerlib/            import package; dist name `hyper-computer`, command `com
   cli.py                build_parser()/main(argv)->int, --version from package metadata
   commandtree.py        Command + command_target(): a target package builds its TARGET from its commands/ modules
   desktop_commander.py  managed pinned install (install.json, flock, npm --prefix) and launch_spec; pins.py is the one pin table
+                        (Desktop Commander and the sha256-pinned release binaries of the chatgpt target)
   mcp_probe.py          real MCP handshake used by every adapter's status
   targets/<name>/       one package per target, exposes TARGET (self-registered, no registry to edit)
-    <name>/commands/    one module per command exposing COMMAND (mcp: install, serve; claude: install, status, uninstall)
+    <name>/commands/    one module per command exposing COMMAND (mcp: install, serve; claude: install, status, uninstall;
+                        chatgpt: install chains init + login + start, plus status, connect, logs, doctor, ... see README)
 tests/                  pytest, hermetic
 ```
 
@@ -43,8 +46,8 @@ the dist is `hyper-<name>` with a different command name, like `hyper-qa` -> `qa
 Ticket (GitHub issue of this repo, prefix `CCU`, bare `#NNN`) -> `rig worktree create <name> --from origin/main` (never author in
 the primary checkout) -> tests -> `review diff --staged --task <N>` `[ok]` -> PR -> `gh ship <PR>`. Conventional commits, one logical
 change each. Gates: `uv run --group dev ruff check . && uv run --group dev pyright && uv run --group dev pytest -q` and
-`gitleaks dir . --redact --no-banner --exit-code 1`. The repo is private so Actions minutes are blocked: `.ship-config` carries the
-local gate `gh ship` runs when CI is structurally down.
+`gitleaks dir . --redact --no-banner --exit-code 1`. The repo is public and its Actions workflows run these gates; `.ship-config`
+carries the same trio as the local gate `gh ship` runs when CI is structurally down.
 
 ## Tests
 

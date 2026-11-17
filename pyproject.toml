@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyper-computer"
-version = "0.1.0"
-description = "computer: connect chat clients (Claude Desktop today) to this PC's computer-use MCP server"
+version = "0.2.0"
+description = "computer: connect Claude Desktop or ChatGPT (via a Cloudflare tunnel) to this PC's computer-use MCP server"
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/alex-mextner/chatgpt-computer-use-plugin"
+Homepage = "https://github.com/alex-mextner/computer-use-plugin"
 
 [project.scripts]
 computer = "computerlib.cli:main"
