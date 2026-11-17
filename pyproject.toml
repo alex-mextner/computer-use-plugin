@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyper-computer"
-version = "0.2.0"
+version = "0.2.1"
 description = "computer: connect Claude Desktop or ChatGPT (via a Cloudflare tunnel) to this PC's computer-use MCP server"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -27,6 +27,9 @@ dev = ["pytest>=8", "ruff==0.16.10", "pyright>=1.1.400"]
 
 [tool.setuptools.packages.find]
 include = ["computerlib*"]
+
+[tool.setuptools.package-data]
+"computerlib" = ["data/desktop-commander/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
