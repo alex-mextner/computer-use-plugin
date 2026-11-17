@@ -44,10 +44,12 @@ login in front of Desktop Commander, and a small shim that adds what ChatGPT's c
 
 ## Core: `computer mcp`
 
-- `computer mcp install` installs one exact, pinned version of the npm package `@wonderwhy-er/desktop-commander` (the package itself is pinned; its own
-  dependencies resolve at install time) into
-  `${XDG_DATA_HOME:-~/.local/share}/computer/desktop-commander` and records the absolute `node` path. Idempotent. Needs `node` and
-  `npm` (exit 127 without them, 7 on a network failure).
+- `computer mcp install` installs one exact, pinned version of the npm package `@wonderwhy-er/desktop-commander` together with its
+  whole dependency tree, locked: `npm ci --ignore-scripts` from the `package-lock.json` bundled in this package (every package at a
+  fixed version with its sha512 integrity), so a broken or re-published transitive package on npm cannot break or change the
+  install. It goes into `${XDG_DATA_HOME:-~/.local/share}/computer/desktop-commander` and records the absolute `node` path.
+  Idempotent (npm runs again only when the pinned version or the bundled lock changed). Needs `node` and `npm` (exit 127 without
+  them, 7 on a network failure).
 - `computer mcp serve` is what a client launches: it replaces itself with the pinned Desktop Commander over stdio, needs
   no `PATH`, and prints only MCP protocol on stdout. Exit 5 with a fix message if `computer mcp install` has not been run.
 

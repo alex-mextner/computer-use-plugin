@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import signal
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from computerlib.cli import main
+from computerlib.desktop_commander import bundled_lock_files, install, launch_spec
 from computerlib.mcp_probe import handshake
 from computerlib.pins import DESKTOP_COMMANDER_PACKAGE, DESKTOP_COMMANDER_VERSION
 from tests.fakes import fake_node, fake_npm, minimal_env
 
 ENTRY = "node_modules/@wonderwhy-er/desktop-commander/dist/index.js"
+LOCK_SHA256 = hashlib.sha256(bundled_lock_files()[1]).hexdigest()
 
 
 def managed_dir(home: Path) -> Path:
     return home / ".local/share/computer/desktop-commander"
+
+
+def tree_dir(home: Path) -> Path:
+    """Where the install from the bundled lock lives."""
+    return managed_dir(home) / "trees" / LOCK_SHA256
 
 
 @pytest.fixture
@@ -28,17 +40,279 @@ def toolchain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return bin_dir
 
 
-def test_install_pins_exact_version_and_records_node(toolchain: Path, tmp_path: Path) -> None:
+def test_install_runs_npm_ci_from_the_bundled_lock_and_records_node(toolchain: Path, tmp_path: Path) -> None:
     assert main(["mcp", "install"]) == 0
     root = managed_dir(tmp_path / "home")
-    assert (root / ENTRY).is_file()
+    tree = tree_dir(tmp_path / "home")
+    assert (tree / ENTRY).is_file()
+    package_json, lock = bundled_lock_files()
     record = json.loads((root / "install.json").read_text())
     assert record["version"] == DESKTOP_COMMANDER_VERSION
+    assert record["lock_sha256"] == LOCK_SHA256
     assert record["node"] == str(toolchain / "node")
-    npm_args = (toolchain / "npm.log").read_text()
-    assert f"{DESKTOP_COMMANDER_PACKAGE}@{DESKTOP_COMMANDER_VERSION}" in npm_args
-    assert f"--prefix {root}" in npm_args
-    assert "--save-exact" in npm_args
+    npm_args = (toolchain / "npm.log").read_text().split()
+    assert npm_args[:2] == ["ci", "--ignore-scripts"]
+    # Hoisted whatever the user's npmrc says, so the platform ripgrep package sits where the activation check looks.
+    assert "--install-strategy=hoisted" in npm_args and "--include=optional" in npm_args
+    # Only puppeteer's browser download runs, with the recorded node, in the finished tree.
+    assert (toolchain / "node.log").read_text().split() == [str(tree), str(tree / "node_modules/puppeteer/install.mjs")]
+    # npm ci ran in a staging directory that then became the tree, never in a tree a client may be launching.
+    assert npm_args[npm_args.index("--prefix") + 1] == str(root / "trees" / f".staging-{LOCK_SHA256}")
+    assert sorted(path.name for path in (root / "trees").iterdir()) == [LOCK_SHA256]
+    # npm ci installed from exactly the bundled lock, next to the bundled package.json it must agree with.
+    assert (toolchain / "npm-lock.json").read_bytes() == lock
+    assert (tree / "package.json").read_bytes() == package_json
+
+
+@pytest.mark.parametrize("failure", [{"FAKE_BROWSER_EXIT": "1"}, {"FAKE_BROWSER_MISSING": "1"}])
+def test_a_failed_browser_download_only_warns(
+    toolchain: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: dict[str, str],
+) -> None:
+    # Both the script failing and the script exiting 0 after a swallowed download error (no browser afterwards) count.
+    for name, value in failure.items():
+        monkeypatch.setenv(name, value)
+    assert main(["mcp", "install"]) == 0
+    out = capsys.readouterr().out
+    assert "warning: the browser for PDF output was not downloaded (browser download failed)" in out
+    # The command it names runs from the tree: puppeteer loads a `.puppeteerrc.cjs` from the working directory as code.
+    assert f"re-run `cd {tree_dir(tmp_path / 'home')} && " in out
+    assert "install.mjs" in out
+    assert launch_spec().entry == tree_dir(tmp_path / "home") / ENTRY
+
+
+def test_the_bundled_lock_pins_desktop_commander_and_every_package_below_it() -> None:
+    package_json, lock = bundled_lock_files()
+    pinned = {DESKTOP_COMMANDER_PACKAGE: DESKTOP_COMMANDER_VERSION}
+    assert json.loads(package_json)["dependencies"] == pinned
+    packages = json.loads(lock)["packages"]
+    assert packages[""]["dependencies"] == pinned
+    assert packages[f"node_modules/{DESKTOP_COMMANDER_PACKAGE}"]["version"] == DESKTOP_COMMANDER_VERSION
+    for name, entry in packages.items():
+        if name:
+            assert entry["resolved"].startswith("https://registry.npmjs.org/"), name
+            assert entry["integrity"].startswith("sha512-"), name
+    # puppeteer-core 25.18.1 was listed by npm while its tarball answered 404 (#11): the lock holds the previous release.
+    assert packages["node_modules/puppeteer-core"]["version"] == "25.18.0"
+    assert "puppeteer-core-25.18.1.tgz" not in lock.decode()
+
+
+def test_an_install_from_another_lock_is_replaced_by_the_bundled_one(toolchain: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    other = "0" * 64
+    _older_tree(home, other)
+    record = {"package": DESKTOP_COMMANDER_PACKAGE, "version": DESKTOP_COMMANDER_VERSION, "lock_sha256": other, "tree": other}
+    (managed_dir(home) / "install.json").write_text(json.dumps({**record, "node": str(toolchain / "node")}))
+    assert main(["mcp", "install"]) == 0
+    assert len((toolchain / "npm.log").read_text().splitlines()) == 1
+    assert json.loads((managed_dir(home) / "install.json").read_text())["lock_sha256"] == LOCK_SHA256
+    assert launch_spec().entry == tree_dir(home) / ENTRY
+
+
+def _pre_lock_install(home: Path, node: Path) -> dict[str, object]:
+    """What 0.2.0 left behind: `npm install --prefix` straight into the managed directory and a record without a lock."""
+    entry = managed_dir(home) / ENTRY
+    entry.parent.mkdir(parents=True)
+    entry.write_text("// pre-lock dc")
+    record: dict[str, object] = {"package": DESKTOP_COMMANDER_PACKAGE, "version": DESKTOP_COMMANDER_VERSION, "node": str(node)}
+    (managed_dir(home) / "install.json").write_text(json.dumps(record))
+    return record
+
+
+def test_a_failed_migration_leaves_the_pre_lock_install_launchable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bin_dir = tmp_path / "bin"
+    node = fake_node(bin_dir)
+    fake_npm(bin_dir, mode="fail", fail_with="npm error code ECONNRESET")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    home = tmp_path / "home"
+    record = _pre_lock_install(home, node)
+    assert main(["mcp", "install"]) == 7
+    assert json.loads((managed_dir(home) / "install.json").read_text()) == record
+    assert launch_spec().entry == managed_dir(home) / ENTRY
+    assert launch_spec().entry.read_text() == "// pre-lock dc"
+
+
+def test_a_migration_serves_the_old_tree_until_the_new_one_is_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    node = fake_node(bin_dir)
+    old_entry = managed_dir(home) / ENTRY
+    # While npm runs, record what `serve` would resolve: the old record and its entry file must still be there.
+    seen = tmp_path / "seen-during-npm"
+    watch = f'cp "{managed_dir(home)}/install.json" "{seen}.json"; test -f "{old_entry}" && touch "{seen}.ok"'
+    fake_npm(bin_dir, side_effect=watch)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    record = _pre_lock_install(home, node)
+    assert main(["mcp", "install"]) == 0
+    assert json.loads(Path(f"{seen}.json").read_text()) == record
+    assert Path(f"{seen}.ok").exists()
+    assert launch_spec().entry == tree_dir(home) / ENTRY
+    # A client started before the switch may still be running from the pre-lock files, so they are left in place.
+    assert old_entry.read_text() == "// pre-lock dc"
+
+
+def _older_tree(home: Path, name: str) -> Path:
+    entry = managed_dir(home) / "trees" / name / ENTRY
+    entry.parent.mkdir(parents=True)
+    entry.write_text("// older dc")
+    return entry
+
+
+def test_an_upgrade_leaves_every_older_tree_in_place(toolchain: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    older = [_older_tree(home, name * 64) for name in "ab"]
+    record = {
+        "package": DESKTOP_COMMANDER_PACKAGE,
+        "version": DESKTOP_COMMANDER_VERSION,
+        "lock_sha256": "a" * 64,
+        "tree": "a" * 64,
+    }
+    (managed_dir(home) / "install.json").write_text(json.dumps({**record, "node": str(toolchain / "node")}))
+    assert main(["mcp", "install"]) == 0
+    assert launch_spec().entry == tree_dir(home) / ENTRY
+    assert all(entry.read_text() == "// older dc" for entry in older)
+
+
+def test_a_lost_record_reuses_the_complete_tree_without_npm(toolchain: Path, tmp_path: Path) -> None:
+    assert main(["mcp", "install"]) == 0
+    (managed_dir(tmp_path / "home") / "install.json").unlink()
+    assert main(["mcp", "install"]) == 0
+    assert len((toolchain / "npm.log").read_text().splitlines()) == 1
+    assert launch_spec().entry == tree_dir(tmp_path / "home") / ENTRY
+    # An install interrupted after promoting the tree never reached the browser download, so a reuse runs it too.
+    assert len((toolchain / "node.log").read_text().splitlines()) == 2
+
+
+def test_a_lost_record_with_an_incomplete_tree_rebuilds_it_as_a_new_generation(toolchain: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    assert main(["mcp", "install"]) == 0
+    (managed_dir(home) / "install.json").unlink()
+    (tree_dir(home) / "node_modules/@vscode/ripgrep-linux-x64/bin/rg").unlink()
+    assert main(["mcp", "install"]) == 0
+    assert len((toolchain / "npm.log").read_text().splitlines()) == 2
+    assert launch_spec().entry.parents[4].name.startswith(f"{LOCK_SHA256}-")
+
+
+def test_a_damaged_tree_is_repaired_as_a_new_generation_and_left_in_place(toolchain: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    assert main(["mcp", "install"]) == 0
+    (tree_dir(home) / ENTRY).unlink()
+    (tree_dir(home) / "marker").write_text("old tree")
+    assert main(["mcp", "install"]) == 0
+    assert len((toolchain / "npm.log").read_text().splitlines()) == 2
+    # A client started from the damaged tree keeps finding every file it still has at the same path.
+    assert (tree_dir(home) / "marker").read_text() == "old tree"
+    repaired = launch_spec().entry
+    assert repaired.is_file() and repaired.is_relative_to(managed_dir(home) / "trees")
+    assert repaired.parents[4].name.startswith(f"{LOCK_SHA256}-")
+    assert main(["mcp", "install"]) == 0  # the repaired generation counts as installed
+    assert len((toolchain / "npm.log").read_text().splitlines()) == 2
+
+
+def test_failed_repairs_leave_no_partial_staging_tree(toolchain: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    assert main(["mcp", "install"]) == 0
+    (tree_dir(home) / ENTRY).unlink()
+    # npm extracts part of the tree into the staging prefix, then fails.
+    partial = 'mkdir -p "$prefix/node_modules/partial"; echo "npm error code ECONNRESET" >&2; exit 1'
+    fake_npm(toolchain, side_effect=partial.replace("$prefix", '$(echo "$@" | sed "s/.*--prefix \\([^ ]*\\).*/\\1/")'))
+    assert main(["mcp", "install"]) == 7
+    assert main(["mcp", "install"]) == 7
+    assert sorted(path.name for path in (managed_dir(home) / "trees").iterdir()) == [LOCK_SHA256]
+
+
+def test_a_repair_reclaims_the_staging_left_by_a_killed_attempt(toolchain: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    assert main(["mcp", "install"]) == 0
+    (tree_dir(home) / ENTRY).unlink()
+    leftover = managed_dir(home) / "trees" / f".staging-{LOCK_SHA256}" / "node_modules" / "partial"
+    leftover.mkdir(parents=True)
+    assert main(["mcp", "install"]) == 0
+    assert not any(path.name.startswith(".staging-") for path in (managed_dir(home) / "trees").iterdir())
+
+
+def test_a_tree_without_the_ripgrep_binary_is_not_activated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    node = fake_node(bin_dir)
+    fake_npm(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("FAKE_NPM_SKIP_RIPGREP", "1")  # npm ci succeeds but dropped the optional platform package
+    record = _pre_lock_install(home, node)
+    assert main(["mcp", "install"]) == 7
+    assert json.loads((managed_dir(home) / "install.json").read_text()) == record
+    assert launch_spec().entry == managed_dir(home) / ENTRY
+    monkeypatch.delenv("FAKE_NPM_SKIP_RIPGREP")
+    assert main(["mcp", "install"]) == 0  # a retry is not fooled into "already installed"
+    assert launch_spec().entry == tree_dir(home) / ENTRY
+
+
+def test_an_npm_platform_override_does_not_pick_the_ripgrep_package(
+    toolchain: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("npm_config_os", "darwin")  # like `os=darwin` in an npmrc: a package this node never loads
+    monkeypatch.setenv("npm_config_cpu", "arm64")
+    assert main(["mcp", "install"]) == 0
+    rg_packages = [path.name for path in (tree_dir(tmp_path / "home") / "node_modules" / "@vscode").iterdir()]
+    assert rg_packages == ["ripgrep-linux-x64"]
+    assert "--os=linux --cpu=x64" in (toolchain / "npm.log").read_text()
+
+
+@pytest.mark.parametrize("damage", ["other_platform", "renamed", "directory", "dangling_symlink"])
+def test_a_tree_without_this_platforms_ripgrep_binary_is_not_complete(toolchain: Path, tmp_path: Path, damage: str) -> None:
+    home = tmp_path / "home"
+    assert main(["mcp", "install"]) == 0
+    vscode = tree_dir(home) / "node_modules" / "@vscode"
+    rg = vscode / "ripgrep-linux-x64" / "bin" / "rg"
+    if damage == "other_platform":
+        (vscode / "ripgrep-linux-x64").rename(vscode / "ripgrep-darwin-x64")
+    elif damage == "renamed":
+        rg.rename(rg.with_name("rg.bak"))
+    elif damage == "directory":
+        rg.unlink()
+        rg.mkdir()
+    else:
+        rg.unlink()
+        rg.symlink_to(tmp_path / "missing")
+    assert main(["mcp", "install"]) == 0  # not "already installed": search would fail from this tree
+    assert len((toolchain / "npm.log").read_text().splitlines()) == 2
+    assert launch_spec().entry.parents[4].name.startswith(f"{LOCK_SHA256}-")
+
+
+def test_an_interrupted_install_stops_npm_before_cleaning_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    bin_dir = tmp_path / "bin"
+    fake_node(bin_dir)
+    pid_file = tmp_path / "npm.pid"
+    fake_npm(bin_dir, mode="hang", side_effect=f'echo $$ > "{pid_file}"')
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+    def ctrl_c_once_npm_runs() -> None:
+        while not pid_file.exists():
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGINT)  # what a terminal's Ctrl-C delivers to the installing process
+
+    # Ctrl-C must arrive as KeyboardInterrupt, whatever handler an earlier test left behind.
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
+    threading.Thread(target=ctrl_c_once_npm_runs, daemon=True).start()
+    with pytest.raises(KeyboardInterrupt):
+        install()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+    assert not any((managed_dir(tmp_path / "home") / "trees").iterdir())
+
+
+@pytest.mark.parametrize("tree", ["../../elsewhere", None, "a" * 64 + "/.."])
+def test_serve_exits_5_when_the_recorded_tree_is_not_a_tree_name(toolchain: Path, tmp_path: Path, tree: str | None) -> None:
+    assert main(["mcp", "install"]) == 0
+    record_path = managed_dir(tmp_path / "home") / "install.json"
+    record_path.write_text(json.dumps({**json.loads(record_path.read_text()), "tree": tree}))
+    assert main(["mcp", "serve"]) == 5
 
 
 def test_install_is_idempotent(toolchain: Path) -> None:
@@ -63,7 +337,7 @@ def test_install_refreshes_recorded_node_without_reinstalling(
 def test_install_honours_xdg_data_home(toolchain: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     assert main(["mcp", "install"]) == 0
-    assert (tmp_path / "xdg/computer/desktop-commander" / ENTRY).is_file()
+    assert (tmp_path / "xdg/computer/desktop-commander/trees" / LOCK_SHA256 / ENTRY).is_file()
 
 
 def test_install_without_node_exits_127(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,7 +393,7 @@ def test_serve_execs_recorded_node_under_a_minimal_environment(toolchain: Path, 
     home = tmp_path / "home"
     # env -i style: no PATH entry for node, so only the recorded absolute path can work.
     result = handshake(sys.executable, ["-m", "computerlib.cli", "mcp", "serve"], minimal_env(home), timeout=20)
-    assert result.server_version == str(managed_dir(home) / ENTRY)
+    assert result.server_version == str(tree_dir(home) / ENTRY)
 
 
 def test_install_records_the_binary_node_reports_not_the_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -154,7 +428,7 @@ def test_concurrent_installs_run_npm_once(toolchain: Path) -> None:
 def test_relative_xdg_data_home_is_ignored(toolchain: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", "relative/dir")
     assert main(["mcp", "install"]) == 0
-    assert (managed_dir(tmp_path / "home") / ENTRY).is_file()
+    assert (tree_dir(tmp_path / "home") / ENTRY).is_file()
 
 
 def test_install_npm_timeout_exits_7(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
