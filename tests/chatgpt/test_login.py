@@ -66,7 +66,9 @@ def test_login_logs_in_creates_the_tunnel_and_routes_the_hostname(
     assert fake_cloudflared.tunnels(account) == ["my-tunnel"]
     assert fake_cloudflared.routes(account) == {HOST: "my-tunnel"}
     assert opened == ["https://dash.cloudflare.com/argotunnel?aud=&callback=https%3A%2F%2Flogin.cloudflareaccess.org%2Ffake"]
-    assert "0000000000aa" not in result.out + result.err  # the tunnel id is never printed
+    printed = result.out + result.err
+    # Neither the tunnel id nor the tunnel secret of the credentials file nor the account certificate is ever printed.
+    assert not any(secret in printed for secret in ("0000000000aa", "c2VjcmV0", "fake account certificate"))
 
 
 def test_dot_cloudflared_is_never_used_and_the_login_cannot_start_a_browser_itself(
