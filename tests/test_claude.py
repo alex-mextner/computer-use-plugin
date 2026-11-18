@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from computerlib import pdf_sandbox
 from computerlib.cli import main
 from computerlib.targets.claude import autostart
 from tests.fakes import fake_computer, fake_node, fake_npm, write_executable
@@ -185,6 +186,18 @@ def test_status_healthy_after_install(computer_bin: Path, claude_binary: Path, c
     out = capsys.readouterr().out
     assert "3 tools" in out
     assert "start_process" in out
+
+
+def test_status_warns_about_the_pdf_sandbox_without_failing(
+    computer_bin: Path, claude_binary: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pdf_sandbox.RESTRICTION_FILE.write_text("1\n")  # a scratch file (conftest), as Ubuntu 23.10+ sets it
+    monkeypatch.setattr(pdf_sandbox, "SYSTEM_CHROMES", ())
+    assert main(["claude", "install"]) == 0
+    assert "warning: write_pdf cannot start Chrome" in capsys.readouterr().out
+    assert main(["claude", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn] pdf: write_pdf cannot start Chrome" in out and "       fix: as root, add an AppArmor profile" in out
 
 
 def test_status_unhealthy_without_config(computer_bin: Path, claude_binary: Path) -> None:

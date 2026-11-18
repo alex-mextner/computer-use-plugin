@@ -6,8 +6,8 @@ Two targets, each set up by ONE command:
 
 | Target | One command | Needs on this PC / account |
 |---|---|---|
-| **Claude Desktop** | `computer claude install` | Linux; the Claude Desktop app; Node.js 18+ and npm |
-| **ChatGPT** | `computer chatgpt install --domain example.com` (one per machine: `<machine>-mcp.example.com`) | Linux (x86_64 or aarch64) with systemd `--user` (and `loginctl`); Node.js 18+ and npm; a Cloudflare account with your domain (zone) on it; a ChatGPT plan that lets you add custom MCP servers with write tools (see below). `cloudflared` and `mcp-auth-proxy` are downloaded automatically, pinned and sha256-verified. macOS is not supported (no systemd) |
+| **Claude Desktop** | `computer claude install` | Linux; the Claude Desktop app; Node.js 18+ and npm. For PDF output (write_pdf) on Ubuntu 23.10+: an AppArmor profile for Desktop Commander's Chrome (see [PDF output on Ubuntu 23.10+](#pdf-output-on-ubuntu-2310-apparmor)) |
+| **ChatGPT** | `computer chatgpt install --domain example.com` (one per machine: `<machine>-mcp.example.com`) | Linux (x86_64 or aarch64) with systemd `--user` (and `loginctl`); Node.js 18+ and npm; a Cloudflare account with your domain (zone) on it; a ChatGPT plan that lets you add custom MCP servers with write tools (see below). `cloudflared` and `mcp-auth-proxy` are downloaded automatically, pinned and sha256-verified. For PDF output (write_pdf) on Ubuntu 23.10+: an AppArmor profile for Desktop Commander's Chrome (see [PDF output on Ubuntu 23.10+](#pdf-output-on-ubuntu-2310-apparmor)). macOS is not supported (no systemd) |
 
 Both run the same pinned [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) from the shared core
 (`computer mcp`), never a floating `npx ...@latest`.
@@ -54,6 +54,45 @@ login in front of Desktop Commander, and a small shim that adds what ChatGPT's c
   no `PATH`, and prints only MCP protocol on stdout. Exit 5 with a fix message if `computer mcp install` has not been run.
   Desktop Commander runs with `--no-onboarding`: until its welcome page has been opened once in a HOME it may otherwise answer
   `initialize` only after opening that page with `xdg-open`, which never returns while a newly started browser stays open.
+
+### PDF output on Ubuntu 23.10+ (AppArmor)
+
+Desktop Commander's `write_pdf` renders with Chrome. It first uses the Chrome for Testing build in its own cache
+(`~/.claude-server-commander/puppeteer-cache/chrome/<build>/chrome-linux64/chrome`), then a packaged browser at
+`/usr/bin/google-chrome`, `/usr/bin/google-chrome-stable`, `/usr/bin/chromium`, `/usr/bin/chromium-browser` or
+`/snap/bin/chromium`, and with neither it downloads Chrome for Testing into that cache. Ubuntu 23.10+ sets
+`kernel.apparmor_restrict_unprivileged_userns=1`, and a program no AppArmor profile allows `userns,` for cannot start Chrome's
+sandbox: write_pdf then fails with `No usable sandbox!`. Packaged browsers bring their own profile (or a setuid sandbox, or snap
+confinement); the downloaded build has none. The shell and file tools are not affected.
+
+`computer mcp install` (and so `computer claude install` and `computer chatgpt install`) prints a `warning:` when the restriction
+is on and no profile in `/etc/apparmor.d` covers the Chrome write_pdf will launch; `computer chatgpt doctor` shows it as a `[warn]`
+check and `computer claude status` as a `[warn] pdf:` line. Neither changes their exit code, and nothing here changes system
+settings: both fixes need root, following
+[Chromium's guide](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md).
+
+1. Recommended: an AppArmor profile for the downloaded build only. Save this as `/etc/apparmor.d/desktop-commander-chrome` and
+   load it with `sudo apparmor_parser -r /etc/apparmor.d/desktop-commander-chrome` (the `*` keeps it valid when Desktop Commander
+   updates its build). Any program at that path, which your user can write, may create user namespaces; that is still much
+   narrower than option 2.
+
+   ```
+   abi <abi/4.0>,
+   include <tunables/global>
+
+   profile desktop-commander-chrome @{HOME}/.claude-server-commander/puppeteer-cache/chrome/*/chrome-linux64/chrome flags=(unconfined) {
+     userns,
+
+     # Site-specific additions and overrides. See local/README for details.
+     include if exists <local/desktop-commander-chrome>
+   }
+   ```
+
+2. Lift the restriction for every program: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (add
+   `kernel.apparmor_restrict_unprivileged_userns=0` to a file in `/etc/sysctl.d/` to keep it after a reboot). This switches off a
+   system-wide hardening, so prefer option 1.
+
+Installing a packaged Google Chrome or Chromium does not help while the cache holds a build: Desktop Commander prefers the cache.
 
 ## Claude Desktop: `computer claude`
 

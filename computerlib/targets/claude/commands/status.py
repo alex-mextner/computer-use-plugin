@@ -3,7 +3,7 @@
 INVARIANTS: never changes the user's config or autostart files (the handshake does start the real server, which keeps its own
 state under its home directory); the handshake runs the configured command as a bare-PATH autostart would (HOME, a minimal PATH
 and the entry's own env), so a pass here means a pass at login; exit 0 only when every check passes, 3 otherwise; whether Claude
-is running is informational.
+is running, and whether AppArmor keeps write_pdf's Chrome from starting its sandbox (`pdf_sandbox`), are informational.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import cast
 
 from agenttools_errors import AgentToolError
 
+from computerlib import pdf_sandbox
 from computerlib.commandtree import Command
 from computerlib.desktop_commander import EXPECTED_TOOLS
 from computerlib.jsonvalue import as_dict
@@ -90,6 +91,10 @@ def run(_args: argparse.Namespace) -> int:
     for ok, line in report:
         print(f"[{'ok' if ok else 'FAIL'}] {line}")
     print(f"[info] Claude Desktop running: {'yes' if claude_running() else 'no'}")
+    sandbox = pdf_sandbox.problem()
+    if sandbox is not None:
+        print(f"[warn] pdf: {sandbox.detail}")
+        print(f"       fix: {sandbox.fix}")
     return 0 if all(ok for ok, _ in report) else 3
 
 

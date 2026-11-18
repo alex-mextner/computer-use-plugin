@@ -7,6 +7,7 @@ public to probe.
 Checks: configuration, pinned installs (digest and exec bit of every binary), password file mode, unit files up to date, units
 active and lingering, local probes (shim, proxy), the 401 challenge through the shim, the cloudflared readiness endpoint, and
 (unless --local) the same challenge through the public URL. Exit 0 when all pass, 3 otherwise. `--json` prints the list.
+Both modes also check that write_pdf's Chrome can start its sandbox under AppArmor (`pdf_sandbox`); that one only warns.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from agenttools_errors import AgentToolError
 
-from computerlib import desktop_commander
+from computerlib import desktop_commander, pdf_sandbox
 from computerlib.commandtree import Command
 from computerlib.pins import DESKTOP_COMMANDER_VERSION, binary_pin, zip_member_pin
 from computerlib.targets.chatgpt.context import Context, load_context
@@ -43,6 +44,8 @@ class Check:
     ok: bool
     detail: str
     fix: str = ""
+    # A failed check that is not required is printed as a warning and leaves the exit code alone: the chain still serves.
+    required: bool = True
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
@@ -127,6 +130,14 @@ def _desktop_commander() -> Check:
     except AgentToolError as error:
         return Check(name, False, f"{error.what}: {error.why}", error.fix)
     return Check(name, True, f"{DESKTOP_COMMANDER_VERSION} with node {spec.node}")
+
+
+def _pdf_sandbox() -> Check:
+    name = "PDF browser sandbox (write_pdf)"
+    found = pdf_sandbox.problem()
+    if found is None:
+        return Check(name, True, "no AppArmor user-namespace restriction stops it")
+    return Check(name, False, found.detail, found.fix, required=False)
 
 
 def _cloudflare_fix(ctx: Context, credentials: Path) -> str:
@@ -252,6 +263,7 @@ def collect_tunnel(ctx: Context) -> list[Check]:
         _tunnel_id(ctx),
         _tunnel_client(ctx),
         _desktop_commander(),
+        _pdf_sandbox(),
         _runtime_key(ctx),
         _unit_files(ctx),
         *_units(ctx),
@@ -266,13 +278,20 @@ def collect(ctx: Context, local_only: bool) -> list[Check]:
     builders: list[Callable[[], list[Check]]] = [
         lambda: [_binary(ctx, "mcp-auth-proxy")],
         lambda: [_binary(ctx, "cloudflared"), _cloudflare_files(ctx)] if ctx.settings.tunnel_name else [],
-        lambda: [_desktop_commander(), _password(ctx), _unit_files(ctx)],
+        lambda: [_desktop_commander(), _pdf_sandbox(), _password(ctx), _unit_files(ctx)],
         lambda: [*_units(ctx), _linger(ctx)],
         lambda: _local(ctx),
         lambda: _tunnel(ctx),
         lambda: [] if local_only else _edge(ctx),
     ]
     return [check for build in builders for check in build()]
+
+
+def _print(check: Check) -> None:
+    label = "ok" if check.ok else "FAIL" if check.required else "warn"
+    print(f"[{label}] {check.name}: {check.detail}")
+    if not check.ok and check.fix:
+        print(f"       fix: {check.fix}")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -282,10 +301,8 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps([asdict(c) for c in checks], indent=2))
     else:
         for check in checks:
-            print(f"[{'ok' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
-            if not check.ok and check.fix:
-                print(f"       fix: {check.fix}")
-    return 0 if all(c.ok for c in checks) else 3
+            _print(check)
+    return 0 if all(c.ok or not c.required for c in checks) else 3
 
 
 COMMAND = Command(
