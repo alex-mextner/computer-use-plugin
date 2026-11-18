@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.12
+
+- `--cloudflare-cert` refuses, with exit 2 and before `cert.pem` is written, a certificate the pinned cloudflared would decode
+  differently or not at all: a token that sets a field twice in any letter case (`apiToken` and `APITOKEN`; Go's encoding/json
+  matches field names ignoring case and the last value wins, so cloudflared read an empty token and failed with "missing token"),
+  an earlier value of the wrong type, a base64 body broken by a vertical tab, form feed or no-break space (Go's encoding/pem
+  skips only spaces, tabs and line breaks), and a token that is not UTF-8 JSON (a byte-order mark, UTF-16, invalid bytes, NaN).
+  Such a file used to be published as the login, so later runs skipped the browser and refused the right certificate as
+  different (#33).
+- `uninstall --purge` without a config now also stops and removes the units this tool wrote under another `--unit-prefix`,
+  found by the marker line at the top of each unit file: before, only the default `computer-chatgpt-*` units were stopped, so a
+  stack with a custom prefix kept running while its state was deleted. Every unit name of both modes under each such prefix is
+  stopped (one whose file is gone may still run), and only the files this tool wrote are disabled and removed, since
+  `systemctl disable` gives up on the whole list at the first unknown unit (#33).
+
 ## 0.3.11
 
 - `computer mcp install` stopped by SIGTERM or SIGHUP (a closed terminal, a service manager) now stops npm and everything npm

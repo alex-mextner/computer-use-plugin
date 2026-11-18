@@ -15,6 +15,7 @@ from agenttools_errors import AgentToolError
 
 from computerlib.targets.chatgpt.password import ensure_password, read_password
 from computerlib.targets.chatgpt.removal import remove_tree
+from computerlib.targets.chatgpt.settings import config_file
 from tests.chatgpt.cli_helpers import init_args, layout, run_cli, stand_in_for_the_network
 from tests.chatgpt.conftest import FakeMachine
 
@@ -113,6 +114,68 @@ def test_revoke_that_cannot_delete_fails_with_the_permission_exit_code(
     assert result.code == 8
     assert "could not remove" in result.err and "revoked" not in result.out
     assert (data / "db").exists()
+
+
+def test_purge_without_a_config_stops_a_stack_under_another_unit_prefix(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the lost config named the prefix: purge finds the units by their marker, never leaves them serving deleted state."""
+    stand_in_for_the_network(monkeypatch)
+    assert run_cli(capsys, *init_args(unit_prefix="custom")).code == 0
+    assert run_cli(capsys, "start", "--no-wait").code == 0
+    units = layout().unit_dir
+    custom = sorted(path.name for path in units.glob("custom-*.service"))
+    assert custom == ["custom-bridge.service", "custom-shim.service"]
+    assert all(machine.unit_state(name, "active") == "active" for name in custom)
+    users_own = units / "mine-shim.service"  # a unit of the same shape this tool did not write: never touched
+    users_own.write_text("[Service]\nExecStart=/bin/true\n")
+    state = layout().state_dir
+    config_file().unlink()
+    purged = run_cli(capsys, "uninstall", "--purge")
+    assert purged.code == 0, purged.err
+    for name in custom:
+        assert name in purged.out and not (units / name).exists()
+        assert machine.unit_state(name, "active") == "inactive" and machine.unit_state(name, "enabled") == "disabled"
+    assert users_own.exists() and not any("mine-shim" in call for call in machine.calls())
+    # real systemd's `disable` drops the whole list at the first unknown unit: absent default-prefix units are only stopped
+    disabled = [call for call in machine.calls() if call.startswith("disable")]
+    assert disabled == ["disable --now custom-shim.service custom-bridge.service"]
+    assert not state.exists()
+
+
+def test_purge_without_a_config_stops_units_whose_files_are_gone(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """systemd keeps running a unit after its file is deleted: purge must still stop it before deleting the state it serves."""
+    _running_stack(capsys, monkeypatch)
+    for name in (BRIDGE, SHIM):
+        (layout().unit_dir / name).unlink()
+    config_file().unlink()
+    purged = run_cli(capsys, "uninstall", "--purge")
+    assert purged.code == 0, purged.err
+    assert machine.unit_state(BRIDGE, "active") == "inactive" and machine.unit_state(SHIM, "active") == "inactive"
+    assert not any(call.startswith("disable") for call in machine.calls())  # no file left to disable
+
+
+def test_purge_without_a_config_stops_every_unit_of_a_discovered_prefix(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One surviving marked file names the prefix; its siblings are stopped by name even when their files are gone, and a
+    file of the same prefix without the marker is the user's: neither stopped nor removed."""
+    stand_in_for_the_network(monkeypatch)
+    assert run_cli(capsys, *init_args(unit_prefix="custom")).code == 0
+    assert run_cli(capsys, "start", "--no-wait").code == 0
+    units = layout().unit_dir
+    (units / "custom-bridge.service").unlink()  # still running: stopping the shim does not stop what it Wants=
+    users_own = units / "custom-tunnel.service"
+    users_own.write_text("[Service]\nExecStart=/bin/true\n")
+    config_file().unlink()
+    purged = run_cli(capsys, "uninstall", "--purge")
+    assert purged.code == 0, purged.err
+    for name in ("custom-bridge.service", "custom-shim.service"):
+        assert machine.unit_state(name, "active") == "inactive"
+    assert [call for call in machine.calls() if call.startswith("disable")] == ["disable --now custom-shim.service"]
+    assert users_own.exists() and not any("custom-tunnel.service" in call for call in machine.calls())
 
 
 def test_remove_tree_never_removes_home_root_or_a_parent_of_home(tmp_path: Path) -> None:

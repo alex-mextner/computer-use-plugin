@@ -371,6 +371,101 @@ def test_a_file_that_is_not_an_account_certificate_is_refused_and_leaves_login_p
     assert (layout().cloudflared_dir / "cert.pem").read_text() == good.read_text()
 
 
+def _token_cert(payload: bytes | str, blank: str = "") -> str:
+    """A token block around `payload` (JSON text or raw bytes); `blank` is put between the two halves of the base64 body."""
+    body = base64.b64encode(payload.encode() if isinstance(payload, str) else payload).decode()
+    half = len(body) // 2 // 4 * 4
+    return f"-----BEGIN ARGO TUNNEL TOKEN-----\n{body[:half]}{blank}{body[half:]}\n-----END ARGO TUNNEL TOKEN-----\n"
+
+
+TOKEN = '"zoneID":"z","accountID":"a","apiToken":"t"'
+
+
+@pytest.mark.parametrize(
+    ("content", "why"),
+    [
+        # encoding/json fills apiToken from APITOKEN too, last one wins: cloudflared would read an empty token
+        (_token_cert('{"zoneID":"z","accountID":"a","apiToken":"t","APITOKEN":""}'), "apitoken more than once"),
+        (_token_cert('{"zoneID":"z","ZONEID":"y","accountID":"a","apiToken":"t"}'), "zoneid more than once"),
+        (_token_cert('{"zoneID":"z","accountid":"b","accountID":"a","apiToken":"t"}'), "accountid more than once"),
+        # the Kelvin sign folds onto k in Go's foldName
+        (_token_cert('{"zoneID":"z","accountID":"a","apiToken":"t","apiTo\\u212aen":""}'), "apitoken more than once"),
+        # the later value is a good string, but encoding/json still fails on the earlier number
+        (_token_cert('{"zoneID":"z","accountID":"a","apiToken":1,"apiToken":"t"}'), "apitoken of its token is not a string"),
+        (_token_cert('{"zoneID":"z","accountID":"a","APIToken":["t"]}'), "apitoken of its token is not a string"),
+        (_token_cert("{" + TOKEN + ',"other":NaN}'), "not base64 of a UTF-8 JSON object"),
+        (_token_cert(b'{"zoneID":"z\xff","accountID":"a","apiToken":"t"}'), "not base64 of UTF-8 text"),
+        (_token_cert(b"\xef\xbb\xbf{" + TOKEN.encode() + b"}"), "not base64 of a UTF-8 JSON object"),
+        (_token_cert(("{" + TOKEN + "}").encode("utf-16")), "not base64 of UTF-8 text"),
+        (_token_cert("[" + TOKEN.replace(":", ",") + "]"), "not base64 of a UTF-8 JSON object"),
+        # one level past the bound (the token object is level 1); brackets inside strings do not count
+        (_token_cert("{" + TOKEN + ',"x":' + "[" * 100 + "]" * 100 + "}"), "deeper than 100 levels"),
+        (_token_cert("{" + TOKEN + "}").replace("\n-----END", "=\n-----END"), "not base64 of UTF-8 text"),
+        # pem.Decode strips only spaces and tabs and base64 skips only line breaks: these make cloudflared find no token
+        (_token_cert("{" + TOKEN + "}", "\v"), "broken only by spaces, tabs and line breaks"),
+        (_token_cert("{" + TOKEN + "}", "\f"), "broken only by spaces, tabs and line breaks"),
+        (_token_cert("{" + TOKEN + "}", "\u00a0"), "broken only by spaces, tabs and line breaks"),
+        (_token_cert('{"zoneID":"z","accountID":"a","apiToken":""}'), "no apiToken"),
+        # the dotless i and the dotted capital I fold only onto themselves in Go: these keys are ignored, so no token at all
+        (_token_cert('{"zoneID":"z","accountID":"a","ap\\u0131Token":"t"}'), "no apiToken"),
+        (_token_cert('{"zoneID":"z","accountID":"a","AP\\u0130TOKEN":"t"}'), "no apiToken"),
+    ],
+    ids=[
+        "apiToken-APITOKEN",
+        "zoneID-ZONEID",
+        "accountid-accountID",
+        "kelvin-sign-alias",
+        "earlier-mistyped-duplicate",
+        "array-token",
+        "nan",
+        "non-utf8",
+        "utf8-bom",
+        "utf16",
+        "json-array",
+        "nested-too-deep",
+        "excess-padding",
+        "vertical-tab",
+        "form-feed",
+        "no-break-space",
+        "empty-token",
+        "dotless-i-key-ignored",
+        "dotted-capital-i-key-ignored",
+    ],
+)
+def test_a_token_cloudflared_would_not_decode_is_refused_before_cert_pem_is_written(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path, content: str, why: str
+) -> None:
+    """The Go decoders of the pinned cloudflared decide: encoding/pem, then encoding/json matching field names ignoring case."""
+    bad = tmp_path / "bad.pem"
+    bad.write_text(content)
+    refused = run_cli(capsys, "login", "--cloudflare-cert", str(bad))
+    assert refused.code == 2 and "is not a Cloudflare account certificate" in refused.err
+    assert why in refused.err
+    assert not (layout().cloudflared_dir / "cert.pem").exists()
+    assert not any(c.argv[:2] == ["tunnel", "login"] for c in fake_cloudflared.calls(account))
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _token_cert("{" + TOKEN + "}", " \t\n  "),  # pem.Decode drops spaces and tabs, base64 the line break
+        _token_cert('{"zoneID":"z","accountID":"a","apiToken":"t","endpoint":null,"apiTokens":1,"extra":{"apiToken":2}}'),
+        _token_cert("{" + TOKEN + ',"ap\\u0131Token":"","AP\\u0130TOKEN":""}'),  # ignored by encoding/json, not repeats
+        account_cert("a").replace("-----\n", "-----\r\n"),
+        _token_cert("{" + TOKEN + ',"x":' + "[" * 99 + "]" * 99 + ',"y":"' + "[{" * 200 + '\\""}'),  # exactly at the bound
+    ],
+    ids=["spaces-tabs-newlines", "unknown-and-nested-keys", "dotted-and-dotless-i-keys", "crlf", "nesting-at-the-bound"],
+)
+def test_a_token_cloudflared_decodes_is_imported(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path, content: str
+) -> None:
+    good = tmp_path / "cert.pem"
+    good.write_text(content)
+    imported = run_cli(capsys, "login", "--cloudflare-cert", str(good))
+    assert imported.code == 0, imported.err
+    assert (layout().cloudflared_dir / "cert.pem").read_text() == good.read_text()
+
+
 def test_a_browser_login_still_works_after_a_refused_import(
     capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path
 ) -> None:
