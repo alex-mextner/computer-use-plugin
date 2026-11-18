@@ -8,6 +8,12 @@ with exit 2, since the hostname would not reach this machine (`--skip-dns` leave
 certificate, credentials and config live in this target's own directory (`--cloudflared-dir`), never in ~/.cloudflared unless
 pointed there; nothing secret or identifying (tunnel id, credentials) is printed.
 
+Two machines with the same name must never end up serving one public hostname (Cloudflare would split ChatGPT's traffic between
+them, and the other machine's OAuth keys differ). So a tunnel is this machine's only when a local credentials file carries the
+TunnelID `tunnel list` shows; adopting one by `--tunnel-name` is refused while `tunnel info` reports live connections (or no
+connection data: unknown fails closed); and the existing DNS record of a `--domain` hostname (`<machine>-mcp.<zone>`, the same on
+a same-name machine) is never replaced by `--yes`. Only `--force-takeover` passes the last two.
+
 Tunnel mode never takes the key as an argument (it would sit in the process list and the shell history): `--key-stdin` reads one
 line from standard input, otherwise a hidden prompt asks for it. It is written to a 0600 file (`tunnel.key` next to config.toml),
 which tunnel-client reads as `file:<path>`; it is never echoed, printed or logged. login never changes the mode.
@@ -46,16 +52,32 @@ def add_cert_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+TAKEOVER_FLAG = "--force-takeover"
+
+
+def add_takeover_option(parser: argparse.ArgumentParser) -> None:
+    """`login` and `install`: the one way past the same-name guards, named so nobody passes it by habit like --yes."""
+    parser.add_argument(
+        TAKEOVER_FLAG,
+        action="store_true",
+        help=(
+            "DANGEROUS: take over what may be ANOTHER machine's: adopt a tunnel named on this run that has live connections, "
+            "or replace the existing DNS record of a hostname derived from the domain; the other machine's connector breaks"
+        ),
+    )
+
+
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tunnel-name",
         help=(
             "name of the Cloudflare tunnel (default: the saved one, else the machine name); naming an existing tunnel this "
-            "machine has no credentials for adopts it"
+            "machine has no credentials for adopts it (refused while it has live connections, unless forced)"
         ),
     )
     add_cert_option(parser)
-    parser.add_argument("--yes", action="store_true", help="replace an existing DNS record of the hostname without asking")
+    add_takeover_option(parser)
+    parser.add_argument("--yes", action="store_true", help="replace an existing DNS record of a --hostname without asking")
     parser.add_argument(
         "--key-stdin",
         action="store_true",
@@ -107,9 +129,9 @@ def _read_key(from_stdin: bool) -> str:
 
 
 def run_tunnel(ctx: Context, args: argparse.Namespace) -> int:
-    if args.tunnel_name or args.yes or args.skip_dns or args.cloudflare_cert:
+    if args.tunnel_name or args.yes or args.skip_dns or args.cloudflare_cert or args.force_takeover:
         raise UsageError(
-            what="--tunnel-name, --cloudflare-cert, --yes and --skip-dns belong to the public mode",
+            what="--tunnel-name, --cloudflare-cert, --yes, --force-takeover and --skip-dns belong to the public mode",
             why="in tunnel mode login only stores the runtime key",
             fix="drop them",
         )
@@ -131,7 +153,52 @@ def _taken_fix(name: str, domain: str) -> str:
     return f"{adopt}; otherwise pass another --tunnel-name (the tunnel serving this hostname)"
 
 
-def _ensure_tunnel(cloudflare: Cloudflare, name: str, hostname: str, *, adopt: bool, domain: str) -> None:
+def _require_own_credentials(cloudflare: Cloudflare, name: str, tunnel_id: str, domain: str) -> None:
+    """`<name>.json` exists: it must belong to the listed tunnel. A tunnel deleted and created again under the same name (most
+    likely by a same-name machine) has a new id, and the old file would make this machine believe it owns that tunnel."""
+    own = cloudflare.credentials(name)
+    if cloudflare.credentials_tunnel_id(own) == tunnel_id:
+        print(f"tunnel {name}: exists")
+        return
+    raise ConfigError(
+        what=f"REFUSED: {own} is NOT the credentials of the tunnel {name!r} that Cloudflare lists now",
+        why=(
+            "its TunnelID differs from the id of the tunnel with that name (or it is no credentials file at all): the tunnel was "
+            "deleted and created again, most likely by another machine with the same name, so this machine does not own it"
+        ),
+        fix=f"move {own} aside (its tunnel no longer exists under this name), then: {_taken_fix(name, domain)}",
+    )
+
+
+def _adopt(cloudflare: Cloudflare, name: str, tunnel_id: str, *, force_takeover: bool, domain: str) -> None:
+    """Fetch the credentials of an existing tunnel named on this run. A tunnel with live connections is running somewhere right
+    now: on a same-name machine that serves its hostname, so it is taken only with --force-takeover; so is one whose
+    connections Cloudflare's answer does not show (fail closed)."""
+    live = cloudflare.live_connections(tunnel_id)
+    state = "whose live connections Cloudflare did not report" if live is None else f"with {live} live connection(s)"
+    if live != 0 and not force_takeover:
+        running = "cannot tell whether it runs right now" if live is None else f"is RUNNING right now ({live} live connection(s))"
+        raise ConfigError(
+            what=f"REFUSED: the tunnel {name!r} {running} and this machine has no credentials for it",
+            why=(
+                "another machine (most likely one with the same name) may run it; adopting it here would split ChatGPT's "
+                "traffic between the two machines and break that machine's connector (its OAuth keys differ)"
+            ),
+            fix=(
+                f"stop it on the machine that runs it (`computer chatgpt stop`) and re-run, or {_taken_fix(name, domain)}; only "
+                f"when you are SURE no other machine serves it, re-run with {TAKEOVER_FLAG}"
+            ),
+        )
+    if live != 0:
+        print(
+            f"WARNING: {TAKEOVER_FLAG}: adopting the tunnel {name} {state}; any other machine running it now shares this "
+            "machine's ChatGPT traffic"
+        )
+    cloudflare.fetch_credentials(name, tunnel_id)
+    print(f"tunnel {name}: exists, adopted (credentials fetched into {cloudflare.directory})")
+
+
+def _ensure_tunnel(cloudflare: Cloudflare, name: str, hostname: str, *, adopt: bool, force_takeover: bool, domain: str) -> None:
     if cloudflare.logged_in():
         print(f"cloudflare: logged in (certificate in {cloudflare.directory})")
     else:
@@ -141,14 +208,17 @@ def _ensure_tunnel(cloudflare: Cloudflare, name: str, hostname: str, *, adopt: b
         )
         cloudflare.login()
         print(f"cloudflare: logged in, certificate stored in {cloudflare.directory} (mode 600)")
-    if not cloudflare.tunnel_exists(name):
+    tunnel_id = cloudflare.find_tunnel(name)
+    if tunnel_id is None:
         cloudflare.create_tunnel(name)
         print(f"tunnel {name}: created")
-    elif cloudflare.credentials(name).is_file():
-        print(f"tunnel {name}: exists")
+    elif cloudflare.credentials(name).exists():
+        _require_own_credentials(cloudflare, name, tunnel_id, domain)
+    elif cloudflare.adopt_credentials_by_id(name, tunnel_id):
+        # A plain `cloudflared tunnel create` names the file after the tunnel id; its TunnelID matches, so it is ours.
+        print(f"tunnel {name}: exists, this machine's credentials file (named by tunnel id) copied to {name}.json")
     elif adopt:
-        cloudflare.fetch_credentials(name)
-        print(f"tunnel {name}: exists, adopted (credentials fetched into {cloudflare.directory})")
+        _adopt(cloudflare, name, tunnel_id, force_takeover=force_takeover, domain=domain)
     else:
         # Tunnel names are per account: two machines that share a hostname would share a tunnel and split ChatGPT's traffic.
         raise ConfigError(
@@ -161,20 +231,36 @@ def _ensure_tunnel(cloudflare: Cloudflare, name: str, hostname: str, *, adopt: b
         )
 
 
-def _route(cloudflare: Cloudflare, name: str, hostname: str, assume_yes: bool, domain: str) -> bool:
-    """Route the hostname; True when it points at the tunnel afterwards, False when the user kept an existing record."""
+def _route(cloudflare: Cloudflare, name: str, hostname: str, *, assume_yes: bool, force_takeover: bool, domain: str) -> bool:
+    """Route the hostname; True when it points at the tunnel afterwards, False when the user kept an existing record. The record
+    of a --domain hostname is replaced only with --force-takeover: a same-name machine derives the very same hostname."""
     route = cloudflare.route_dns(name, hostname)
-    if route is Route.CONFLICT:
-        owner = " It may be another machine's with the same name." if domain else ""
-        question = f"A DNS record for {hostname} already exists and does not point at tunnel {name}.{owner} Replace it?"
-        if not confirmed(question, assume_yes):
-            other = "--machine-name" if domain else "--hostname"
-            print(f"dns {hostname}: kept the existing record (re-run with --yes to replace it, or choose another {other})")
-            return False
-        route = cloudflare.route_dns(name, hostname, overwrite=True)
-        print(f"dns {hostname}: replaced, now routed to tunnel {name}")
+    if route is not Route.CONFLICT:
+        print(f"dns {hostname}: {'routed to tunnel ' + name if route is Route.CREATED else 'already routed to tunnel ' + name}")
         return True
-    print(f"dns {hostname}: {'routed to tunnel ' + name if route is Route.CREATED else 'already routed to tunnel ' + name}")
+    if domain and not force_takeover:
+        raise ConfigError(
+            what=f"REFUSED: the DNS record {hostname} already exists and does not point at tunnel {name}",
+            why=(
+                f"{hostname} is derived from --domain {domain}, so another machine with the same name (or an older install "
+                "under another tunnel name) serves it; replacing it would move that machine's ChatGPT traffic here, so --yes "
+                "does not replace it"
+            ),
+            fix=(
+                f"name this machine differently: `computer chatgpt install --domain {domain} --machine-name <name>`; only when "
+                f"you are SURE no other machine uses {hostname} (Cloudflare dashboard > DNS), re-run with {TAKEOVER_FLAG}"
+            ),
+        )
+    if not domain:
+        question = f"A DNS record for {hostname} already exists and does not point at tunnel {name}. Replace it?"
+        if not confirmed(question, assume_yes or force_takeover):
+            print(f"dns {hostname}: kept the existing record (re-run with --yes to replace it, or choose another --hostname)")
+            return False
+    cloudflare.route_dns(name, hostname, overwrite=True)
+    if domain:
+        print(f"WARNING: {TAKEOVER_FLAG}: dns {hostname}: the existing record was REPLACED, now routed to tunnel {name}")
+    else:
+        print(f"dns {hostname}: replaced, now routed to tunnel {name}")
     return True
 
 
@@ -191,11 +277,19 @@ def record_kept_error(settings: Settings) -> ConfigError:
 
 
 def setup_tunnel(
-    settings: Settings, layout: Layout, *, assume_yes: bool, skip_dns: bool, adopt: bool = False, cert: AccountCert | None = None
+    settings: Settings,
+    layout: Layout,
+    *,
+    assume_yes: bool,
+    skip_dns: bool,
+    adopt: bool = False,
+    force_takeover: bool = False,
+    cert: AccountCert | None = None,
 ) -> bool:
     """Login, tunnel and DNS for `settings.hostname` / `settings.tunnel_name`; True when the hostname routes to the tunnel (or DNS
     is the user's business: `skip_dns`). `adopt`: the tunnel name was given on this run, so an existing tunnel without local
-    credentials is taken over. `cert`: an account certificate (already read and checked) to reuse instead of the browser login."""
+    credentials is taken over (one with live connections only with `force_takeover`, which also replaces the record of a
+    --domain hostname). `cert`: an account certificate (already read and checked) to reuse instead of the browser login."""
     binary = layout.bin_dir / "cloudflared"
     if not binary.exists():
         raise MissingTargetError(
@@ -213,11 +307,11 @@ def setup_tunnel(
     if cert is not None:
         copied = cloudflare.import_cert(cert)
         print(f"cloudflare: account certificate {'copied from' if copied else 'already the same as'} {cert.source}")
-    _ensure_tunnel(cloudflare, name, hostname, adopt=adopt, domain=settings.domain)
+    _ensure_tunnel(cloudflare, name, hostname, adopt=adopt, force_takeover=force_takeover, domain=settings.domain)
     if skip_dns:
         print(f"dns: skipped; route it yourself: point {hostname} at {name} (cloudflared tunnel route dns {name} {hostname})")
         return True
-    return _route(cloudflare, name, hostname, assume_yes, settings.domain)
+    return _route(cloudflare, name, hostname, assume_yes=assume_yes, force_takeover=force_takeover, domain=settings.domain)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -247,6 +341,7 @@ def run(args: argparse.Namespace) -> int:
         assume_yes=args.yes,
         skip_dns=args.skip_dns,
         adopt=explicit,
+        force_takeover=args.force_takeover,
         cert=cert,
     )
     # The tunnel exists even when its DNS record was kept, so its name is saved before the failure is reported.

@@ -137,13 +137,25 @@ domain); both are saved, so a re-run needs no flags.
 3. **Cloudflare**: when this target has no account certificate yet, runs `cloudflared tunnel login` (the ONLY interactive step: a
    URL where you authorize the zone of your hostname, see [A new machine](#a-new-machine-login-or-an-existing-certificate)), creates
    the named tunnel (default: the machine name, `--tunnel-name` to choose), and routes the hostname to it. A tunnel of that name
-   that already exists with credentials in this target's directory is reused; one that exists WITHOUT them (another machine of the
-   same name, or a lost install) is refused with exit 2: pass `--machine-name`, delete the stale tunnel, or adopt it by naming it with
-   `--tunnel-name`. A NEW DNS record is created without a question; an EXISTING record that points elsewhere is replaced only after
-   you confirm (`--yes` answers yes; without consent install stops with exit 2).
+   that already exists with credentials in this target's directory (`<tunnel name>.json`, or `<tunnel id>.json` as plain
+   `cloudflared tunnel create` names it) is reused, but only when the file's TunnelID is the id Cloudflare lists for that name: a
+   file of another id (the tunnel was deleted and created again, most likely by a machine of the same name) is refused with exit 2.
+   One that exists WITHOUT credentials here (another machine of the same name, or a lost install) is refused with exit 2: pass
+   `--machine-name`, delete the stale tunnel, or adopt it by naming it with `--tunnel-name`. A NEW DNS record is created without a
+   question; an EXISTING record that points elsewhere is replaced only after you confirm (`--yes` answers yes; without consent
+   install stops with exit 2).
    cloudflared's certificate, tunnel credentials and `config.yml` live in this target's own directory
    (`~/.config/computer/chatgpt/cloudflared`, mode 700; `--cloudflared-dir` to choose). `~/.cloudflared` is never read or written unless
    you point `--cloudflared-dir` at it, so a tunnel that already runs on this machine is left alone.
+
+   **Same-name machines.** Two machines with the same name must never serve one hostname: Cloudflare would split ChatGPT's
+   traffic between them and the other machine's connector would fail with 401s. So adopting a tunnel with `--tunnel-name` is
+   refused while Cloudflare reports live connections for it (`cloudflared tunnel info`: a cloudflared somewhere runs it; recently
+   closed connections do not count, and an answer without connection data is refused too), and the existing record of a
+   `--domain` hostname (`<machine>-mcp.<zone>`, which a same-name machine derives too) is never replaced by `--yes`: install
+   stops with exit 2 and names the record. `--force-takeover` passes both refusals; it is DANGEROUS, use it only when you are sure
+   no other machine serves the tunnel or the hostname (for example the record of this machine's own 0.2.x install). Your own
+   running tunnel, with its credentials here, needs no override.
 4. **Starts**: writes the systemd user units (only now, so a run that stopped in step 3 leaves them as they were and the corrected
    re-run still restarts what changed), enables lingering (the stack starts at boot without a login), enables and starts the units
    (restarting only those whose file changed), and waits until the local chain answers.
@@ -218,9 +230,9 @@ replaced). It lets its holder create tunnels and DNS records in the account, so 
 
 | Command | What it does |
 |---|---|
-| `install` | the one-command setup above. Flags: `--domain`, `--machine-name`, `--hostname`, `--tunnel-name`, `--cloudflare-cert`, `--cloudflared-dir`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--yes`, `--skip-dns`, `--no-linger`, `--timeout`, `--name` (default: the machine name) |
+| `install` | the one-command setup above. Flags: `--domain`, `--machine-name`, `--hostname`, `--tunnel-name`, `--cloudflare-cert`, `--cloudflared-dir`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--yes`, `--force-takeover`, `--skip-dns`, `--no-linger`, `--timeout`, `--name` (default: the machine name) |
 | `init` | building block: choose the mode (default `public`), write the config, install the pinned pieces, create the password (public) and unit files. Flags: `--mode`, `--domain`, `--machine-name`, `--hostname`, `--scheme`, `--tunnel-name`, `--tunnel-id`, `--tunnel-health-port`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--cloudflared-dir`, `--lang`, `--no-install`, `--no-units` |
-| `login` | building block: public: Cloudflare login, create the named tunnel (an existing one without local credentials only when named with `--tunnel-name`), route the hostname (asks before replacing a record; keeping it exits 2). Flags: `--tunnel-name`, `--cloudflare-cert`, `--yes`, `--skip-dns`. Tunnel mode: store the runtime API key. Flag: `--key-stdin` |
+| `login` | building block: public: Cloudflare login, create the named tunnel (an existing one without local credentials only when named with `--tunnel-name`, and while it has live connections only with `--force-takeover`), route the hostname (asks before replacing a record, keeping it exits 2; the record of a `--domain` hostname only with `--force-takeover`). Flags: `--tunnel-name`, `--cloudflare-cert`, `--yes`, `--force-takeover`, `--skip-dns`. Tunnel mode: store the runtime API key. Flag: `--key-stdin` |
 | `start` | enable and start the stack, wait until it serves. Flags: `--no-wait`, `--no-linger` |
 | `stop` | stop the stack now (stays enabled for the next boot) |
 | `restart` | restart in start order and wait until it serves |

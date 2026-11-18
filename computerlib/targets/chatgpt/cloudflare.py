@@ -11,7 +11,8 @@ headless machine over ssh: it can be opened on any device) and opened with the u
 and the certificate is then moved into place with mode 0600. `import_cert` instead reuses a certificate from an earlier login,
 read and checked once up front (`read_account_cert`), before the caller writes anything.
 INVARIANTS: only the pinned binary is run; nothing secret or identifying (certificate, credentials, tunnel id) is printed; a DNS
-record that points elsewhere is replaced only with the caller's consent (`route_dns(..., overwrite=True)`).
+record that points elsewhere is replaced only with the caller's consent (`route_dns(..., overwrite=True)`); a credentials file
+counts as a tunnel's only when its TunnelID is the id `tunnel list` shows (`credentials_tunnel_id`).
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ CONFIG_TEXT = (
     "# to ~/.cloudflared/config.yml. Tunnel name, credentials and origin are given on the command line.\n"
     "no-autoupdate: true\n"
 )
+TUNNEL_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 LoginRunner = Callable[[list[str], dict[str, str], Callable[[str], None]], int]
@@ -63,8 +65,11 @@ Opener = Callable[[str], bool]
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    # cloudflared reads TUNNEL_FORCE_PROVISIONING_DNS as --overwrite-dns: an exported one would replace a record that the caller
+    # was never allowed to replace (route_dns(..., overwrite=True) is the only way).
+    env = {key: value for key, value in os.environ.items() if key != "TUNNEL_FORCE_PROVISIONING_DNS"}
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=120)
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=120, env=env)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(argv, 124, "", "cloudflared did not answer within 120 s")
 
@@ -263,15 +268,67 @@ class Cloudflare:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-    def tunnel_exists(self, name: str) -> bool:
+    def find_tunnel(self, name: str) -> str | None:
+        """The id (lowercase UUID) of the account's tunnel called `name`, None when there is none."""
         result = self.runner(self._tunnel("list", "--output", "json", "--name", name))
         if result.returncode != 0:
             raise NetworkError(what="cannot list Cloudflare tunnels", why=_detail(result), fix="check the login and the network")
         try:
             listed = as_list(json.loads(result.stdout or "[]"))
         except ValueError:
+            return None
+        for item in listed:
+            fields = as_object(item)
+            if fields.get("name") == name:
+                tunnel_id = str(fields.get("id") or "").lower()
+                # Every later step is bound to this id (it also names a file here), so anything but a UUID is refused.
+                if not TUNNEL_UUID.fullmatch(tunnel_id):
+                    raise NetworkError(
+                        what=f"`cloudflared tunnel list` gave no valid id for the tunnel {name!r}",
+                        why="the answer did not have the shape this tool expects",
+                        fix="re-run; if it persists, report it with the cloudflared version",
+                    )
+                return tunnel_id
+        return None
+
+    def live_connections(self, tunnel_id: str) -> int | None:
+        """How many edge connections the tunnel has open right now (a cloudflared somewhere runs it), from `tunnel info`, which
+        reads Cloudflare's connections endpoint: since 2026-10-05 `tunnel list` carries no connections. Recently closed ones
+        (`is_pending_reconnect`) do not count, as in cloudflared's own listing. None when the answer cannot be read: unknown."""
+        result = self.runner(self._tunnel("info", "--output", "json", tunnel_id))
+        if result.returncode != 0:
+            raise NetworkError(
+                what="cannot ask Cloudflare whether the tunnel runs", why=_detail(result), fix="check the login and the network"
+            )
+        try:
+            info = as_object(json.loads(result.stdout or ""))
+        except ValueError:
+            return None
+        if not isinstance(info.get("conns"), list):
+            return None
+        return sum(
+            1
+            for connector in as_list(info.get("conns"))
+            for connection in as_list(as_object(connector).get("conns"))
+            if not as_object(connection).get("is_pending_reconnect")
+        )
+
+    def credentials_tunnel_id(self, path: Path) -> str | None:
+        """The TunnelID a credentials file belongs to (lowercase); None when it is missing, unreadable or not one."""
+        try:
+            value = as_object(json.loads(path.read_text())).get("TunnelID")
+        except (OSError, ValueError):
+            return None
+        return value.lower() if isinstance(value, str) and value else None
+
+    def adopt_credentials_by_id(self, name: str, tunnel_id: str) -> bool:
+        """`<tunnel id>.json` (what plain `cloudflared tunnel create` writes) in this directory, when it belongs to `tunnel_id`,
+        is this machine's own credentials file: copied to `<name>.json` (mode 0600), the file the units name. False otherwise."""
+        by_id = self.directory / f"{tunnel_id}.json"
+        if self.credentials_tunnel_id(by_id) != tunnel_id:
             return False
-        return any(as_object(item).get("name") == name for item in listed)
+        atomic_write(self.credentials(name), by_id.read_text(), mode=0o600)
+        return True
 
     def create_tunnel(self, name: str) -> None:
         result = self.runner(self._tunnel("create", "--credentials-file", str(self.credentials(name)), name))
@@ -280,14 +337,23 @@ class Cloudflare:
                 what=f"cannot create the tunnel {name!r}", why=_detail(result), fix="check the Cloudflare login and the network"
             )
 
-    def fetch_credentials(self, name: str) -> None:
-        """Credentials of a tunnel that exists on the account but not in this directory (created elsewhere, or files lost)."""
-        result = self.runner(self._tunnel("token", "--cred-file", str(self.credentials(name)), name))
-        if result.returncode != 0 or not self.credentials(name).is_file():
+    def fetch_credentials(self, name: str, tunnel_id: str) -> None:
+        """Credentials of a tunnel that exists on the account but not in this directory (created elsewhere, or files lost). By
+        id, not name: a tunnel recreated under the name since it was checked is never fetched; the file must carry that id."""
+        credentials = self.credentials(name)
+        result = self.runner(self._tunnel("token", "--cred-file", str(credentials), tunnel_id))
+        if result.returncode != 0 or not credentials.is_file():
             raise AgentToolError(
                 what=f"cannot fetch the credentials of the existing tunnel {name!r}",
                 why=_detail(result),
                 fix="use another --tunnel-name (a tunnel created before cloudflared 2022.3 has no fetchable token)",
+            )
+        if self.credentials_tunnel_id(credentials) != tunnel_id:
+            credentials.unlink()
+            raise AgentToolError(
+                what=f"the credentials fetched for the tunnel {name!r} belong to another tunnel",
+                why="their TunnelID is not the id that was checked; they were removed again",
+                fix="re-run the command",
             )
 
     def route_dns(self, name: str, hostname: str, *, overwrite: bool = False) -> Route:

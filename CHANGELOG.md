@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.10
+
+- Two machines with the same name can no longer end up serving one public hostname (which split ChatGPT's traffic between them
+  and broke the other machine's connector with 401s). `install` and `login` now refuse, with exit 2 and a message naming what to
+  do: adopting a tunnel by `--tunnel-name` while `cloudflared tunnel info` reports live connections for it (an answer without
+  connection data is refused too, and credentials are fetched by the tunnel id that was checked); replacing the existing
+  DNS record of a `--domain` hostname (`--yes` alone no longer does it; a `--hostname` record still follows `--yes`); and a local
+  `<tunnel>.json` whose TunnelID is not the id Cloudflare lists for that name (the tunnel was created again elsewhere). The new
+  `--force-takeover` flag passes the first two refusals, loudly, when you are sure no other machine serves the tunnel or hostname.
+  This machine's own running tunnel, with matching credentials here (as `<tunnel name>.json`, or `<tunnel id>.json` as plain
+  `cloudflared tunnel create` writes it, then copied to the name the units use), needs no override (#31).
+
 ## 0.3.9
 
 - On Ubuntu 23.10+ (AppArmor's `kernel.apparmor_restrict_unprivileged_userns=1`), Desktop Commander's write_pdf fails with

@@ -353,6 +353,20 @@ def test_a_tunnel_of_the_same_name_without_local_credentials_is_refused(capsys: 
     assert load_settings().machine_name == "test-box-2"
 
 
+def test_yes_never_replaces_the_record_of_a_domain_hostname(capsys: pytest.CaptureFixture[str], world: World) -> None:
+    """Another `test-box` (0.2.x tunnel name) serves test-box-mcp.example.test: install --domain --yes must not re-point it."""
+    fake_cloudflared.existing_record(world.account, MACHINE_HOST, "computer-test-box-mcp-example-test")
+    refused = run_cli(capsys, "install", "--domain", "example.test", "--yes", *world.common())
+    assert refused.code == 2
+    assert f"REFUSED: the DNS record {MACHINE_HOST} already exists" in refused.err and "--force-takeover" in refused.err
+    assert fake_cloudflared.routes(world.account) == {MACHINE_HOST: "computer-test-box-mcp-example-test"}
+    assert not any("--overwrite-dns" in " ".join(c.argv) for c in fake_cloudflared.calls(world.account))
+    assert not config_file().exists()
+    taken = run_cli(capsys, "install", "--domain", "example.test", "--force-takeover", *world.common())
+    assert taken.code == 0, taken.err
+    assert fake_cloudflared.routes(world.account) == {MACHINE_HOST: "test-box"}
+
+
 def test_uninstall_purge_cleans_up_after_a_refused_first_install(capsys: pytest.CaptureFixture[str], world: World) -> None:
     """The refused first install saved no config but stored the account certificate: --purge must still remove it."""
     world.account.mkdir(parents=True, exist_ok=True)

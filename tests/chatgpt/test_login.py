@@ -4,7 +4,9 @@ What is proven here: cloudflared's state lives in this target's own directory (t
 login runs under a staging HOME with an empty PATH and its URL is shown on its own line and opened by us (or left to another
 device on a headless machine), re-running changes nothing, a new DNS record is created without a question but an existing one that
 points elsewhere is only replaced with consent, an existing tunnel without local credentials is refused unless named with
---tunnel-name, and an account certificate from another machine can stand in for the browser login.
+--tunnel-name, and an account certificate from another machine can stand in for the browser login. The same-name guards (#31):
+a running tunnel is adopted only with --force-takeover, the record of a --domain hostname is never replaced by --yes, and a
+credentials file of another tunnel id is not this machine's tunnel; this machine's own running tunnel needs no override.
 """
 
 from __future__ import annotations
@@ -145,6 +147,126 @@ def test_lost_credentials_of_an_existing_tunnel_are_refused_unless_the_tunnel_is
     assert adopted.code == 0, adopted.err
     assert credentials.is_file() and "adopted" in adopted.out
     assert fake_cloudflared.tunnels(account) == ["my-tunnel"]
+
+
+def _drop_credentials() -> Path:
+    credentials = layout().cloudflared_dir / "my-tunnel.json"
+    credentials.chmod(0o600)
+    credentials.unlink()
+    return credentials
+
+
+def test_adopting_a_running_tunnel_by_name_needs_force_takeover(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """Machine B, same name as A, has no credentials; `tunnel info` shows A's live connections: --tunnel-name alone (or with
+    --yes) must not fetch A's credentials. Recently closed connections (pending reconnect) do not count."""
+    run_cli(capsys, "login")
+    credentials = _drop_credentials()
+    fake_cloudflared.connected(account, "my-tunnel", 2, pending=3)
+    for extra in ((), ("--yes",)):
+        refused = run_cli(capsys, "login", "--tunnel-name", "my-tunnel", *extra)
+        assert refused.code == 2
+        assert "REFUSED" in refused.err and "RUNNING right now (2 live connection(s))" in refused.err
+        assert "--force-takeover" in refused.err
+        assert not credentials.exists()
+        assert not any(" token " in call for call in _calls(account))
+    taken = run_cli(capsys, "login", "--tunnel-name", "my-tunnel", "--force-takeover")
+    assert taken.code == 0, taken.err
+    assert "WARNING: --force-takeover" in taken.out and "adopted" in taken.out and credentials.is_file()
+    # bound to the id that was checked, never re-resolved by name
+    assert [c.split()[-1] for c in _calls(account) if " token " in c] == ["00000000-0000-0000-0000-0000000000aa"]
+
+
+def test_a_tunnel_with_only_recently_closed_connections_is_adopted_by_name(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """A stopped tunnel whose files were lost: its connections are all pending reconnect, so nothing runs it."""
+    run_cli(capsys, "login")
+    credentials = _drop_credentials()
+    fake_cloudflared.connected(account, "my-tunnel", 0, pending=2)
+    adopted = run_cli(capsys, "login", "--tunnel-name", "my-tunnel")
+    assert adopted.code == 0, adopted.err
+    assert "adopted" in adopted.out and "WARNING" not in adopted.out and credentials.is_file()
+
+
+def test_unknown_liveness_is_refused_without_force_takeover(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """Fail closed: an answer that does not say whether the tunnel runs never lets --tunnel-name adopt it."""
+    run_cli(capsys, "login")
+    credentials = _drop_credentials()
+    fake_cloudflared.connections_unreported(account, "my-tunnel")
+    refused = run_cli(capsys, "login", "--tunnel-name", "my-tunnel")
+    assert refused.code == 2
+    assert "REFUSED" in refused.err and "cannot tell whether it runs right now" in refused.err
+    assert not credentials.exists()
+    taken = run_cli(capsys, "login", "--tunnel-name", "my-tunnel", "--force-takeover")
+    assert taken.code == 0, taken.err
+    assert "whose live connections Cloudflare did not report" in taken.out and credentials.is_file()
+
+
+def test_this_machines_own_running_tunnel_needs_no_override(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """The cutover machine: fixed --hostname, tunnel dc-local running from THIS machine, its credentials here (as
+    `<name>.json`, or as `<tunnel id>.json` the way plain `cloudflared tunnel create` names it): `login --tunnel-name dc-local`
+    exits 0 without --force-takeover and never fetches credentials."""
+    first = run_cli(capsys, "login", "--tunnel-name", "dc-local")
+    assert first.code == 0, first.err
+    fake_cloudflared.connected(account, "dc-local", 4)
+    again = run_cli(capsys, "login", "--tunnel-name", "dc-local")
+    assert again.code == 0, again.err
+    assert "tunnel dc-local: exists" in again.out
+    own = layout().cloudflared_dir
+    by_id = own / "00000000-0000-0000-0000-0000000000aa.json"
+    (own / "dc-local.json").rename(by_id)
+    from_id = run_cli(capsys, "login", "--tunnel-name", "dc-local")
+    assert from_id.code == 0, from_id.err
+    assert "copied to dc-local.json" in from_id.out
+    assert (own / "dc-local.json").read_text() == by_id.read_text()
+    assert stat.S_IMODE((own / "dc-local.json").stat().st_mode) == 0o600
+    assert "0000000000aa" not in from_id.out + from_id.err
+    assert not any(" token " in call for call in _calls(account))
+
+
+def test_credentials_of_another_tunnel_id_are_not_this_machines_tunnel(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """A local my-tunnel.json from a tunnel that was deleted; a same-name machine created my-tunnel again (new id)."""
+    run_cli(capsys, "login")
+    credentials = layout().cloudflared_dir / "my-tunnel.json"
+    stale = credentials.read_text()
+    fake_cloudflared.recreated(account, "my-tunnel", "00000000-0000-0000-0000-0000000000bb")
+    for extra in ((), ("--tunnel-name", "my-tunnel"), ("--tunnel-name", "my-tunnel", "--force-takeover")):
+        refused = run_cli(capsys, "login", *extra)
+        assert refused.code == 2
+        assert "REFUSED" in refused.err and "is NOT the credentials of the tunnel 'my-tunnel'" in refused.err
+        assert credentials.read_text() == stale
+    assert not any(" token " in call for call in _calls(account))
+
+
+def test_yes_never_replaces_the_record_of_a_domain_hostname(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A's 0.2.x tunnel name serves pc-mcp.example.test; B (also `pc`) derives the same hostname from --domain."""
+    host = "pc-mcp.example.test"
+    save_settings(Settings(hostname=host, domain="example.test", machine_name="pc", tunnel_name="pc"))
+    fake_cloudflared.existing_record(account, host, "computer-pc-mcp-example-test")
+    # an exported cloudflared overwrite switch must not bypass the refusal either
+    monkeypatch.setenv("TUNNEL_FORCE_PROVISIONING_DNS", "true")
+    for extra in ((), ("--yes",)):
+        refused = run_cli(capsys, "login", *extra)
+        assert refused.code == 2
+        assert f"REFUSED: the DNS record {host} already exists" in refused.err
+        assert "--yes does not replace it" in refused.err and "--force-takeover" in refused.err
+        assert "--machine-name" in refused.err
+        assert fake_cloudflared.routes(account) == {host: "computer-pc-mcp-example-test"}
+    assert not any("--overwrite-dns" in call for call in _calls(account))
+    taken = run_cli(capsys, "login", "--force-takeover")
+    assert taken.code == 0, taken.err
+    assert "WARNING: --force-takeover" in taken.out and "REPLACED" in taken.out
+    assert fake_cloudflared.routes(account) == {host: "pc"}
 
 
 def test_an_empty_tunnel_name_is_refused_and_never_adopts_the_saved_one(
