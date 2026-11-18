@@ -179,11 +179,16 @@ def parse_settings(text: str) -> Settings:
 
 def load_settings() -> Settings:
     path = config_file()
-    return parse_settings(path.read_text()) if path.exists() else Settings()
+    return parse_settings(path.read_text(encoding="utf-8")) if path.exists() else Settings()
+
+
+# TOML basic strings forbid raw control characters (U+0000-U+001F except tab, and U+007F): escape them all, with the backslash and
+# the quote. Everything else, non-BMP characters included, is valid UTF-8 in a basic string and is written as is.
+_ESCAPES = {code: f"\\u{code:04X}" for code in (*range(0x20), 0x7F)} | {ord("\\"): "\\\\", ord('"'): '\\"'}
 
 
 def _quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + value.translate(_ESCAPES) + '"'
 
 
 def render_settings(settings: Settings) -> str:
@@ -198,6 +203,6 @@ def save_settings(settings: Settings) -> Path:
     path = config_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
-    temp.write_text(render_settings(settings))
+    temp.write_text(render_settings(settings), encoding="utf-8")  # TOML is UTF-8 whatever the locale
     temp.replace(path)
     return path
