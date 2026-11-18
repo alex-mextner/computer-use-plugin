@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5
+
+- `computer chatgpt login` no longer exits 0 when you decline to replace an existing DNS record of the hostname: the record still
+  points elsewhere, so ChatGPT would not reach this PC. login now exits 2 with the same "still points somewhere else" error as
+  `install`, naming `--yes` as the fix; `--skip-dns` still succeeds (#22).
+
 ## 0.3.4
 
 - A path or name in the chatgpt config that contains U+007F (DEL) or another control character no longer breaks every later
