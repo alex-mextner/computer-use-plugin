@@ -8,10 +8,13 @@ INVARIANTS: one exact version from `pins.py` lives under `${XDG_DATA_HOME:-~/.lo
 re-published tarball elsewhere on npm cannot change or break the install; `install.json` records the absolute `node` path that was
 current at install time so launching needs no PATH (a desktop app autostarts with a bare one) and the sha256 of the lock it was
 installed from; `install()` is idempotent and runs npm only when the pinned version or that lock is absent.
-Each lock gets its own tree, `trees/<lock sha256>`, built by npm ci in a staging directory and switched to by rewriting
-`install.json`: npm ci deletes node_modules before downloading, so it never runs in the tree `serve` launches, and a failed
-install leaves the working one in place. Older trees (and the node_modules of a pre-lock install) are never deleted by this
-code: a client started from one may still be running and loading files from it; remove them by hand once clients restarted.
+Each lock gets its own tree, `trees/<lock sha256>`, built by npm ci in a staging directory of its own per attempt and switched to
+by rewriting `install.json`: npm ci deletes node_modules before downloading, so it never runs in the tree `serve` launches, and a
+failed install leaves the working one in place. npm and puppeteer's browser download run in a session of their own that is
+stopped as a whole on a timeout, Ctrl-C, SIGTERM or SIGHUP; an npm that outlived a SIGKILLed installer holds its staging
+directory's `.writer.lock`, so that directory is never reused and is deleted only once nothing writes into it.
+Older trees (and the node_modules of a pre-lock install) are never deleted by this code: a client started from one may still be
+running and loading files from it; remove them by hand once clients restarted.
 Install scripts stay off: Desktop Commander's postinstall only sends an installation ping and re-checks ripgrep (which comes
 from a platform package, no script needed), puppeteer would download a browser nothing uses, fsevents is macOS only.
 """
@@ -27,12 +30,14 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
+from types import FrameType
 
 from agenttools_errors import AgentToolError, MissingDepError, MissingTargetError, NetworkError
 
@@ -46,6 +51,8 @@ from computerlib.pins import DESKTOP_COMMANDER_PACKAGE, DESKTOP_COMMANDER_VERSIO
 EXPECTED_TOOLS = ("start_process", "read_file", "write_file")
 
 _NPM_TIMEOUT_SECONDS = 900
+# In each staging directory: held (flock) by the installer and inherited by its npm, so it stays locked while that npm lives.
+_WRITER_LOCK = ".writer.lock"
 _MIN_NODE_MAJOR = 18
 _NETWORK_CODES = frozenset(
     {
@@ -125,6 +132,76 @@ def _write_record(node: str, lock_sha256: str, tree: Path) -> None:
     atomic_write(_record_path(), json.dumps(record, indent=2) + "\n")
 
 
+class _Terminated(BaseException):
+    """SIGTERM or SIGHUP turned into an exception, so the install unwinds (stopping npm's session) before the process dies."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+class _Termination:
+    """SIGTERM and SIGHUP of an install in the main thread, made to unwind like Ctrl-C does before the process dies of them.
+
+    Their default action kills Python without running a `finally`, and npm runs in a session of its own (so a stop can reach
+    its whole tree), so it would keep writing into the staging prefix after the install lock is released. Only the main thread
+    can set handlers, and a disposition the caller chose (ignored, its own handler) is left alone."""
+
+    def __init__(self) -> None:
+        self.taken: list[int] = []
+        self.starting = False
+        self.pending: int | None = None
+
+    def _handle(self, signum: int, _frame: FrameType | None) -> None:
+        for each in self.taken:  # a repeated signal must not cut the cleanup short
+            signal.signal(each, signal.SIG_IGN)
+        if self.starting:
+            self.pending = signum
+            return
+        raise _Terminated(signum)
+
+    def _restore(self) -> None:
+        for signum in self.taken:
+            signal.signal(signum, signal.SIG_DFL)
+        self.taken = []
+
+    @contextmanager
+    def unwinding(self) -> Generator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        self.taken = [signum for signum in (signal.SIGTERM, signal.SIGHUP) if signal.getsignal(signum) is signal.SIG_DFL]
+        for signum in self.taken:
+            signal.signal(signum, self._handle)
+        try:
+            yield
+        except _Terminated as terminated:
+            self._restore()
+            signal.raise_signal(terminated.signum)  # exit status says "killed by SIGTERM", as without the handler
+            raise
+        finally:
+            self._restore()
+
+    @contextmanager
+    def held_while_starting(self) -> Generator[None]:
+        """Hold a termination back while a child starts and raise it after: raised inside Popen, it would leave a started child
+        that nothing stops."""
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        self.starting = True
+        try:
+            yield
+        finally:
+            self.starting = False
+            if self.pending is not None:
+                signum, self.pending = self.pending, None
+                raise _Terminated(signum)
+
+
+_TERMINATION = _Termination()
+
+
 @contextmanager
 def _exclusive_install_lock() -> Generator[None]:
     """Two installs (`computer mcp install` and an adapter's) must not run npm in one prefix at once."""
@@ -186,7 +263,8 @@ def _install_pinned() -> str:
     platform = _node_platform(node)
     package_json, lock = bundled_lock_files()
     lock_sha256 = hashlib.sha256(lock).hexdigest()
-    with _exclusive_install_lock():
+    with _TERMINATION.unwinding(), _exclusive_install_lock():
+        _reclaim_staging()
         record = _read_record()
         active = _tree_root(record)
         if (
@@ -226,15 +304,16 @@ def _install_browser(node: str, tree: Path) -> str | None:
     # From the tree: run from the caller's directory, puppeteer would load a `.puppeteerrc.cjs` found there as code.
     fix = f"re-run `cd {shlex.quote(str(tree))} && {shlex.quote(node)} {shlex.quote(str(script))}` once the network is back"
     fix += " (only PDF output needs it)"
+    env = _browser_env(node, tree)
     try:
-        done = subprocess.run(
-            [node, str(script)], cwd=tree, capture_output=True, text=True, timeout=_NPM_TIMEOUT_SECONDS, check=False
-        )
+        # Its own session, stopped as a whole: on a timeout the unzip child would otherwise keep writing the browser cache.
+        done = _run_session([node, str(script)], env=env, cwd=tree, timeout=_NPM_TIMEOUT_SECONDS)
         # The script prints a failed download and still exits 0, so ask puppeteer whether its browser is really there.
         check = subprocess.run(
             [node, "-e", _BROWSER_PRESENT_JS, str(tree / "node_modules" / "puppeteer")],
             # The tree, not the caller's directory: puppeteer loads a `.puppeteerrc.cjs` from the working directory as code.
             cwd=tree,
+            env=env,
             capture_output=True,
             text=True,
             timeout=60,
@@ -246,6 +325,70 @@ def _install_browser(node: str, tree: Path) -> str | None:
         detail = (done.stderr or done.stdout or check.stderr).strip()[-300:] or f"exit {done.returncode}"
         return f"the browser for PDF output was not downloaded ({detail}); {fix}"
     return None
+
+
+def _node_first_env(node: str) -> dict[str, str]:
+    """npm's own shebang is `env node`, so the node we are about to record must be first on the PATH of npm and its scripts."""
+    return {**os.environ, "PATH": f"{os.path.dirname(node)}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
+def _browser_env(node: str, tree: Path) -> dict[str, str]:
+    """The environment npm gave puppeteer's postinstall: npm sets NODE_OPTIONS to its `node-options` setting (an npmrc's
+    `node-options=--use-system-ca` behind a TLS-intercepting proxy) for scripts, which the direct node call would drop. Set, it
+    replaces the caller's NODE_OPTIONS as under npm: appended, one of them could conflict with it (`--use-openssl-ca` and
+    `--use-bundled-ca`) and node would refuse to start."""
+    env = _node_first_env(node)
+    found = shutil.which("npm")
+    if found is None:  # a reused tree needs no npm; without one there is no npm setting to honour either
+        return env
+    try:
+        # In the tree, as the postinstall ran there: npm reads the user's and global npmrc and the tree's own (none) from it.
+        # Absolute, as a relative PATH entry would not resolve from there.
+        done = subprocess.run(
+            [os.path.abspath(found), "config", "get", "node-options"],
+            cwd=tree,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return env  # the download may well work without it; if not, its own warning says so
+    configured = done.stdout.strip()
+    if done.returncode == 0 and configured not in ("", "null", "undefined"):  # npm prints `null` for the unset default
+        env["NODE_OPTIONS"] = configured
+    return env
+
+
+def _run_session(
+    command: Sequence[str], *, env: dict[str, str], cwd: Path | None, timeout: float, pass_fds: Sequence[int] = ()
+) -> subprocess.CompletedProcess[str]:
+    """Run `command` in a session of its own and stop that whole session on any way out: a timeout, Ctrl-C, SIGTERM.
+
+    npm and puppeteer's download start children, and killing only the direct child would leave them writing (into the
+    staging prefix, into the browser cache) after the install lock is released. Raises subprocess.TimeoutExpired."""
+    proc: subprocess.Popen[str] | None = None
+    try:
+        with _TERMINATION.held_while_starting():
+            proc = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                pass_fds=pass_fds,
+            )
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        if proc is not None:
+            with suppress(ProcessLookupError):  # the session may have exited between the interruption and here
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+        raise
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
 # Exit 0 only when the browser puppeteer launches by default (no executablePath) exists; executablePath() is async in v25.
@@ -289,25 +432,40 @@ def _install_tree(npm: str, node: str, platform: tuple[str, str], package_json: 
 
     npm ci deletes node_modules before it downloads anything, so it never runs in a tree a client may be launching: a failed or
     timed-out install leaves the working one untouched."""
-    # One staging name per lock (not per repair generation), so whatever an attempt killed half way left behind is reclaimed
-    # by the next one; the install lock keeps two attempts from sharing it.
-    staging = _trees_dir() / f".staging-{tree.name[:64]}"
-    shutil.rmtree(staging, ignore_errors=True)
+    # A new staging directory per attempt: an npm that outlived a SIGKILLed installer may still be writing into its own, and
+    # the install lock no longer covers it. `_reclaim_staging` deletes such a directory once its npm is gone.
+    staging = _trees_dir() / f".staging-{tree.name[:64]}-{os.getpid()}-{time.time_ns()}"
+    staging.mkdir(parents=True)
     try:
-        # npm ci installs exactly what the lock in the prefix says and refuses a package.json that disagrees with it.
-        atomic_write(staging / "package.json", package_json.decode())
-        atomic_write(staging / "package-lock.json", lock.decode())
-        _run_npm(npm, node, platform, staging)
+        with open(staging / _WRITER_LOCK, "w") as writer:
+            fcntl.flock(writer, fcntl.LOCK_EX)
+            # npm ci installs exactly what the lock in the prefix says and refuses a package.json that disagrees with it.
+            atomic_write(staging / "package.json", package_json.decode())
+            atomic_write(staging / "package-lock.json", lock.decode())
+            _run_npm(npm, node, platform, staging, writer.fileno())
+        (staging / _WRITER_LOCK).unlink()
     except BaseException:
-        # Nothing launches from staging; a partial tree left here would pile up across repair retries (each has its own name).
+        # Nothing launches from staging; a partial tree left here would pile up across retries (each has its own name).
         shutil.rmtree(staging, ignore_errors=True)
         raise
     staging.rename(tree)
 
 
-def _run_npm(npm: str, node: str, platform: tuple[str, str], prefix: Path) -> None:
-    # npm's own shebang is `env node`, so the node we are about to record must be first on its PATH.
-    env = {**os.environ, "PATH": f"{os.path.dirname(node)}{os.pathsep}{os.environ.get('PATH', '')}"}
+def _reclaim_staging() -> None:
+    """Delete the staging directories killed attempts left behind, except one an npm still writes into (it holds the lock)."""
+    if not _trees_dir().is_dir():
+        return
+    for staging in _trees_dir().iterdir():
+        if not staging.name.startswith(".staging-") or not staging.is_dir():
+            continue
+        # The lock file is created for a directory left by a version without it. BlockingIOError: an npm that outlived its
+        # killed installer still holds it; the directory is never activated, so it is left to that npm until a later install.
+        with suppress(OSError), open(staging / _WRITER_LOCK, "a") as writer:
+            fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _run_npm(npm: str, node: str, platform: tuple[str, str], prefix: Path, writer_lock: int) -> None:
     spec = f"{DESKTOP_COMMANDER_PACKAGE}@{DESKTOP_COMMANDER_VERSION}"
     command = [
         npm,
@@ -327,32 +485,25 @@ def _run_npm(npm: str, node: str, platform: tuple[str, str], prefix: Path) -> No
         "--no-fund",
         "--loglevel=error",
     ]
-    # Own session so an interruption can stop npm's whole process tree, not leave it writing into the prefix past the lock.
-    proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        stdout, stderr = proc.communicate(timeout=_NPM_TIMEOUT_SECONDS)
-    except BaseException as exc:
-        # A timeout, Ctrl-C or any other way out stops npm's whole tree before the caller deletes the staging prefix and
-        # releases the install lock; an npm left running would keep writing into the staging prefix a retry reuses.
-        with suppress(ProcessLookupError):  # the tree may have exited between the interruption and here
-            os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
-        if isinstance(exc, subprocess.TimeoutExpired):
-            raise NetworkError(
-                what="npm ci timed out",
-                why=f"npm did not finish within {_NPM_TIMEOUT_SECONDS}s installing {spec}",
-                fix="check the network and re-run `computer mcp install`",
-            ) from exc
-        raise
-    if proc.returncode != 0:
-        output = (stderr or stdout).strip()
+        # npm inherits the staging directory's writer lock, so the directory stays locked for as long as npm (or a child of
+        # it) runs, even past a SIGKILL of this process.
+        done = _run_session(command, env=_node_first_env(node), cwd=None, timeout=_NPM_TIMEOUT_SECONDS, pass_fds=(writer_lock,))
+    except subprocess.TimeoutExpired as exc:
+        raise NetworkError(
+            what="npm ci timed out",
+            why=f"npm did not finish within {_NPM_TIMEOUT_SECONDS}s installing {spec}",
+            fix="check the network and re-run `computer mcp install`",
+        ) from exc
+    if done.returncode != 0:
+        output = (done.stderr or done.stdout).strip()
         # Classify on npm's own `code E...` line (free text such as "check your network" also appears in permission errors),
         # over the full output, and show only the tail.
         code = re.search(r"\bcode ([A-Z][A-Z_]+)\b", output)
         error_class = NetworkError if code is not None and code.group(1) in _NETWORK_CODES else AgentToolError
         raise error_class(
             what=f"npm ci of the locked {spec} tree failed",
-            why=output[-600:] or f"npm exited {proc.returncode}",
+            why=output[-600:] or f"npm exited {done.returncode}",
             fix="fix the cause above and re-run `computer mcp install`",
         )
     if not _entry_path(prefix).is_file():

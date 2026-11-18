@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.11
+
+- `computer mcp install` stopped by SIGTERM or SIGHUP (a closed terminal, a service manager) now stops npm and everything npm
+  started before it exits, as Ctrl-C already did; it still dies of the same signal. Each npm ci runs in a staging directory of
+  its own, so a retry never installs into a directory that an npm left running by a SIGKILLed install still writes to; such a
+  directory is deleted by a later install once that npm has exited (#15).
+- The browser download for PDF output is stopped with everything it started (puppeteer's unzip) when it times out or the install
+  is interrupted, so nothing keeps writing the browser cache afterwards. It also gets npm's `node-options` setting as
+  `NODE_OPTIONS` (in place of the caller's, as npm did when it ran the download): an npmrc's `node-options=--use-system-ca`
+  behind a TLS-intercepting proxy works again. With no npm setting the caller's `NODE_OPTIONS` is kept (README, PDF output)
+  (#16).
+
 ## 0.3.10
 
 - Two machines with the same name can no longer end up serving one public hostname (which split ChatGPT's traffic between them

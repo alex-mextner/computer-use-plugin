@@ -4,10 +4,13 @@ import hashlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -56,8 +59,8 @@ def test_install_runs_npm_ci_from_the_bundled_lock_and_records_node(toolchain: P
     assert "--install-strategy=hoisted" in npm_args and "--include=optional" in npm_args
     # Only puppeteer's browser download runs, with the recorded node, in the finished tree.
     assert (toolchain / "node.log").read_text().split() == [str(tree), str(tree / "node_modules/puppeteer/install.mjs")]
-    # npm ci ran in a staging directory that then became the tree, never in a tree a client may be launching.
-    assert npm_args[npm_args.index("--prefix") + 1] == str(root / "trees" / f".staging-{LOCK_SHA256}")
+    # npm ci ran in a staging directory of this attempt that then became the tree, never in a tree a client may be launching.
+    assert npm_args[npm_args.index("--prefix") + 1].startswith(str(root / "trees" / f".staging-{LOCK_SHA256}-"))
     assert sorted(path.name for path in (root / "trees").iterdir()) == [LOCK_SHA256]
     # npm ci installed from exactly the bundled lock, next to the bundled package.json it must agree with.
     assert (toolchain / "npm-lock.json").read_bytes() == lock
@@ -305,6 +308,175 @@ def test_an_interrupted_install_stops_npm_before_cleaning_up(
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)
     assert not any((managed_dir(tmp_path / "home") / "trees").iterdir())
+
+
+def _running(pid: int) -> bool:
+    """Alive and not a zombie (a killed orphan waits for init to reap it, and a zombie writes nothing)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def _eventually(condition: Callable[[], bool], seconds: float = 10) -> bool:
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _start_installer(bin_dir: Path, prelude: str = "") -> subprocess.Popen[bytes]:
+    """`computer mcp install` in a process of its own (it is to die of a signal), `bin_dir` on PATH, `prelude` run first."""
+    return subprocess.Popen(
+        [sys.executable, "-c", f"{prelude}\nimport sys\nfrom computerlib.cli import main\nsys.exit(main(['mcp', 'install']))"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _installer_mid_npm(tmp_path: Path) -> tuple[subprocess.Popen[bytes], int, int, Path]:
+    """A `computer mcp install` process whose npm ci (with a child of its own) hangs: (installer, npm pid, child pid, prefix)."""
+    bin_dir = tmp_path / "hanging"
+    fake_node(bin_dir)
+    state = tmp_path / "npm.state"
+    fake_npm(
+        bin_dir,
+        mode="hang",
+        side_effect=f'/bin/sleep 60 & echo "$$ $! $prefix" > "{state}.tmp" && mv "{state}.tmp" "{state}"',
+    )
+    installer = _start_installer(bin_dir)
+    assert _eventually(state.exists), "npm ci never started"
+    npm_pid, child_pid, prefix = state.read_text().split()
+    return installer, int(npm_pid), int(child_pid), Path(prefix)
+
+
+def _stop_session(leader: int) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(leader, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_a_terminated_install_stops_npms_whole_session_and_a_retry_starts_clean(
+    toolchain: Path, tmp_path: Path, signum: signal.Signals
+) -> None:
+    installer, npm_pid, child_pid, prefix = _installer_mid_npm(tmp_path)
+    installer.send_signal(signum)
+    # It still dies of the signal (a service manager sees what it sent), only after stopping npm and cleaning up.
+    assert installer.wait(timeout=30) == -signum
+    assert not _running(npm_pid)
+    assert _eventually(lambda: not _running(child_pid))
+    assert not prefix.exists()
+    assert main(["mcp", "install"]) == 0  # at once, with a working npm (the toolchain on PATH)
+    assert sorted(path.name for path in (managed_dir(tmp_path / "home") / "trees").iterdir()) == [LOCK_SHA256]
+
+
+def test_a_retry_after_a_killed_installer_never_shares_the_staging_its_npm_still_writes(
+    toolchain: Path, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    installer, npm_pid, _, orphan_prefix = _installer_mid_npm(tmp_path)
+    request.addfinalizer(lambda: _stop_session(npm_pid))
+    installer.kill()  # SIGKILL runs no cleanup at all: npm, in a session of its own, lives on
+    installer.wait(timeout=30)
+    assert _running(npm_pid)
+    assert main(["mcp", "install"]) == 0  # at once, while the orphan still runs
+    npm_args = (toolchain / "npm.log").read_text().split()
+    retry_prefix = Path(npm_args[npm_args.index("--prefix") + 1])
+    assert retry_prefix != orphan_prefix
+    assert retry_prefix.parent == orphan_prefix.parent
+    assert orphan_prefix.is_dir()  # not deleted under the orphan, and never activated
+    assert launch_spec().entry == tree_dir(tmp_path / "home") / ENTRY
+    _stop_session(npm_pid)
+    assert _eventually(lambda: not _running(npm_pid))
+    assert main(["mcp", "install"]) == 0  # nothing writes there any more, so it is reclaimed
+    assert sorted(path.name for path in (managed_dir(tmp_path / "home") / "trees").iterdir()) == [LOCK_SHA256]
+
+
+def test_a_termination_the_moment_npm_starts_still_stops_it(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "hanging"
+    fake_node(bin_dir)
+    fake_npm(bin_dir, mode="hang")
+    pid_file = tmp_path / "npm.pid"
+    # SIGTERM handled inside Popen, right after npm ci started: before the caller holds the process it has to stop.
+    prelude = (
+        "import os, signal, subprocess\n"
+        "real_popen = subprocess.Popen\n"
+        "def popen(args, *rest, **kwargs):\n"
+        "    proc = real_popen(args, *rest, **kwargs)\n"
+        "    if 'ci' in args:\n"
+        f"        with open({str(pid_file)!r}, 'w') as out:\n"
+        "            out.write(str(proc.pid))\n"
+        "        signal.raise_signal(signal.SIGTERM)\n"
+        "    return proc\n"
+        "subprocess.Popen = popen\n"
+    )
+    installer = _start_installer(bin_dir, prelude)
+    assert installer.wait(timeout=30) == -signal.SIGTERM
+    npm_pid = int(pid_file.read_text())
+    orphaned = _running(npm_pid)
+    _stop_session(npm_pid)  # a failing run must not leave the orphan behind
+    assert not orphaned
+    assert not any(path.name.startswith(".staging-") for path in (managed_dir(tmp_path / "home") / "trees").iterdir())
+
+
+def test_a_timed_out_browser_download_stops_its_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bin_dir = tmp_path / "bin"
+    unzip = tmp_path / "unzip.pid"
+    # Like puppeteer's download: node starts an unzip child, and the download outlasts the timeout.
+    fake_node(bin_dir, browser_side_effect=f'/bin/sleep 60 & echo $! > "{unzip}"; exec /bin/sleep 60')
+    fake_npm(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setattr("computerlib.desktop_commander._NPM_TIMEOUT_SECONDS", 2)
+    assert main(["mcp", "install"]) == 0
+    assert "warning: the browser for PDF output was not downloaded" in capsys.readouterr().out
+    assert _eventually(lambda: not _running(int(unzip.read_text())))
+
+
+@pytest.mark.parametrize(
+    ("caller", "npm_setting", "expected"),
+    [
+        ("", "--use-system-ca", "--use-system-ca"),
+        ("--max-old-space-size=4096", "--use-system-ca", "--use-system-ca"),  # npm replaces it: options could conflict
+        ("--max-old-space-size=4096", "null", "--max-old-space-size=4096"),  # npm's unset default
+        ("", "null", ""),
+    ],
+)
+def test_npms_node_options_reach_the_browser_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caller: str, npm_setting: str, expected: str
+) -> None:
+    bin_dir = tmp_path / "bin"
+    seen = tmp_path / "node-options"
+    fake_node(bin_dir, browser_side_effect=f'echo "$NODE_OPTIONS" > "{seen}"')
+    fake_npm(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("FAKE_NPM_CONFIG", npm_setting)  # what `node-options=` in an npmrc makes npm answer
+    if caller:
+        monkeypatch.setenv("NODE_OPTIONS", caller)
+    else:
+        monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    assert main(["mcp", "install"]) == 0
+    assert seen.read_text().strip() == expected
+    # Asked from the tree, where puppeteer's postinstall ran under npm.
+    tree = tree_dir(tmp_path / "home")
+    assert (bin_dir / "npm-config.log").read_text().split() == [str(tree), "config", "get", "node-options"]
+
+
+def test_npms_node_options_are_found_through_a_relative_path_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bin_dir = tmp_path / "bin"
+    seen = tmp_path / "node-options"
+    fake_node(bin_dir, browser_side_effect=f'echo "$NODE_OPTIONS" > "{seen}"')
+    fake_npm(bin_dir)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "bin:/usr/bin:/bin")  # npm config get runs from the tree, where `bin` is not
+    monkeypatch.setenv("FAKE_NPM_CONFIG", "--use-system-ca")
+    assert main(["mcp", "install"]) == 0
+    assert seen.read_text().strip() == "--use-system-ca"
 
 
 @pytest.mark.parametrize("tree", ["../../elsewhere", None, "a" * 64 + "/.."])

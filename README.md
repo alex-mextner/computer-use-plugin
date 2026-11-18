@@ -94,6 +94,12 @@ settings: both fixes need root, following
 
 Installing a packaged Google Chrome or Chromium does not help while the cache holds a build: Desktop Commander prefers the cache.
 
+`computer mcp install` downloads that build itself (puppeteer's postinstall, run with node directly). The download gets npm's
+`node-options` setting as `NODE_OPTIONS`, as it would under npm: when an npmrc sets it (for example `node-options=--use-system-ca`
+behind a TLS-intercepting proxy), it replaces your own `NODE_OPTIONS` for the download instead of being appended, because two
+option sets can conflict (`--use-openssl-ca` with `--use-bundled-ca`) and node then does not start. With no npm setting, your
+`NODE_OPTIONS` is kept.
+
 ## Claude Desktop: `computer claude`
 
 - `computer claude install` sets `mcpServers["desktop-commander"]` in `${XDG_CONFIG_HOME:-~/.config}/Claude/claude_desktop_config.json`
