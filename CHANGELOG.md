@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+- Stopping or restarting the ChatGPT bridge unit no longer marks it failed: `computer chatgpt quiet` returned the stopped
+  mcp-auth-proxy's `-15` as its own exit status (exit 241), which systemd records as `Result=exit-code` (and answers with any
+  `OnFailure=` a user drop-in adds). quiet now dies of the same signal as the command it runs, so a stop by SIGTERM is clean; a
+  crash signal that writes a core (SIGSEGV, SIGABRT, ...) or one it cannot re-raise becomes exit 128+N, so a crash of the
+  command never makes quiet dump a core of its own (#25).
+
 ## 0.3.0
 
 - Several machines, one command each: `computer chatgpt install --domain <zone>` serves this machine at
@@ -29,7 +37,6 @@
 - `connect` and `install` suggest the machine name as the ChatGPT connector name (was `Computer`), so connectors stay apart.
 - A CPU without pinned builds is refused before anything is written, naming the covered ones (x86_64, aarch64; mcp-auth-proxy has
   no 32-bit ARM build). macOS stays out of scope (no systemd).
-
 ## 0.2.2
 
 - `computer mcp serve` starts Desktop Commander with `--no-onboarding` (#21). In a HOME where Desktop Commander had never run (any
@@ -37,7 +44,6 @@
   page, currently everyone, `xdg-open https://desktopcommander.app/welcome/`). In a desktop session where that started a new
   browser, xdg-open waited until the browser closed, so `initialize` was never answered and the ChatGPT stack's mcp-auth-proxy
   exited. The welcome page is no longer opened.
-
 ## 0.2.1
 
 - `computer mcp install` installs Desktop Commander 0.3.2 with its whole dependency tree locked: `npm ci --ignore-scripts` from a
