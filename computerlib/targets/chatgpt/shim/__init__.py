@@ -16,10 +16,15 @@ LOG_KEEP = 3
 
 
 def build_server(
-    external_url: str, listen_port: int, upstream_port: int, log_file: Path | None, upstream_host: str = "127.0.0.1"
+    external_url: str,
+    listen_port: int,
+    upstream_port: int,
+    log_file: Path | None,
+    upstream_host: str = "127.0.0.1",
+    oauth_db: Path | None = None,
 ) -> ShimServer:
     log = RotatingLog(log_file, LOG_MAX_BYTES, LOG_KEEP) if log_file else None
-    clients = ClientTable(log_file.parent / "clients.json" if log_file else None)
+    clients = ClientTable(log_file.parent / "clients.json" if log_file else None, oauth_db)
     rules = ShimRules(external_url, log, clients)
     return ShimServer(("127.0.0.1", listen_port), (upstream_host, upstream_port), rules)
 
