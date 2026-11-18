@@ -1,4 +1,4 @@
-"""Hermetic defaults for every test: scratch HOME/XDG, no credentials in the environment, no network."""
+"""Hermetic defaults for every test: scratch HOME/XDG, no credentials in the environment, no network, no host AppArmor state."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+from computerlib import pdf_sandbox
 
 CREDENTIAL_ENV = ("PASSWORD", "CONTROL_PLANE_API_KEY", "OPENAI_API_KEY", "CLOUDFLARE_API_TOKEN", "TUNNEL_TOKEN")
 
@@ -20,6 +22,9 @@ def hermetic_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
         monkeypatch.delenv(name, raising=False)
     for name in CREDENTIAL_ENV:
         monkeypatch.delenv(name, raising=False)
+    # The host's userns restriction and profiles would add a write_pdf warning to install, doctor and status output.
+    monkeypatch.setattr(pdf_sandbox, "RESTRICTION_FILE", tmp_path / "apparmor_restrict_unprivileged_userns")
+    monkeypatch.setattr(pdf_sandbox, "PROFILE_DIR", tmp_path / "apparmor.d")
     yield
 
 

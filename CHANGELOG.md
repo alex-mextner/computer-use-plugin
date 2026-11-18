@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.9
+
+- On Ubuntu 23.10+ (AppArmor's `kernel.apparmor_restrict_unprivileged_userns=1`), Desktop Commander's write_pdf fails with
+  "No usable sandbox!" when the Chrome it launches, the Chrome for Testing build in its own cache, has no AppArmor profile that
+  allows `userns,`. `computer mcp install` (and so the claude and chatgpt installs) now prints a warning naming that Chrome and
+  the two fixes, both needing root: a profile for the downloaded build (the README has it) or the sysctl.
+  `computer chatgpt doctor` shows the same as a `[warn]` check and `computer claude status` as a `[warn] pdf:` line; neither
+  changes their exit code, since the shell and file tools are not affected. Nothing changes system settings (#14).
+
 ## 0.3.8
 
 - The ChatGPT shim no longer holds request bodies in memory before mcp-auth-proxy has checked the login: it read each body whole

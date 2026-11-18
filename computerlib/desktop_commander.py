@@ -36,6 +36,7 @@ from pathlib import Path
 
 from agenttools_errors import AgentToolError, MissingDepError, MissingTargetError, NetworkError
 
+from computerlib import pdf_sandbox
 from computerlib.fileio import atomic_write
 from computerlib.jsonvalue import as_dict, is_object
 from computerlib.paths import data_home
@@ -172,7 +173,15 @@ def _real_node(found: str) -> str:
 
 
 def install() -> str:
-    """Make the pinned install present and return a one-line report. Raises AgentToolError (127 no node/npm, 7 network)."""
+    """Make the pinned install present and return its report, with a `warning:` line per problem it found. Raises
+    AgentToolError (127 no node/npm, 7 network)."""
+    report = _install_pinned()
+    # Also for an install that was already there: the restriction and the profiles can change between runs.
+    sandbox = pdf_sandbox.problem()
+    return f"{report}\nwarning: {sandbox.detail}; fix: {sandbox.fix}" if sandbox else report
+
+
+def _install_pinned() -> str:
     node = _real_node(_require("node"))
     platform = _node_platform(node)
     package_json, lock = bundled_lock_files()
