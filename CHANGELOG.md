@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+
+- A path or name in the chatgpt config that contains U+007F (DEL) or another control character no longer breaks every later
+  `computer chatgpt` command: config.toml wrote it raw, which TOML forbids, so loading the config failed. Such characters are now
+  written as `\uXXXX` escapes, and the file is always read and written as UTF-8 whatever the locale (#23).
+
 ## 0.3.3
 
 - The MCP handshake probe (`computer claude status`) reports a server that exits before answering as `server exited before

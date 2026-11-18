@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,13 @@ def test_the_proxy_and_the_shim_cannot_share_a_port() -> None:
 def test_rendered_settings_with_quotes_parse_back_unchanged() -> None:
     odd = Settings(hostname='we"ird\\host')
     assert parse_settings(render_settings(odd)) == odd
+
+
+def test_a_path_with_control_and_non_bmp_characters_survives_a_save_and_load() -> None:
+    odd = Settings(state_dir="/tmp/del\x7f-esc\x1b-tab\t-nl\n-emoji\U0001f600")
+    path = save_settings(odd)
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["state_dir"] == odd.state_dir
+    assert load_settings() == odd
 
 
 def test_the_layout_follows_xdg_variables_and_falls_back_to_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
