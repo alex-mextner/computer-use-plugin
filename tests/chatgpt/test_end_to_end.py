@@ -26,7 +26,7 @@ from computerlib.pins import binary_pin
 from computerlib.targets.chatgpt.install import sha256_file
 from computerlib.targets.chatgpt.password import ensure_password, read_password
 from computerlib.targets.chatgpt.settings import Layout, Settings, save_settings
-from tests.chatgpt.cli_helpers import free_port, install_core_stand_in
+from tests.chatgpt.cli_helpers import free_ports, install_core_stand_in
 from tests.chatgpt.oauth_driver import FORM, OPENAI_UA, Driver
 
 PROXY_BIN = os.environ.get("COMPUTER_PROXY_BIN", "")
@@ -79,7 +79,7 @@ def stack(tmp_path: Path) -> Generator[Stack]:
     pin = binary_pin("mcp-auth-proxy")
     assert pin is not None
     assert sha256_file(Path(PROXY_BIN)) == pin.sha256, "COMPUTER_PROXY_BIN is not the pinned mcp-auth-proxy build"
-    shim_port, proxy_port = free_port(), free_port()
+    shim_port, proxy_port = free_ports(2)
     settings = Settings(scheme="http", hostname=f"127.0.0.1:{shim_port}", shim_port=shim_port, proxy_port=proxy_port)
     save_settings(settings)
     layout = _install_scratch_stack(settings, tmp_path)

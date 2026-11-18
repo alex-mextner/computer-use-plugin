@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+- The MCP handshake probe (`computer claude status`) reports a server that exits before answering as `server exited before
+  answering (exit N)` every time. Which of our write or our read first noticed the exit was a race, and the write side said
+  `server closed its input (exit None)` instead; both sides now wait for the exit and quote its real status, and a server that
+  closes its pipes but keeps running is reported as a timeout (#19).
+
 ## 0.3.2
 
 - `computer chatgpt doctor` fails `<binary> installed` when the binary has the pinned digest but you cannot execute it (a
@@ -7,7 +14,6 @@
   to run `computer chatgpt init`; init now repairs such a binary to mode 0755 instead of leaving it (#30).
 - The fix hint of doctor's `proxy answers` check names the bridge unit (`<prefix>-bridge.service`), where the proxy runs; it
   named a `<prefix>-proxy.service` that does not exist (#20).
-
 ## 0.3.1
 
 - Stopping or restarting the ChatGPT bridge unit no longer marks it failed: `computer chatgpt quiet` returned the stopped

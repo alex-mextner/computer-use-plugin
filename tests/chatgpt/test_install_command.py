@@ -31,7 +31,7 @@ from computerlib.targets.chatgpt.context import Context
 from computerlib.targets.chatgpt.password import read_password
 from computerlib.targets.chatgpt.settings import config_file, load_settings
 from tests.chatgpt import fake_cloudflared
-from tests.chatgpt.cli_helpers import free_port, layout, run_cli, stand_in_for_the_network
+from tests.chatgpt.cli_helpers import free_ports, layout, run_cli, stand_in_for_the_network
 from tests.chatgpt.conftest import FakeMachine
 from tests.chatgpt.fake_cloudflared import FAKE_CLOUDFLARED, account_cert
 
@@ -108,7 +108,8 @@ def world(machine: FakeMachine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     account = tmp_path / "cloudflare-account"
     monkeypatch.setenv("FAKE_CF_STATE", str(account))
     monkeypatch.setattr(zone, "doh_ns", _answers({"example.test": CLOUDFLARE_NS}))
-    found = World(account, [], [], free_port(), free_port(), free_port())
+    proxy_port, shim_port, metrics_port = free_ports(3)
+    found = World(account, [], [], proxy_port, shim_port, metrics_port)
 
     def fake_open(url: str) -> bool:
         found.opened.append(url)
@@ -183,7 +184,7 @@ def test_a_changed_setting_rewrites_and_restarts_only_the_changed_units(
 ) -> None:
     assert run_cli(capsys, *world.args()).code == 0
     calls_before = len(machine.calls())
-    world.metrics_port = free_port()
+    (world.metrics_port,) = free_ports(1, exclude=(world.proxy_port, world.shim_port, world.metrics_port))
     assert run_cli(capsys, *world.args()).code == 0
     restarts = [c for c in machine.calls()[calls_before:] if c.startswith("restart")]
     assert restarts == ["restart computer-chatgpt-tunnel.service"]
