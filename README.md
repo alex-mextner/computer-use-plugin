@@ -176,7 +176,7 @@ replaced). It lets its holder create tunnels and DNS records in the account, so 
 |---|---|
 | `install` | the one-command setup above. Flags: `--domain`, `--machine-name`, `--hostname`, `--tunnel-name`, `--cloudflare-cert`, `--cloudflared-dir`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--yes`, `--skip-dns`, `--no-linger`, `--timeout`, `--name` (default: the machine name) |
 | `init` | building block: choose the mode (default `public`), write the config, install the pinned pieces, create the password (public) and unit files. Flags: `--mode`, `--domain`, `--machine-name`, `--hostname`, `--scheme`, `--tunnel-name`, `--tunnel-id`, `--tunnel-health-port`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--cloudflared-dir`, `--lang`, `--no-install`, `--no-units` |
-| `login` | building block: public: Cloudflare login, create the named tunnel (an existing one without local credentials only when named with `--tunnel-name`), route the hostname (asks before replacing a record). Flags: `--tunnel-name`, `--cloudflare-cert`, `--yes`, `--skip-dns`. Tunnel mode: store the runtime API key. Flag: `--key-stdin` |
+| `login` | building block: public: Cloudflare login, create the named tunnel (an existing one without local credentials only when named with `--tunnel-name`), route the hostname (asks before replacing a record; keeping it exits 2). Flags: `--tunnel-name`, `--cloudflare-cert`, `--yes`, `--skip-dns`. Tunnel mode: store the runtime API key. Flag: `--key-stdin` |
 | `start` | enable and start the stack, wait until it serves. Flags: `--no-wait`, `--no-linger` |
 | `stop` | stop the stack now (stays enabled for the next boot) |
 | `restart` | restart in start order and wait until it serves |

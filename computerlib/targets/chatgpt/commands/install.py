@@ -37,7 +37,7 @@ from computerlib.targets.chatgpt import zone
 from computerlib.targets.chatgpt.cloudflare import read_account_cert
 from computerlib.targets.chatgpt.commands.connect import connector_name, print_instructions
 from computerlib.targets.chatgpt.commands.init import add_public_options, apply_flags, install_units, prepare, require_pins
-from computerlib.targets.chatgpt.commands.login import add_cert_option, require_tunnel_name, setup_tunnel
+from computerlib.targets.chatgpt.commands.login import add_cert_option, record_kept_error, require_tunnel_name, setup_tunnel
 from computerlib.targets.chatgpt.commands.start import start_stack
 from computerlib.targets.chatgpt.context import load_context
 from computerlib.targets.chatgpt.machine import require_hostname
@@ -217,14 +217,7 @@ def run(args: argparse.Namespace) -> int:
         adopt=args.tunnel_name is not None,
         cert=cert,
     ):
-        raise ConfigError(
-            what=f"{settings.hostname} still points somewhere else",
-            why="its existing DNS record was kept, so ChatGPT would not reach this PC",
-            fix=(
-                "re-run the same command with --yes to replace the record (only when it is not another machine's), "
-                f"or choose another {'--machine-name' if settings.domain else '--hostname'}"
-            ),
-        )
+        raise record_kept_error(settings)
     print(f"config: {save_settings(settings)}")
     changed_units = install_units(settings, layout)
     ctx = load_context()

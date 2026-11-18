@@ -3,7 +3,8 @@ route the DNS name). Tunnel mode: store the OpenAI runtime API key (Tunnels Read
 `computer chatgpt install` runs the public half (`setup_tunnel`) as one of its steps.
 
 Each step is skipped when it is already done, so re-running is safe. Creating a NEW DNS record needs no question (the hostname was
-given for exactly that); replacing an EXISTING record that points elsewhere asks first (`--yes` answers it). cloudflared's
+given for exactly that); replacing an EXISTING record that points elsewhere asks first (`--yes` answers it), and keeping it fails
+with exit 2, since the hostname would not reach this machine (`--skip-dns` leaves DNS to the user and succeeds). cloudflared's
 certificate, credentials and config live in this target's own directory (`--cloudflared-dir`), never in ~/.cloudflared unless
 pointed there; nothing secret or identifying (tunnel id, credentials) is printed.
 
@@ -177,6 +178,18 @@ def _route(cloudflare: Cloudflare, name: str, hostname: str, assume_yes: bool, d
     return True
 
 
+def record_kept_error(settings: Settings) -> ConfigError:
+    """The user declined to replace the hostname's DNS record: the tunnel is unreachable, so login and install fail."""
+    return ConfigError(
+        what=f"{settings.hostname} still points somewhere else",
+        why="its existing DNS record was kept, so ChatGPT would not reach this PC",
+        fix=(
+            "re-run the same command with --yes to replace the record (only when it is not another machine's), "
+            f"or choose another {'--machine-name' if settings.domain else '--hostname'}"
+        ),
+    )
+
+
 def setup_tunnel(
     settings: Settings, layout: Layout, *, assume_yes: bool, skip_dns: bool, adopt: bool = False, cert: AccountCert | None = None
 ) -> bool:
@@ -228,7 +241,7 @@ def run(args: argparse.Namespace) -> int:
         else ctx.settings.tunnel_name or ctx.settings.machine_name or default_machine_name("--tunnel-name")
     )
     settings = replace(ctx.settings, tunnel_name=name)
-    setup_tunnel(
+    routed = setup_tunnel(
         settings,
         ctx.layout,
         assume_yes=args.yes,
@@ -236,9 +249,12 @@ def run(args: argparse.Namespace) -> int:
         adopt=explicit,
         cert=cert,
     )
+    # The tunnel exists even when its DNS record was kept, so its name is saved before the failure is reported.
     if ctx.settings.tunnel_name != name:
         save_settings(settings)
         print(f"config: tunnel_name = {name}; run `computer chatgpt init` to write the cloudflared unit")
+    if not routed:
+        raise record_kept_error(settings)
     return 0
 
 

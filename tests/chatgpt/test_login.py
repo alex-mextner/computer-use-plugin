@@ -107,8 +107,9 @@ def test_an_existing_record_that_points_elsewhere_is_kept_without_consent(
 ) -> None:
     fake_cloudflared.existing_record(account, HOST, "someone-elses-tunnel")
     result = run_cli(capsys, "login")
-    assert result.code == 0
+    assert result.code == ConfigError.exit_code
     assert "kept the existing record" in result.out
+    assert f"{HOST} still points somewhere else" in result.err and "--yes" in result.err
     assert fake_cloudflared.routes(account) == {HOST: "someone-elses-tunnel"}
     assert not any("--overwrite-dns" in call for call in _calls(account))
 
@@ -122,9 +123,11 @@ def test_yes_replaces_an_existing_record(capsys: pytest.CaptureFixture[str], acc
 
 
 def test_skip_dns_never_touches_the_zone(capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]) -> None:
-    run_cli(capsys, "login", "--skip-dns")
+    fake_cloudflared.existing_record(account, HOST, "someone-elses-tunnel")
+    result = run_cli(capsys, "login", "--skip-dns")
+    assert result.code == 0, result.err
     assert not any(" route " in call for call in _calls(account))
-    assert fake_cloudflared.routes(account) == {}
+    assert fake_cloudflared.routes(account) == {HOST: "someone-elses-tunnel"}
 
 
 def test_lost_credentials_of_an_existing_tunnel_are_refused_unless_the_tunnel_is_named(
