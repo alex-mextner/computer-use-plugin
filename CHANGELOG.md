@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2
+
+- The ChatGPT shim no longer holds request bodies in memory before mcp-auth-proxy has checked the login: it read each body whole
+  (up to 32 MiB) before forwarding it, with one thread per connection and no limit, so 64 unauthenticated uploads that held back
+  their last bytes kept about 2 GiB. Bodies now go to the proxy as they arrive (64 KiB at a time, plus the small copy the access
+  log and the client label read). When the proxy answers before the body is through (its 401 to an unauthenticated upload),
+  also while the client pauses mid-body, the shim stops sending and passes that answer on at once. A client that leaves
+  mid-body is never forwarded as a complete request. At most 128 connections are served at once: more get a 503, with one
+  journal line per minute (#29).
+
 ## 0.3.1
 
 - Stopping or restarting the ChatGPT bridge unit no longer marks it failed: `computer chatgpt quiet` returned the stopped

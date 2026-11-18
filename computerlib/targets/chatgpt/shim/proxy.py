@@ -1,12 +1,18 @@
 """Minimal streaming HTTP reverse proxy that runs the shim rules (stand-in for the agent-tools proxy engine).
 
-WHAT: listens on one loopback port, forwards every request to one upstream (mcp-auth-proxy), streams the response back without
-buffering (MCP's Server-Sent Events must not be held), and calls `ShimRules` at the points they care about.
-INVARIANTS: an unframed (streamed) response is relayed through a bounded buffer: a client that stops reading stalls the upstream
-instead of growing memory, and a client that goes away (also while the stream is idle) makes the shim shut the upstream connection
-and end the helper thread. Hop-by-hop headers (RFC 9110 7.6.1) are not forwarded in either direction; rules never delay or change
-what is forwarded except the three documented changes (challenge header, protected-resource path, idle SSE comment); a logging
-failure never touches a request; an upstream failure is a 502 and one journal line per minute.
+WHAT: listens on one loopback port, forwards every request to one upstream (mcp-auth-proxy), streams the request body there and
+the response back without buffering (MCP's Server-Sent Events must not be held), and calls `ShimRules` at the points they care
+about.
+INVARIANTS: the shim is the public entry point and the proxy authenticates only once it has the request, so nothing a client sends
+before that may grow memory: a request body is passed on piece by piece (one STREAM_CHUNK at a time, plus the copy of at most
+PEEK_MAX_BYTES the rules ask for); an upstream answer that comes before the body is through is relayed at once, also while the
+client pauses; and at most MAX_HANDLERS connections are served at once, more are answered 503 from the accept loop without a
+thread. An unframed (streamed) response is relayed through a bounded buffer: a client that stops reading stalls the
+upstream instead of growing memory, and a client that goes away (also while the stream is idle) makes the shim shut the upstream
+connection and end the helper thread. Hop-by-hop headers (RFC 9110 7.6.1) are not forwarded in either direction; rules never
+delay or change what is forwarded except the three documented changes (challenge header, protected-resource path, idle SSE
+comment); a logging failure never touches a request; an upstream failure is a 502 and one journal line per minute, as is a
+refused connection.
 NOTE: a generic engine belongs in agent-tools/lib (L2 work); this is the target-specific minimum until it ships, kept to the same
 hook points so the swap is local to this file.
 """
@@ -14,6 +20,7 @@ hook points so the swap is local to this file.
 from __future__ import annotations
 
 import http.client
+import itertools
 import queue
 import select
 import socket
@@ -22,8 +29,16 @@ import threading
 import time
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BufferedIOBase, BufferedReader
+from typing import TypeIs
 
-from computerlib.targets.chatgpt.shim.rules import CAPTURE_MAX_BYTES, OPEN_COMMENT_SECONDS, Exchange, ShimRules
+from computerlib.targets.chatgpt.shim.rules import (
+    CAPTURE_MAX_BYTES,
+    OPEN_COMMENT_SECONDS,
+    PEEK_MAX_BYTES,
+    Exchange,
+    ShimRules,
+)
 
 HOP_BY_HOP = frozenset(
     {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
@@ -34,6 +49,10 @@ IDLE_TIMEOUT_SECONDS = 65.0
 STREAM_CHUNK = 64 * 1024
 STREAM_BUFFER_PIECES = 8  # x STREAM_CHUNK: the most a stalled client can make the shim hold for one stream
 STREAM_POLL_SECONDS = 0.25  # how often an idle stream checks that its client is still there
+MAX_HANDLERS = 128  # connections served at once; cloudflared keeps up to 100 idle ones to its origin by default
+BUSY_RESPONSE = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n"
+
+Request = socket.socket | tuple[bytes, socket.socket]  # socketserver's request: a TCP server always gets the socket
 
 
 class _UpstreamConnection(http.client.HTTPConnection):
@@ -54,6 +73,19 @@ class _UpstreamConnection(http.client.HTTPConnection):
             except OSError:
                 pass
 
+    def send_body(self, body: _RequestBody) -> bool:
+        """Send a request body; False when the upstream answered or closed before it had all of it. mcp-auth-proxy rejects an
+        unauthenticated upload without reading it: sending stops there, so `getresponse` relays that 401 instead of a reset."""
+        if body.length == 0:
+            return True
+        body.upstream = self.stream_socket
+        try:
+            for piece in itertools.chain(body.pieces(), [b""] if body.length is None else []):
+                self.send(f"{len(piece):x}\r\n".encode() + piece + b"\r\n" if body.length is None else piece)
+        except (_UpstreamAnswered, OSError):
+            return False  # an OSError here is the upstream's: its answer, or the error, comes out of getresponse
+        return True
+
 
 def end_to_end(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """The headers without hop-by-hop ones and without those the Connection header names: they describe one TCP hop."""
@@ -67,33 +99,182 @@ def end_to_end(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return [(n, v) for n, v in headers if n.lower() not in HOP_BY_HOP and n.lower() not in named]
 
 
+class _UpstreamAnswered(Exception):
+    """The upstream answered while the shim was still reading the client's body for it."""
+
+
+def _is_reader(stream: BufferedIOBase) -> TypeIs[BufferedReader]:
+    return isinstance(stream, BufferedReader)
+
+
+class _BodyError(Exception):
+    """The client's request body cannot be forwarded whole; `status` is what the shim answers (400 bad framing, 413 too big) or
+    499 (the client went away or stalled past the idle timeout)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+class _RequestBody:
+    """A request body read from the client as the upstream takes it, so the shim never holds it whole (#29). `length` is None for
+    a chunked body, which is passed on chunked. Keeps a copy only while the body is at most `keep` bytes, for the rules."""
+
+    def __init__(self, rfile: BufferedIOBase, client: socket.socket, length: int | None, keep: int) -> None:
+        self.length = length
+        self.upstream: socket.socket | None = None  # while set, an answer from it ends the body (see `_wait`)
+        self._rfile = rfile
+        self._client = client
+        self._keep = keep
+        self._kept: list[bytes] = []
+        self._size = 0
+
+    def pieces(self) -> Generator[bytes]:
+        """The body in pieces of at most STREAM_CHUNK; raises `_BodyError` when it cannot be forwarded whole and
+        `_UpstreamAnswered` when the upstream answers first. A failed read of the client becomes `_BodyError(499)`, so an OSError
+        out of the upstream connection is always the upstream's."""
+        try:
+            yield from self._read(self.length) if self.length is not None else self._chunked()
+        except OSError as error:
+            raise _BodyError(499) from error
+
+    def kept(self) -> bytes | None:
+        """The body when it was at most `keep` bytes, else None: a truncated copy could hide a second client_id."""
+        return b"".join(self._kept) if self._size <= self._keep else None
+
+    def _wait(self) -> None:
+        """Return when the next read of the client cannot block. A client that pauses must not keep an early upstream answer
+        (the 401 to an unauthenticated upload) waiting until the idle timeout, holding a handler slot: the upstream is polled
+        together with the client, and its answer raises `_UpstreamAnswered`."""
+        if self.upstream is None:
+            return
+        buffered = self._buffered()
+        poller = select.poll()  # not select(): a busy shim may hold descriptors past FD_SETSIZE
+        poller.register(self._client, select.POLLIN)
+        poller.register(self.upstream, select.POLLIN)
+        timeout = self._client.gettimeout()
+        ready = {fd for fd, _ in poller.poll(0 if buffered else None if timeout is None else timeout * 1000)}
+        if self.upstream.fileno() in ready:
+            raise _UpstreamAnswered
+        if not buffered and not ready:
+            raise _BodyError(499)  # idle past the handler's timeout, as a blocking read would have timed out
+
+    def _buffered(self) -> bool:
+        """True when `rfile` already holds client bytes (the socket then says nothing about them). Peeks with the socket
+        non-blocking, so an empty buffer costs one read that returns at once."""
+        if not _is_reader(self._rfile):
+            return False  # an unbuffered rfile holds nothing the socket does not show
+        timeout = self._client.gettimeout()
+        self._client.setblocking(False)
+        try:
+            return bool(self._rfile.peek(1))
+        finally:
+            self._client.settimeout(timeout)
+
+    def _readline(self, limit: int) -> bytes:
+        self._wait()
+        return self._rfile.readline(limit)
+
+    def _read(self, count: int) -> Generator[bytes]:
+        while count:
+            self._wait()
+            piece = self._rfile.read1(min(count, STREAM_CHUNK))
+            if not piece:
+                raise _BodyError(499)
+            count -= len(piece)
+            self._size += len(piece)
+            if self._size <= self._keep:
+                self._kept.append(piece)
+            yield piece
+
+    def _chunked(self) -> Generator[bytes]:
+        while True:
+            line = self._readline(1024)
+            if not line:
+                raise _BodyError(499)
+            try:
+                size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                raise _BodyError(400) from None
+            if size < 0:
+                raise _BodyError(400)
+            if size == 0:
+                while self._readline(1024).strip():  # trailers
+                    pass
+                return
+            if self._size + size > MAX_REQUEST_BYTES:
+                raise _BodyError(413)
+            yield from self._read(size)
+            self._readline(8)
+
+
+class _ThrottledReport:
+    """One journal line per ERROR_REPORT_SECONDS for an event that can repeat at network speed, with its count since the last."""
+
+    def __init__(self, unit: str) -> None:
+        self._unit = unit
+        self._last = 0.0
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def note(self, message: str) -> None:
+        with self._lock:
+            self._count += 1
+            now = time.monotonic()
+            if now - self._last < ERROR_REPORT_SECONDS:
+                return
+            try:
+                print(f"{message}; {self._count} {self._unit} since the last report", file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # a lost journal line must not end the request or the accept loop that reports it (stderr gone: EPIPE)
+            self._last = now
+            self._count = 0
+
+
 class ShimServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 128
+    max_handlers = MAX_HANDLERS
 
     def __init__(self, listen: tuple[str, int], upstream: tuple[str, int], rules: ShimRules) -> None:
         super().__init__(listen, _Handler)
         self.upstream = upstream
         self.rules = rules
-        self._last_report = 0.0
-        self._errors_since_report = 0
-        self._report_lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(self.max_handlers)
+        self._upstream_errors = _ThrottledReport("request(s)")
+        self._refusals = _ThrottledReport("connection(s)")
 
     def report_upstream_error(self, reason: str) -> None:
-        with self._report_lock:
-            self._errors_since_report += 1
-            now = time.monotonic()
-            if now - self._last_report < ERROR_REPORT_SECONDS:
-                return
-            print(
-                f"computer shim: upstream {self.upstream[0]}:{self.upstream[1]} failed ({reason}); "
-                f"{self._errors_since_report} request(s) since the last report",
-                file=sys.stderr,
-                flush=True,
-            )
-            self._last_report = now
-            self._errors_since_report = 0
+        self._upstream_errors.note(f"computer shim: upstream {self.upstream[0]}:{self.upstream[1]} failed ({reason})")
+
+    def process_request(self, request: Request, client_address: object) -> None:
+        """A connection over the cap gets a 503 from the accept loop and never a thread, so threads (and what each holds) are
+        bounded however many connections a stranger opens."""
+        if not self._slots.acquire(blocking=False):
+            self._refuse(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Request, client_address: object) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def _refuse(self, request: Request) -> None:
+        if isinstance(request, socket.socket):
+            try:
+                request.setblocking(False)  # the accept loop must never wait on a client: a full send buffer drops the answer
+                request.send(BUSY_RESPONSE)
+            except OSError:
+                pass
+        self.shutdown_request(request)
+        self._refusals.note(f"computer shim: {self.max_handlers} connections busy, refused one with 503")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -110,57 +291,35 @@ class _Handler(BaseHTTPRequestHandler):
         rules = self.server.rules
         request_headers = {name.lower(): value for name, value in self.headers.items()}
         kind = rules.peek_kind(self.command, path, request_headers)
-        body = self._read_body()
+        keep = PEEK_MAX_BYTES if kind == "mcp" else CAPTURE_MAX_BYTES if kind == "learn" else 0
+        body = self._request_body(keep)
         if body is None:
             return
         exchange = Exchange(self.command, path, 0, 0, request_headers)
-        if kind == "mcp":
-            exchange.request_body = body
-        elif kind == "learn" and len(body) <= CAPTURE_MAX_BYTES:
-            exchange.request_body = body  # a truncated copy could hide a second client_id: bigger bodies are not captured
         try:
             exchange.status = self._forward(path, body, kind == "learn", exchange)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             exchange.status = 499
             self.close_connection = True
+        if kind:
+            exchange.request_body = body.kept()
         exchange.millis = round((time.monotonic() - started) * 1000)
         rules.record(exchange)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 
-    def _read_body(self) -> bytes | None:
-        """The request body, decoded from chunked framing if needed; None after answering 4xx for an unusable one."""
+    def _request_body(self, keep: int) -> _RequestBody | None:
+        """The request body to stream upstream; None after answering 4xx for one whose framing is unusable or declared too big."""
         encoding = self.headers.get("Transfer-Encoding", "").lower()
         length = self.headers.get("Content-Length", "")
         if "chunked" in encoding:
-            return self._read_chunked()
+            return _RequestBody(self.rfile, self.connection, None, keep)
         if not length:
-            return b""
+            return _RequestBody(self.rfile, self.connection, 0, keep)
         if not length.isdigit() or int(length) > MAX_REQUEST_BYTES:
             self._reply_error(400 if not length.isdigit() else 413)
             return None
-        return self.rfile.read(int(length))
-
-    def _read_chunked(self) -> bytes | None:
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            size_line = self.rfile.readline(1024).split(b";", 1)[0].strip()
-            try:
-                size = int(size_line, 16)
-            except ValueError:
-                self._reply_error(400)
-                return None
-            if size == 0:
-                while self.rfile.readline(1024).strip():  # trailers
-                    pass
-                return b"".join(chunks)
-            total += size
-            if total > MAX_REQUEST_BYTES:
-                self._reply_error(413)
-                return None
-            chunks.append(self.rfile.read(size))
-            self.rfile.readline(8)
+        return _RequestBody(self.rfile, self.connection, int(length), keep)
 
     def _reply_error(self, status: int, text: bytes = b"") -> None:
         self.send_response_only(status)
@@ -171,7 +330,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(text)
         self.close_connection = True
 
-    def _forward(self, path: str, body: bytes, capture_response: bool, exchange: Exchange) -> int:
+    def _forward(self, path: str, body: _RequestBody, capture_response: bool, exchange: Exchange) -> int:
         rules = self.server.rules
         headers = end_to_end(list(self.headers.items()))
         headers = [(n, v) for n, v in headers if n.lower() not in ("content-length", "expect")]
@@ -181,15 +340,27 @@ class _Handler(BaseHTTPRequestHandler):
             connection.putrequest(self.command, rules.upstream_target(self.path), skip_host=True, skip_accept_encoding=True)
             for name, value in headers:
                 connection.putheader(name, value)
-            if body or self.command in ("POST", "PUT", "PATCH"):
-                connection.putheader("Content-Length", str(len(body)))
-            connection.endheaders(body)
+            if body.length is None:
+                connection.putheader("Transfer-Encoding", "chunked")
+            elif body.length or self.command in ("POST", "PUT", "PATCH"):
+                connection.putheader("Content-Length", str(body.length))
+            connection.endheaders()
+            whole = connection.send_body(body)
             response = connection.getresponse()
+        except _BodyError as error:
+            connection.close()  # the upstream got an incomplete request: closing it is how it learns that
+            if error.status == 499:
+                self.close_connection = True
+            else:
+                self._reply_error(error.status)
+            return error.status
         except (OSError, http.client.HTTPException) as error:
             connection.close()
             self.server.report_upstream_error(type(error).__name__)
             self._reply_error(502, b"bad gateway")
             return 502
+        if not whole:
+            self.close_connection = True  # the rest of the client's body is still unread on this connection
         try:
             return self._relay(path, response, connection, capture_response, exchange)
         finally:
@@ -213,6 +384,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response_only(response.status, response.reason)
         for name, value in out:
             self.send_header(name, value)
+        if self.close_connection:
+            self.send_header("Connection", "close")  # a client must not send its next request on a connection the shim drops
         if chunked:
             self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
