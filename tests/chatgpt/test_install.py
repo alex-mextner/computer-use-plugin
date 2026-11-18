@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from agenttools_errors import AgentToolError, NetworkError
 
-from computerlib.pins import BinaryPin, ZipMemberPin, binary_pin, zip_member_pin
+from computerlib.pins import BinaryPin, ZipMemberPin, binary_pin, pinned_machines, zip_member_pin
 from computerlib.targets.chatgpt.install import ensure_binary, ensure_zip_member
 
 
@@ -68,6 +68,16 @@ def test_every_supported_architecture_has_a_pin_for_each_binary() -> None:
             pin = binary_pin(name, machine)
             assert pin is not None and len(pin.sha256) == 64 and pin.url.startswith("https://")
     assert binary_pin("mcp-auth-proxy", "riscv64") is None
+
+
+def test_arm64_pins_are_the_published_arm64_assets_and_32_bit_arm_has_none() -> None:
+    """aarch64 boards (an Odroid on a 64-bit OS) get the arm64 builds; armv7l has no mcp-auth-proxy build upstream, so no pin."""
+    proxy, tunnel = binary_pin("mcp-auth-proxy", "aarch64"), binary_pin("cloudflared", "aarch64")
+    assert proxy is not None and proxy.url.endswith("/mcp-auth-proxy-linux-arm64")
+    assert tunnel is not None and tunnel.url.endswith("/cloudflared-linux-arm64")
+    for name in ("mcp-auth-proxy", "cloudflared"):
+        assert binary_pin(name, "armv7l") is None
+        assert pinned_machines(name) == ("x86_64", "aarch64")
 
 
 MEMBER = b"#!/bin/sh\necho tunnel-client\n"

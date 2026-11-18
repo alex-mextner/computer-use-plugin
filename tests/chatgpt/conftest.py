@@ -10,7 +10,17 @@ from pathlib import Path
 
 import pytest
 
+from computerlib.targets.chatgpt import machine as machine_identity
 from tests.fakes import fake_node, fake_npm
+
+SYSTEM_HOSTNAME = "Test_Box.lan"  # the machine name every test sees by default: `test-box`
+
+
+@pytest.fixture(autouse=True)
+def system_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The machine name must not depend on the host the tests run on."""
+    monkeypatch.setattr(machine_identity, "system_hostname", lambda: SYSTEM_HOSTNAME)
+
 
 SYSTEMCTL = '''#!/usr/bin/env python3
 """Fake `systemctl --user`: keeps per-unit state in $FAKE_SYSTEMD_DIR and logs every call."""

@@ -8,6 +8,7 @@ Messages are the real ones of cloudflared 2026.10.7 (`route dns` success/"alread
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 _BODY = """
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 state = Path(os.environ["FAKE_CF_STATE"])
 state.mkdir(parents=True, exist_ok=True)
@@ -72,6 +73,8 @@ if command == "list":
     print(json.dumps([{"id": "00000000-0000-0000-0000-0000000000aa", "name": n} for n in tunnels if n == name]))
 elif command == "create":
     name = rest[-1]
+    if re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32}", name):
+        fail("tunnel name cannot be a UUID")
     if name in tunnels:
         fail("failed to create tunnel: Create Tunnel API call failed: tunnel with name already exists")
     write_credentials(rest[rest.index("--credentials-file") + 1])
@@ -136,3 +139,10 @@ def existing_record(state: Path, host: str, points_at: str) -> None:
     """A DNS record that already exists in the zone (another tunnel, or anything that is not ours)."""
     state.mkdir(parents=True, exist_ok=True)
     (state / "routes.json").write_text(json.dumps({**routes(state), host: points_at}))
+
+
+def account_cert(account: str) -> str:
+    """A certificate shaped like the one `cloudflared tunnel login` writes (made-up values), for `account`."""
+    token = {"zoneID": f"zone-{account}", "accountID": f"account-{account}", "apiToken": f"token-{account}"}
+    body = base64.b64encode(json.dumps(token).encode()).decode()
+    return f"-----BEGIN ARGO TUNNEL TOKEN-----\n{body}\n-----END ARGO TUNNEL TOKEN-----\n"

@@ -15,8 +15,11 @@ import argparse
 from computerlib.commandtree import Command
 from computerlib.targets.chatgpt.context import load_context
 from computerlib.targets.chatgpt.lifecycle import unit_names
+from computerlib.targets.chatgpt.processes import TUNNEL_SERVICE
 from computerlib.targets.chatgpt.removal import remove_tree
-from computerlib.targets.chatgpt.settings import config_dir
+from computerlib.targets.chatgpt.settings import config_dir, config_file
+from computerlib.targets.chatgpt.stack import SERVICES
+from computerlib.targets.chatgpt.units import unit_name
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
@@ -28,8 +31,13 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    ctx = load_context()
-    names = list(reversed(unit_names(ctx)))
+    # --purge also cleans up after a first install that stopped before saving the config (the account certificate is on disk).
+    configured = config_file().exists()
+    ctx = load_context(configured=not args.purge)
+    if configured:
+        names = list(reversed(unit_names(ctx)))
+    else:  # the mode is unknown without the config: stop the units of both, so no access path keeps running
+        names = [unit_name(ctx.settings.unit_prefix, service) for service in (TUNNEL_SERVICE, *reversed(SERVICES))]
     ctx.systemd.disable_now(names)
     ctx.systemd.remove(names)
     print(f"removed units: {', '.join(names)}")
