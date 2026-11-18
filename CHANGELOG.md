@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6
+
+- `computer chatgpt connect` over ssh (no `DISPLAY` or `WAYLAND_DISPLAY`) now prints the ChatGPT settings URL to open yourself.
+  It used its own copy of the browser opener that skipped the display check, so it ran `xdg-open` with nothing to show it on and
+  never printed the URL; it now uses the same opener as `computer chatgpt login` (#32).
+- Correction to the 0.2.2 entry: Desktop Commander waits on its welcome page not only on its first run in a HOME but until that
+  page has been opened once there; `--no-onboarding` covers both.
+
 ## 0.3.5
 
 - `computer chatgpt login` no longer exits 0 when you decline to replace an existing DNS record of the hostname: the record still

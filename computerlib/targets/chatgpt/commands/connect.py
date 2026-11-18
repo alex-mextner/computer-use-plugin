@@ -29,6 +29,7 @@ from computerlib.commandtree import Command
 from computerlib.targets.chatgpt import dialog
 from computerlib.targets.chatgpt.accessview import LogTail
 from computerlib.targets.chatgpt.checklist import STEPS, Checklist
+from computerlib.targets.chatgpt.cloudflare import open_in_browser
 from computerlib.targets.chatgpt.context import Context, load_context
 from computerlib.targets.chatgpt.lifecycle import tunnel_serving
 from computerlib.targets.chatgpt.machine import default_machine_name
@@ -64,14 +65,6 @@ def copy_to_clipboard(text: str) -> str | None:
         if result.returncode == 0:
             return tool
     return None
-
-
-def open_page(url: str) -> bool:
-    opener = shutil.which("xdg-open") or shutil.which("open")
-    if opener is None:
-        return False
-    subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    return True
 
 
 def print_instructions(ctx: Context, name: str, url: str) -> None:
@@ -217,8 +210,8 @@ def run_tunnel(ctx: Context, args: argparse.Namespace) -> int:
     if not args.no_copy:
         tool = copy_to_clipboard(tunnel_id)
         print(f"tunnel id copied to the clipboard ({tool})" if tool else f"tunnel id (no clipboard tool found): {tunnel_id}")
-    if not args.no_open and not open_page(dialog.SETTINGS_PAGE):
-        print(f"open {dialog.SETTINGS_PAGE} yourself (no browser opener found)")
+    if not args.no_open and not open_in_browser(dialog.SETTINGS_PAGE):
+        print(f"open {dialog.SETTINGS_PAGE} yourself (no display or browser opener on this machine)")
     if args.no_wait:
         return 0
     try:
@@ -268,8 +261,8 @@ def run(args: argparse.Namespace) -> int:
     if not args.no_copy:
         tool = copy_to_clipboard(server_url)
         print(f"server URL copied to the clipboard ({tool})" if tool else f"server URL (no clipboard tool found): {server_url}")
-    if not args.no_open and not open_page(dialog.SETTINGS_PAGE):
-        print(f"open {dialog.SETTINGS_PAGE} yourself (no browser opener found)")
+    if not args.no_open and not open_in_browser(dialog.SETTINGS_PAGE):
+        print(f"open {dialog.SETTINGS_PAGE} yourself (no display or browser opener on this machine)")
     if args.no_wait:
         return 0
     try:
