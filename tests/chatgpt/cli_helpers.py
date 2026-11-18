@@ -8,6 +8,8 @@ import json
 import socket
 import sys
 import zipfile
+from collections.abc import Collection
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,12 +91,27 @@ def stand_in_for_the_network(monkeypatch: pytest.MonkeyPatch, binaries: dict[str
 
 def free_port() -> int:
     """A loopback port nothing listens on (tests must never touch the real stack's ports)."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    return free_ports(1)[0]
+
+
+def free_ports(count: int, exclude: Collection[int] = ()) -> list[int]:
+    """`count` distinct free loopback ports, none in `exclude`.
+
+    Every probe socket stays bound until all ports are chosen: a probe closed before the next bind lets the kernel hand the
+    same port out again (about once in 20,000 pairs), and init refuses equal proxy and shim ports."""
+    with ExitStack() as stack:
+        ports: list[int] = []
+        while len(ports) < count:
+            probe = stack.enter_context(socket.socket())
+            probe.bind(("127.0.0.1", 0))
+            port: int = probe.getsockname()[1]
+            if port not in exclude:
+                ports.append(port)
+        return ports
 
 
 def init_args(**extra: str) -> list[str]:
+    proxy_port, shim_port = free_ports(2)
     args = [
         "init",
         "--hostname",
@@ -102,9 +119,9 @@ def init_args(**extra: str) -> list[str]:
         "--lang",
         "en",
         "--proxy-port",
-        str(free_port()),
+        str(proxy_port),
         "--shim-port",
-        str(free_port()),
+        str(shim_port),
     ]
     for key, value in extra.items():
         args += [f"--{key.replace('_', '-')}", value]

@@ -38,13 +38,25 @@ class HandshakeResult:
     tools: tuple[str, ...]
 
 
-def _send(proc: subprocess.Popen[bytes], message: dict[str, object]) -> None:
+def _early_exit(proc: subprocess.Popen[bytes], deadline: float) -> HandshakeError:
+    """The one report of a server that went away mid-handshake.
+
+    Whether a dying server first fails our write (its stdin is closed) or our read (its stdout hits EOF) is a race, so both
+    paths wait for it to exit and say the same thing; one that closed its pipes but keeps running is a timeout."""
+    try:
+        code = proc.wait(timeout=max(deadline - time.monotonic(), 0))
+    except subprocess.TimeoutExpired:
+        return HandshakeError("timed out waiting for the server")
+    return HandshakeError(f"server exited before answering (exit {code})")
+
+
+def _send(proc: subprocess.Popen[bytes], message: dict[str, object], deadline: float) -> None:
     assert proc.stdin is not None
     try:
         proc.stdin.write((json.dumps(message) + "\n").encode())
         proc.stdin.flush()
     except OSError as exc:
-        raise HandshakeError(f"server closed its input (exit {proc.poll()})") from exc
+        raise _early_exit(proc, deadline) from exc
 
 
 def _pop_reply(buffer: bytearray, request_id: int) -> dict[str, object] | None:
@@ -76,7 +88,7 @@ def _await_reply(proc: subprocess.Popen[bytes], buffer: bytearray, request_id: i
             raise HandshakeError("timed out waiting for the server")
         chunk = os.read(fd, 65536)
         if not chunk:
-            raise HandshakeError(f"server exited before answering (exit {proc.poll()})")
+            raise _early_exit(proc, deadline)
         buffer.extend(chunk)
 
 
@@ -144,10 +156,10 @@ def _exchange(proc: subprocess.Popen[bytes], deadline: float) -> HandshakeResult
         "capabilities": {},
         "clientInfo": {"name": "computer-status", "version": "1"},
     }
-    _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+    _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}, deadline)
     init = _result(_await_reply(proc, buffer, 1, deadline), "initialize")
-    _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
-    _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"}, deadline)
+    _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, deadline)
     listing = _result(_await_reply(proc, buffer, 2, deadline), "tools/list")
     info = as_dict(init.get("serverInfo"))
     return HandshakeResult(str(info.get("name", "")), str(info.get("version", "")), _tool_names(listing))

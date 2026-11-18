@@ -43,6 +43,7 @@ def test_init_never_prints_the_password_and_keeps_its_file_private(
 ) -> None:
     stand_in_for_the_network(monkeypatch)
     result = run_cli(capsys, *init_args())
+    assert result.code == 0, result.out + result.err
     password_file = layout().password_file
     secret = password_file.read_text().split("=", 1)[1].strip()
     assert secret and secret not in result.out + result.err
@@ -94,7 +95,8 @@ def test_commands_before_init_point_at_init(capsys: pytest.CaptureFixture[str], 
 
 def _init(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, shim: Running | None = None) -> None:
     stand_in_for_the_network(monkeypatch)
-    run_cli(capsys, *init_args())
+    init = run_cli(capsys, *init_args())
+    assert init.code == 0, init.out + init.err
     if shim is not None:
         save_settings(replace(load_settings(), shim_port=shim.port, proxy_port=shim.upstream_port))
 
