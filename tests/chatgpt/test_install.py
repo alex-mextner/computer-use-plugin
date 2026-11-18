@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import stat
 import zipfile
 from pathlib import Path
 
@@ -35,6 +36,28 @@ def test_a_second_install_downloads_nothing(tmp_path: Path) -> None:
         raise AssertionError("downloaded again")
 
     assert not ensure_binary(pin, tmp_path, fetch=forbidden).changed
+
+
+def test_a_checksum_correct_binary_without_the_exec_bit_is_repaired_to_0755_without_a_download(tmp_path: Path) -> None:
+    payload = b"binary"
+    pin = _pin(payload)
+    installed = ensure_binary(pin, tmp_path, fetch=lambda url: payload).path
+    installed.chmod(0o644)  # a backup restore keeps the bytes but drops the mode
+
+    def forbidden(url: str) -> bytes:
+        raise AssertionError("downloaded again")
+
+    assert ensure_binary(pin, tmp_path, fetch=forbidden).changed
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o755
+
+
+def test_a_checksum_correct_zip_member_without_the_exec_bit_is_repaired_to_0755(tmp_path: Path) -> None:
+    archive = _zip({"tunnel-client": MEMBER})
+    pin = _zip_pin(archive)
+    installed = ensure_zip_member(pin, tmp_path, fetch=lambda url: archive).path
+    installed.chmod(0o644)
+    assert ensure_zip_member(pin, tmp_path, fetch=lambda url: archive).changed
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o755
 
 
 def test_a_download_with_the_wrong_digest_is_refused_and_the_installed_file_is_untouched(tmp_path: Path) -> None:

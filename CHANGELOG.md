@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2
+
+- `computer chatgpt doctor` fails `<binary> installed` when the binary has the pinned digest but you cannot execute it (a
+  backup restore that dropped the exec bit leaves systemd unable to start the unit while doctor said all was well), and says
+  to run `computer chatgpt init`; init now repairs such a binary to mode 0755 instead of leaving it (#30).
+- The fix hint of doctor's `proxy answers` check names the bridge unit (`<prefix>-bridge.service`), where the proxy runs; it
+  named a `<prefix>-proxy.service` that does not exist (#20).
+
 ## 0.3.1
 
 - Stopping or restarting the ChatGPT bridge unit no longer marks it failed: `computer chatgpt quiet` returned the stopped

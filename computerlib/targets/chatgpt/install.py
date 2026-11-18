@@ -4,8 +4,9 @@ WHAT: `ensure_binary` downloads a pinned asset, verifies its sha256 and moves it
 the same for one file inside a pinned zip (digest of the zip checked before it is opened, digest of the member before it is
 installed, nothing else is ever extracted). Desktop Commander is not installed here: it comes from the shared core
 (`computer mcp install`).
-INVARIANTS: idempotent (a file with the pinned digest is left alone), an installed file is replaced only after the download
-verified, a failed or mismatching download leaves the installed file untouched, nothing here runs a downloaded file.
+INVARIANTS: idempotent (a file with the pinned digest is not downloaded again; only its mode is repaired to 0755 when the user
+cannot execute it), an installed file is replaced only after the download verified, a failed or mismatching download leaves
+the installed file untouched, nothing here runs a downloaded file.
 NOTE: a generic pinned-installer belongs in agent-tools/lib once one ships; this is the target-specific minimum until then.
 """
 
@@ -77,11 +78,22 @@ def _place(payload: bytes, target: Path) -> None:
         raise
 
 
+def _make_executable(target: Path) -> bool:
+    """Give a checksum-correct file mode 0755 when the user cannot run it; True when the mode was changed.
+
+    A binary restored from a backup keeps its digest but may lose the exec bit, and systemd then cannot start the unit.
+    """
+    if os.access(target, os.X_OK):
+        return False
+    os.chmod(target, 0o755)
+    return True
+
+
 def ensure_binary(pin: BinaryPin, bin_dir: Path, fetch: Fetch | None = None) -> Installed:
     fetch = fetch or urllib_fetch  # resolved at call time so a test can stand in for the network
     target = bin_dir / pin.name
     if target.is_file() and sha256_file(target) == pin.sha256:
-        return Installed(target, changed=False)
+        return Installed(target, changed=_make_executable(target))
     payload = fetch(pin.url)
     actual = hashlib.sha256(payload).hexdigest()
     if actual != pin.sha256:
@@ -100,7 +112,7 @@ def ensure_zip_member(pin: ZipMemberPin, bin_dir: Path, fetch: Fetch | None = No
     fetch = fetch or urllib_fetch
     target = bin_dir / pin.name
     if target.is_file() and sha256_file(target) == pin.member_sha256:
-        return Installed(target, changed=False)
+        return Installed(target, changed=_make_executable(target))
     archive = fetch(pin.url)
     actual = hashlib.sha256(archive).hexdigest()
     if actual != pin.zip_sha256:
