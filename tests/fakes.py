@@ -18,17 +18,19 @@ def write_executable(path: Path, body: str) -> Path:
     return path
 
 
-def fake_node(directory: Path, *stub_args: str, exec_path: Path | None = None, version: str = "24.0.0") -> Path:
+def fake_node(
+    directory: Path, *stub_args: str, exec_path: Path | None = None, version: str = "24.0.0", browser_side_effect: str = ""
+) -> Path:
     """A `node` that answers `-p` with its exec path (default itself) and version, logs a run of puppeteer's `install.mjs` to
-    `node.log` next to itself (exit `$FAKE_BROWSER_EXIT`, default 0), answers the browser check (`-e`) with 1 when
-    `$FAKE_BROWSER_MISSING` is set, and is otherwise the stub MCP server."""
+    `node.log` next to itself, runs the shell snippet `browser_side_effect` (exit `$FAKE_BROWSER_EXIT`, default 0), answers the
+    browser check (`-e`) with 1 when `$FAKE_BROWSER_MISSING` is set, and is otherwise the stub MCP server."""
     path = directory / "node"
     reported = exec_path if exec_path is not None else path
     return write_executable(
         path,
         '#!/bin/sh\ncase "$1 $2" in "-p "*process.platform*) echo "linux x64"; exit 0;; esac\n'
         f'if [ "$1" = "-p" ]; then echo "{reported}"; echo "{version}"; exit 0; fi\n'
-        f'case "$1" in */install.mjs) echo "$PWD $@" >> "{directory}/node.log"; '
+        f'case "$1" in */install.mjs) echo "$PWD $@" >> "{directory}/node.log"; {browser_side_effect}\n'
         'echo "browser download failed" >&2; exit "${FAKE_BROWSER_EXIT:-0}";; esac\n'
         'if [ "$1" = "-e" ]; then [ -z "$FAKE_BROWSER_MISSING" ]; exit $?; fi\n'
         f'exec "{sys.executable}" "{STUB_SERVER}" "$@" {" ".join(stub_args)}\n',
@@ -38,17 +40,22 @@ def fake_node(directory: Path, *stub_args: str, exec_path: Path | None = None, v
 def fake_npm(
     directory: Path, *, mode: Literal["ok", "fail", "no_files", "hang"] = "ok", fail_with: str = "", side_effect: str = ""
 ) -> Path:
-    """An `npm` that, like `npm ci`, first deletes the prefix's node_modules, then logs its argv, keeps the package-lock.json it
-    found in the prefix as `npm-lock.json` next to itself, and lays out the package files `npm ci --prefix <dir>` would.
+    """An `npm` that answers `npm config get` with `$FAKE_NPM_CONFIG` (default `null`, npm's unset) after logging its directory
+    and argv to `npm-config.log`, and otherwise, like `npm ci`, first deletes the prefix's node_modules, then logs its argv, keeps
+    the package-lock.json it found in the prefix as `npm-lock.json` next to itself, and lays out the package files
+    `npm ci --prefix <dir>` would.
 
     `fail` prints `fail_with` on stderr and exits 1; `no_files` exits 0 without installing; `hang` never returns. `side_effect` is
-    a shell snippet run first (something else touching the machine while npm is busy).
+    a shell snippet run before npm ci touches anything (something else touching the machine while npm is busy); `$prefix` is set.
     """
     start = (
-        f"#!/bin/sh\n{side_effect}\n"
+        "#!/bin/sh\n"
+        f'if [ "$1 $2" = "config get" ]; then echo "$PWD $@" >> "{directory}/npm-config.log"; '
+        'echo "${FAKE_NPM_CONFIG:-null}"; exit 0; fi\n'
         'os="${npm_config_os:-linux}"; cpu="${npm_config_cpu:-x64}"\n'
         'for arg in "$@"; do if [ "$take" = 1 ]; then prefix="$arg"; fi; take=0; [ "$arg" = "--prefix" ] && take=1\n'
         '  case "$arg" in --os=*) os="${arg#--os=}";; --cpu=*) cpu="${arg#--cpu=}";; esac; done\n'
+        f"{side_effect}\n"
         'if [ -n "$prefix" ]; then rm -rf "$prefix/node_modules"; fi\n'
     )
     if mode == "fail":
