@@ -11,6 +11,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BufferedIOBase
 from pathlib import Path
 
 from computerlib.targets.chatgpt.shim import build_server
@@ -36,6 +37,30 @@ class Upstream:
     seen: list[Seen] = field(default_factory=lambda: list[Seen]())
 
 
+def _read_body(handler: BaseHTTPRequestHandler) -> bytes | None:
+    """The request body as sent (chunked framing decoded); None when the connection ended inside chunked framing, so a body the
+    shim cut short is never recorded as whole. A short Content-Length body is recorded short."""
+    if "chunked" in handler.headers.get("Transfer-Encoding", "").lower():
+        return _read_chunked(handler.rfile)
+    length = int(handler.headers.get("Content-Length") or 0)
+    return handler.rfile.read(length) if length else b""
+
+
+def _read_chunked(rfile: BufferedIOBase) -> bytes | None:
+    parts: list[bytes] = []
+    while line := rfile.readline():
+        size = int(line.split(b";")[0].strip(), 16)
+        if size == 0:
+            while (trailer := rfile.readline()).strip():
+                pass
+            return b"".join(parts) if trailer else None
+        part = rfile.read(size)
+        if len(part) < size or not rfile.readline():
+            return None
+        parts.append(part)
+    return None
+
+
 def _handler(upstream: Upstream) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -44,10 +69,13 @@ def _handler(upstream: Upstream) -> type[BaseHTTPRequestHandler]:
             pass
 
         def _serve(self) -> None:
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length) if length else b""
+            body = _read_body(self)
+            if body is None:
+                return
             path = self.path.partition("?")[0]
             upstream.seen.append(Seen(self.command, self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+            if len(body) < int(self.headers.get("Content-Length") or 0):
+                return  # the shim cut the request short: nobody is left to answer
             if path in upstream.streams:
                 upstream.streams[path](self)
                 return
