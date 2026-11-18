@@ -169,7 +169,8 @@ replaced). It lets its holder create tunnels and DNS records in the account, so 
   is the absolute `computer mcp serve` command, so Desktop Commander comes from the shared core.
 - **shim** adds what ChatGPT's setup needs and the proxy lacks: a `WWW-Authenticate: Bearer resource_metadata=...` challenge on every
   401 outside the login pages, the path-suffix form of `/.well-known/oauth-protected-resource`, and an SSE comment on an idle event
-  stream so Cloudflare releases the headers. It also writes the access log.
+  stream so Cloudflare releases the headers. It also writes the access log. It passes request bodies on as they arrive (never
+  holding one whole before the proxy has checked the login) and serves at most 128 connections at once, answering more with 503.
 - **cloudflared** runs the named tunnel with `--config`, `--origincert` and `--credentials-file` from this target's directory.
 - Units `computer-chatgpt-{bridge,shim,tunnel}.service` (`--unit-prefix` to rename) run with `Restart=always` and
   `StartLimitIntervalSec=0`: a crash loop or a network that is down at boot never leaves a unit dead for good.
