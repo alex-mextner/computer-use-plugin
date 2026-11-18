@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2
+
+- `computer mcp serve` starts Desktop Commander with `--no-onboarding` (#21). In a HOME where Desktop Commander had never run (any
+  new machine), its `initialize` answer waited for its welcome page (a feature-flag fetch, then, for the A/B arm that gets the
+  page, currently everyone, `xdg-open https://desktopcommander.app/welcome/`). In a desktop session where that started a new
+  browser, xdg-open waited until the browser closed, so `initialize` was never answered and the ChatGPT stack's mcp-auth-proxy
+  exited. The welcome page is no longer opened.
+
 ## 0.2.1
 
 - `computer mcp install` installs Desktop Commander 0.3.2 with its whole dependency tree locked: `npm ci --ignore-scripts` from a

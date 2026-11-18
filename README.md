@@ -52,6 +52,8 @@ login in front of Desktop Commander, and a small shim that adds what ChatGPT's c
   them, 7 on a network failure).
 - `computer mcp serve` is what a client launches: it replaces itself with the pinned Desktop Commander over stdio, needs
   no `PATH`, and prints only MCP protocol on stdout. Exit 5 with a fix message if `computer mcp install` has not been run.
+  Desktop Commander runs with `--no-onboarding`: on its first run in a HOME it may otherwise answer `initialize` only after
+  opening its welcome page with `xdg-open`, which never returns while a newly started browser stays open.
 
 ## Claude Desktop: `computer claude`
 

@@ -393,7 +393,8 @@ def test_serve_execs_recorded_node_under_a_minimal_environment(toolchain: Path, 
     home = tmp_path / "home"
     # env -i style: no PATH entry for node, so only the recorded absolute path can work.
     result = handshake(sys.executable, ["-m", "computerlib.cli", "mcp", "serve"], minimal_env(home), timeout=20)
-    assert result.server_version == str(tree_dir(home) / ENTRY)
+    # The stub echoes its argv: the entry file, then the switch that keeps a first run from waiting on a browser (#21).
+    assert result.server_version == f"{tree_dir(home) / ENTRY} --no-onboarding"
 
 
 def test_install_records_the_binary_node_reports_not_the_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
