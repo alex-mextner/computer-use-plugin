@@ -4,9 +4,9 @@ Tunnel mode checks instead: the tunnel id, the pinned tunnel-client, Desktop Com
 mode 600), unit files, the unit, lingering, and tunnel-client's own health port (ready, control plane polled); there is nothing
 public to probe.
 
-Checks: configuration, pinned installs (digest of every binary), password file mode, unit files up to date, units active and
-lingering, local probes (shim, proxy), the 401 challenge through the shim, the cloudflared readiness endpoint, and (unless
---local) the same challenge through the public URL. Exit 0 when all pass, 3 otherwise. `--json` prints the list.
+Checks: configuration, pinned installs (digest and exec bit of every binary), password file mode, unit files up to date, units
+active and lingering, local probes (shim, proxy), the 401 challenge through the shim, the cloudflared readiness endpoint, and
+(unless --local) the same challenge through the public URL. Exit 0 when all pass, 3 otherwise. `--json` prints the list.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import stat
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -49,6 +50,11 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="print the checks as JSON")
 
 
+def _not_executable(name: str, path: Path) -> Check:
+    # The digest survives a backup restore that drops the exec bit, but systemd then cannot start the unit.
+    return Check(name, False, f"{path} is not executable", f"run `computer chatgpt init` (or chmod 755 {path})")
+
+
 def _binary(ctx: Context, name: str) -> Check:
     pin = binary_pin(name)
     path = ctx.layout.bin_dir / name
@@ -60,6 +66,8 @@ def _binary(ctx: Context, name: str) -> Check:
         return Check(
             f"{name} installed", False, f"{path} does not match the pinned {pin.version} digest", "run `computer chatgpt init`"
         )
+    if not os.access(path, os.X_OK):
+        return _not_executable(f"{name} installed", path)
     return Check(f"{name} installed", True, f"{pin.version}, digest matches the pin")
 
 
@@ -77,6 +85,8 @@ def _tunnel_client(ctx: Context) -> Check:
             f"{path} does not match the pinned {pin.version} digest",
             "run `computer chatgpt init`",
         )
+    if not os.access(path, os.X_OK):
+        return _not_executable("tunnel-client installed", path)
     return Check("tunnel-client installed", True, f"{pin.version}, digest matches the pin")
 
 
@@ -188,14 +198,18 @@ def _linger(ctx: Context) -> Check:
 
 
 def _local(ctx: Context) -> list[Check]:
+    # The proxy has no unit of its own: it runs inside the bridge unit, so its journal is the bridge's.
     checks = [
         Check(
             f"{label} answers",
             local_alive(port),
             f"127.0.0.1:{port}",
-            f"journalctl --user -u {unit_name(ctx.settings.unit_prefix, label)}",
+            f"journalctl --user -u {unit_name(ctx.settings.unit_prefix, process)}",
         )
-        for label, port in (("proxy", ctx.settings.proxy_port), ("shim", ctx.settings.shim_port))
+        for label, process, port in (
+            ("proxy", "bridge", ctx.settings.proxy_port),
+            ("shim", "shim", ctx.settings.shim_port),
+        )
     ]
     ok, detail = challenge_ok(f"http://127.0.0.1:{ctx.settings.shim_port}")
     checks.append(

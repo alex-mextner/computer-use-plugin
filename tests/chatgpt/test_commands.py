@@ -202,6 +202,33 @@ def test_doctor_names_what_is_wrong_and_how_to_fix_it_without_changing_anything(
     assert [c for c in machine.calls()[len(before) :] if not c.startswith("show ")] == []
 
 
+def test_doctor_fails_a_checksum_correct_binary_without_the_exec_bit_and_init_repairs_it(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init(capsys, monkeypatch)
+    binary = layout().bin_dir / "mcp-auth-proxy"
+    binary.chmod(0o644)  # a backup restore keeps the bytes but drops the mode; systemd cannot exec it
+    result = run_cli(capsys, "doctor", "--local")
+    assert "[FAIL] mcp-auth-proxy installed" in result.out and "is not executable" in result.out
+    assert f"run `computer chatgpt init` (or chmod 755 {binary})" in result.out
+    run_cli(capsys, *init_args())
+    assert stat.S_IMODE(binary.stat().st_mode) == 0o755
+    assert "[ok] mcp-auth-proxy installed" in run_cli(capsys, "doctor", "--local").out
+
+
+def test_doctor_points_each_local_probe_at_the_unit_that_runs_it(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init(capsys, monkeypatch)
+    save_settings(replace(load_settings(), unit_prefix="dc-mcp"))
+    checks = {c["name"]: c for c in json.loads(run_cli(capsys, "doctor", "--local", "--json").out)}
+    # The proxy runs inside the bridge unit; there is no dc-mcp-proxy.service to read.
+    assert not checks["proxy answers"]["ok"]
+    assert checks["proxy answers"]["fix"] == "journalctl --user -u dc-mcp-bridge.service"
+    assert not checks["shim answers"]["ok"]
+    assert checks["shim answers"]["fix"] == "journalctl --user -u dc-mcp-shim.service"
+
+
 def test_doctor_json_lists_every_check(
     capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
