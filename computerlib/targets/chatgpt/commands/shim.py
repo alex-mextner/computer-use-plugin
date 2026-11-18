@@ -14,10 +14,21 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--listen-port", type=int, required=True, help="loopback port to listen on (the tunnel points here)")
     parser.add_argument("--upstream-port", type=int, required=True, help="loopback port of mcp-auth-proxy")
     parser.add_argument("--log-file", default="", help="access log path; empty = no access log")
+    parser.add_argument(
+        "--oauth-db",
+        default="",
+        help="mcp-auth-proxy's OAuth store (<data dir>/db), read-only, to name the client of a token the shim never saw issued",
+    )
 
 
 def run(args: argparse.Namespace) -> int:
-    server = build_server(args.external_url, args.listen_port, args.upstream_port, Path(args.log_file) if args.log_file else None)
+    server = build_server(
+        args.external_url,
+        args.listen_port,
+        args.upstream_port,
+        Path(args.log_file) if args.log_file else None,
+        oauth_db=Path(args.oauth_db) if args.oauth_db else None,
+    )
     print(f"computer shim listening 127.0.0.1:{args.listen_port} -> 127.0.0.1:{args.upstream_port}", flush=True)
     serve_until_signalled(server)
     print("computer shim stopped", flush=True)

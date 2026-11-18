@@ -139,7 +139,7 @@ class ShimRules:
         headers = exchange.request_headers
         authorization = headers.get("authorization", "")
         if exchange.path == "/mcp":
-            signal = self._clients.class_of_token(authorization)
+            signal = self._clients.class_of_token(authorization, accepted=200 <= exchange.status < 400)
         entry = Entry(
             time=now_iso(),
             status=exchange.status,

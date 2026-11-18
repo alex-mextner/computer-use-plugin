@@ -23,11 +23,14 @@ freely.
 Remembered (clients.json, mode 0600, next to the access log): client_id -> class in two tables, jti -> client_id, oldest dropped
 first. Registration is open to anyone, so the table of merely registered clients (MAX_CLIENTS) is evictable by a flood of
 registrations; a client that completed a token exchange (which needs the owner's password login) moves to a second table
-(MAX_EXCHANGED) that registrations cannot touch, so a flood never takes the classification of a connected ChatGPT away while its
-tokens are valid. A flood between a client's registration and its first exchange (the length of one password login) still evicts
-it.
-No secrets: no redirect URIs, tokens or codes. A token issued before the table existed is `unverified` until its
-client's next /.idp/token exchange (the token lifetime, about a day).
+(MAX_EXCHANGED) that registrations cannot touch.
+The tables are a cache, not the truth: when the proxy ACCEPTED a token (2xx/3xx) that the tables cannot attribute (issued before
+the shim watched its exchange: a cutover, a lost or evicted entry, a client registered before the table existed), the shim reads
+the proxy's own OAuth store (oauthdb.py: the client each access token was issued to, with its redirect URIs) and remembers the
+answer. So neither a restart nor another client's registrations or exchanges can leave a valid ChatGPT token unverified, and a
+forged token (rejected by the proxy, or absent from its store) still names no client. A lookup reads only the few pages on the
+way to the token's and its client's keys, so it needs no rate limit; a rejected token never triggers one.
+No secrets: no redirect URIs, tokens or codes are kept or logged.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qsl, urlsplit
 
+from computerlib.targets.chatgpt.shim import oauthdb
 from computerlib.targets.chatgpt.shim.jsonish import as_list, as_object, parse_object
 
 MAX_CLIENTS = 64
@@ -124,8 +128,9 @@ def _remember[V](table: OrderedDict[str, V], key: str, value: V, limit: int) -> 
 
 
 class ClientTable:
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | None, oauth_db: Path | None = None) -> None:
         self._path = path
+        self._oauth_db = oauth_db
         self._clients: OrderedDict[str, ClientClass] = OrderedDict()  # registered, not yet proven by a token exchange
         self._exchanged: OrderedDict[str, ClientClass] = OrderedDict()
         self._tokens: OrderedDict[str, str] = OrderedDict()
@@ -193,10 +198,31 @@ class ClientTable:
                 self._save()
             return known
 
-    def class_of_token(self, authorization: str) -> ClientClass | None:
+    def class_of_token(self, authorization: str, accepted: bool = False) -> ClientClass | None:
+        """The class of the client a token was issued to. `accepted`: the proxy answered the request 2xx/3xx, so the token is
+        valid and an unknown one may be looked up in the proxy's store (never for a rejected one: a stranger cannot make the
+        shim read the store)."""
+        jti = token_id(authorization)
         with self._lock:
-            client_id = self._tokens.get(token_id(authorization), "")
-            return self._class_of_client(client_id) if client_id else None
+            client_id = self._tokens.get(jti, "") if jti else ""
+            known = self._class_of_client(client_id) if client_id else None
+        if known is not None or not accepted or self._oauth_db is None:
+            return known
+        return self._from_proxy(self._oauth_db, authorization, jti)
+
+    def _from_proxy(self, oauth_db: Path, authorization: str, jti: str) -> ClientClass | None:
+        client = oauthdb.client_of_token(oauth_db, oauthdb.token_signature(authorization))
+        if client is None or not SAFE_ID.match(client.client_id):
+            return None
+        found = redirect_class(list(client.redirect_uris))
+        with self._lock:
+            # The proxy issued this token after a password login, so the client completed an exchange: the protected table.
+            _remember(self._exchanged, client.client_id, found, MAX_EXCHANGED)
+            self._clients.pop(client.client_id, None)
+            if jti:
+                _remember(self._tokens, jti, client.client_id, MAX_TOKENS)
+            self._save()
+        return found
 
 
 def label(user_agent: str, status: int, signal: ClientClass | None) -> str:
