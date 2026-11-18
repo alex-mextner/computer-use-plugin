@@ -21,7 +21,9 @@ from computerlib.targets import discover_targets
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="computer",
-        description="Give a chat client (Claude Desktop today) a shell and files on this PC through MCP (Desktop Commander).",
+        description=(
+            "Give a chat client (Claude Desktop or ChatGPT) a shell and files on this PC through MCP (Desktop Commander)."
+        ),
         epilog=EXIT_CODES_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,

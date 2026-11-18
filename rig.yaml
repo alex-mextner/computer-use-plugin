@@ -10,8 +10,8 @@ agent_hooks:
 task:
   code_prefix: CCU
 
-# The private repo cannot run Actions minutes (account billing), so `gh ship` falls back to the local gate in
-# .ship-config. The workflows are still installed/written so the gates run on any runner that is available.
+# The repo is public, so the Actions workflows run the gates; when CI is structurally down `gh ship` falls back to the local gate
+# in .ship-config.
 # The tests/lint/types gate is hand-written in .github/workflows/ci.yml (the rig `tests` slot runs bare pytest without installing
 # the package and its git dependency).
 ci:
