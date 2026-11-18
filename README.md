@@ -59,10 +59,14 @@ login in front of Desktop Commander, and a small shim that adds what ChatGPT's c
 
 - `computer claude install` sets `mcpServers["desktop-commander"]` in `${XDG_CONFIG_HOME:-~/.config}/Claude/claude_desktop_config.json`
   to the absolute path of this `computer` executable with `mcp serve`, runs `computer mcp install`, and makes sure
-  `~/.config/autostart/claude-desktop.desktop` exists and is enabled. Every other key of the config is preserved, the write is
-  atomic, a timestamped backup is made first, and invalid JSON is refused (exit 2) without touching the file. Claude Desktop is
-  never restarted by this tool: restart it yourself to pick the change up.
-- `computer claude status` checks the config entry, the executable, the autostart entry, and performs a real MCP handshake
+  `~/.config/autostart/claude-desktop.desktop` exists, is enabled and starts a program that exists. Every other key of the config
+  is preserved, the write is atomic, a timestamped backup is made first, and invalid JSON is refused (exit 2) without touching the
+  file. An autostart entry that is fine is never rewritten (it may carry your own Exec); a disabled one is re-enabled, one whose
+  Exec is missing or names a program that does not exist gets only its Exec line replaced, and an empty file or one without a
+  `[Desktop Entry]` section is replaced; each after a backup. Exec is written with the Desktop Entry spec's quoting and escaping.
+  Claude Desktop is never restarted by this tool: restart it yourself to pick the change up.
+- `computer claude status` checks the config entry, the executable, the autostart entry (present, has a `[Desktop Entry]`
+  section, enabled, Exec program exists), and performs a real MCP handshake
   (`initialize`, `tools/list`) against the configured command under a minimal environment. Exit 0 healthy, 3 unhealthy.
 - `computer claude uninstall` removes only the `desktop-commander` entry (after a backup); the managed install and the autostart
   entry stay.

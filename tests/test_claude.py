@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from computerlib.cli import main
+from computerlib.targets.claude import autostart
 from tests.fakes import fake_computer, fake_node, fake_npm, write_executable
 
 CLAUDE_BIN = "/usr/lib/claude-desktop/claude-desktop"
@@ -123,9 +124,12 @@ def test_install_creates_missing_autostart(computer_bin: Path, claude_binary: Pa
     assert "X-GNOME-Autostart-enabled=true" in text
 
 
-def test_install_leaves_enabled_autostart_alone(computer_bin: Path, claude_binary: Path, autostart_path: Path) -> None:
+def test_install_leaves_enabled_autostart_alone(
+    tmp_path: Path, computer_bin: Path, claude_binary: Path, autostart_path: Path
+) -> None:
+    own = write_executable(tmp_path / "somewhere/else", "#!/bin/sh\n")
     autostart_path.parent.mkdir(parents=True)
-    original = '[Desktop Entry]\nType=Application\nExec="/somewhere/else" --startup\nX-GNOME-Autostart-enabled=true\n'
+    original = f'[Desktop Entry]\nType=Application\nExec="{own}" --startup\nX-GNOME-Autostart-enabled=true\n'
     autostart_path.write_text(original)
     assert main(["claude", "install"]) == 0
     assert autostart_path.read_text() == original
@@ -134,13 +138,13 @@ def test_install_leaves_enabled_autostart_alone(computer_bin: Path, claude_binar
 def test_install_reenables_disabled_autostart(computer_bin: Path, claude_binary: Path, autostart_path: Path) -> None:
     autostart_path.parent.mkdir(parents=True)
     autostart_path.write_text(
-        '[Desktop Entry]\nType=Application\nExec="/x" --startup\nHidden=true\nX-GNOME-Autostart-enabled=false\n'
+        '[Desktop Entry]\nType=Application\nExec="/bin/sh" --startup\nHidden=true\nX-GNOME-Autostart-enabled=false\n'
     )
     assert main(["claude", "install"]) == 0
     text = autostart_path.read_text()
     assert "X-GNOME-Autostart-enabled=true" in text
     assert "Hidden=true" not in text
-    assert 'Exec="/x" --startup' in text
+    assert 'Exec="/bin/sh" --startup' in text
 
 
 def test_install_tells_the_user_to_restart_claude_desktop(
@@ -394,6 +398,75 @@ def test_install_reenables_a_numeric_disabled_autostart_without_mangling_other_b
     computer_bin: Path, claude_binary: Path, autostart_path: Path
 ) -> None:
     autostart_path.parent.mkdir(parents=True)
-    autostart_path.write_bytes(b"[Desktop Entry]\nName=Claude \xe9\nX-GNOME-Autostart-enabled=0\n")
+    autostart_path.write_bytes(b'[Desktop Entry]\nName=Claude \xe9\nExec="/bin/sh"\nX-GNOME-Autostart-enabled=0\n')
     assert main(["claude", "install"]) == 0
-    assert autostart_path.read_bytes() == b"[Desktop Entry]\nName=Claude \xe9\nX-GNOME-Autostart-enabled=true\n"
+    assert autostart_path.read_bytes() == b'[Desktop Entry]\nName=Claude \xe9\nExec="/bin/sh"\nX-GNOME-Autostart-enabled=true\n'
+
+
+@pytest.mark.parametrize("content", ["", "\n\n", "Type=Application\nExec=/bin/sh\n", "[Desktop Action x]\nExec=/bin/sh\n"])
+def test_status_fails_and_install_replaces_an_empty_or_section_less_autostart(
+    content: str, computer_bin: Path, claude_binary: Path, autostart_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["claude", "install"]) == 0
+    autostart_path.write_text(content)
+    capsys.readouterr()
+    assert main(["claude", "status"]) == 3
+    assert "[FAIL] autostart: invalid" in capsys.readouterr().out
+    assert main(["claude", "install"]) == 0
+    assert autostart_path.read_text() == (
+        f'[Desktop Entry]\nType=Application\nName=Claude\nExec="{claude_binary}" --startup\nX-GNOME-Autostart-enabled=true\n'
+    )
+    assert [p.read_text() for p in autostart_path.parent.glob("*.bak-*")] == [content]
+    assert main(["claude", "status"]) == 0
+
+
+@pytest.mark.parametrize(
+    "exec_line", ['Exec="/nonexistent/claude-desktop" --startup', "Exec=no-such-claude-on-path %U", "Exec=", None]
+)
+def test_status_fails_and_install_repairs_an_exec_that_does_not_exist(
+    exec_line: str | None, computer_bin: Path, claude_binary: Path, autostart_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    autostart_path.parent.mkdir(parents=True)
+    user_keys = "[Desktop Entry]\nType=Application\nName=Mine\n"
+    autostart_path.write_text(user_keys + (f"{exec_line}\n" if exec_line else "") + "X-GNOME-Autostart-enabled=true\n")
+    assert main(["claude", "status"]) == 3
+    assert "[FAIL] autostart: broken-exec" in capsys.readouterr().out
+    assert main(["claude", "install"]) == 0
+    text = autostart_path.read_text()
+    # Only the Exec line changed: the user's other keys stay.
+    assert "Name=Mine\n" in text
+    assert text.count("Exec=") == 1
+    assert f'Exec="{claude_binary}" --startup\n' in text
+    assert len(list(autostart_path.parent.glob("*.bak-*"))) == 1
+    capsys.readouterr()
+    assert main(["claude", "status"]) == 0
+
+
+def test_status_accepts_a_relative_exec_found_on_path(computer_bin: Path, claude_binary: Path, autostart_path: Path) -> None:
+    assert main(["claude", "install"]) == 0
+    autostart_path.write_text("[Desktop Entry]\nType=Application\nExec=sh -c true\nX-GNOME-Autostart-enabled=true\n")
+    assert main(["claude", "status"]) == 0
+
+
+def test_install_disabled_and_broken_exec_is_repaired_in_one_backup(
+    computer_bin: Path, claude_binary: Path, autostart_path: Path
+) -> None:
+    autostart_path.parent.mkdir(parents=True)
+    autostart_path.write_text("[Desktop Entry]\nExec=/gone\nHidden=true\n")
+    assert main(["claude", "install"]) == 0
+    assert autostart_path.read_text() == (f'[Desktop Entry]\nX-GNOME-Autostart-enabled=true\nExec="{claude_binary}" --startup\n')
+    assert len(list(autostart_path.parent.glob("*.bak-*"))) == 1
+
+
+def test_install_escapes_the_exec_path_per_the_desktop_entry_spec(
+    tmp_path: Path, computer_bin: Path, autostart_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    odd = write_executable(tmp_path / 'we"ird $dir`\\ 100%' / "claude-desktop", "#!/bin/sh\n")
+    monkeypatch.setattr("computerlib.targets.claude.autostart.CLAUDE_DESKTOP_BINARIES", (str(odd),))
+    assert main(["claude", "install"]) == 0
+    exec_line = next(line for line in autostart_path.read_text().splitlines() if line.startswith("Exec="))
+    # `"`, `$`, backtick get one backslash, a literal backslash four (string escape over quoting escape), `%` becomes `%%`.
+    quoted = str(odd).replace("\\", "\\\\\\\\").replace('"', '\\\\"').replace("$", "\\\\$").replace("`", "\\\\`")
+    assert exec_line == f'Exec="{quoted.replace("%", "%%")}" --startup'
+    assert autostart.exec_program(exec_line.removeprefix("Exec=")) == str(odd)
+    assert main(["claude", "status"]) == 0
