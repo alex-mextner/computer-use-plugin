@@ -83,8 +83,10 @@ def _check_server(report: list[tuple[bool, str]]) -> None:
 def run(_args: argparse.Namespace) -> int:
     report: list[tuple[bool, str]] = []
     _check_server(report)
-    current = autostart.state()
-    report.append((current is autostart.AutostartState.ENABLED, f"autostart: {current.value} ({autostart.autostart_path()})"))
+    current = autostart.inspect()
+    detail = f": {current.detail}" if current.detail else ""
+    healthy = current.state is autostart.AutostartState.ENABLED
+    report.append((healthy, f"autostart: {current.state.value} ({autostart.autostart_path()}){detail}"))
     for ok, line in report:
         print(f"[{'ok' if ok else 'FAIL'}] {line}")
     print(f"[info] Claude Desktop running: {'yes' if claude_running() else 'no'}")

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.7
+
+- `computer claude status` no longer reports a broken autostart entry as healthy: an empty file or one without a
+  `[Desktop Entry]` section is `invalid`, and an entry whose Exec is missing or names a program that does not exist is
+  `broken-exec`; both are FAIL (exit 3). `computer claude install` repairs both after a backup: the empty or section-less file is
+  replaced, and a broken Exec line alone is replaced, keeping your other keys. The Exec line it writes is quoted and escaped per
+  the Desktop Entry spec, so a launcher path with a space, `"`, `$`, a backtick, a backslash or `%` survives (#10).
+
 ## 0.3.6
 
 - `computer chatgpt connect` over ssh (no `DISPLAY` or `WAYLAND_DISPLAY`) now prints the ChatGPT settings URL to open yourself.
