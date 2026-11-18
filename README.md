@@ -7,7 +7,7 @@ Two targets, each set up by ONE command:
 | Target | One command | Needs on this PC / account |
 |---|---|---|
 | **Claude Desktop** | `computer claude install` | Linux; the Claude Desktop app; Node.js 18+ and npm |
-| **ChatGPT** | `computer chatgpt install --hostname computer.example.com` | Linux with systemd `--user` (and `loginctl`); Node.js 18+ and npm; a Cloudflare account with your domain (zone) on it; a ChatGPT plan that lets you add custom MCP servers with write tools (see below). `cloudflared` and `mcp-auth-proxy` are downloaded automatically, pinned and sha256-verified |
+| **ChatGPT** | `computer chatgpt install --domain example.com` (one per machine: `<machine>-mcp.example.com`) | Linux (x86_64 or aarch64) with systemd `--user` (and `loginctl`); Node.js 18+ and npm; a Cloudflare account with your domain (zone) on it; a ChatGPT plan that lets you add custom MCP servers with write tools (see below). `cloudflared` and `mcp-auth-proxy` are downloaded automatically, pinned and sha256-verified. macOS is not supported (no systemd) |
 
 Both run the same pinned [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) from the shared core
 (`computer mcp`), never a floating `npx ...@latest`.
@@ -74,36 +74,90 @@ Design: `docs/superpowers/specs/2026-11-11-claude-desktop-support-design.md`.
 ### One command
 
 ```sh
-computer chatgpt install --hostname computer.example.com
+computer chatgpt install --domain example.com
 ```
+
+On a machine whose hostname is `ubuntu-pc` this serves ChatGPT at `https://ubuntu-pc-mcp.example.com/mcp` through a Cloudflare
+tunnel named `ubuntu-pc`. `--hostname dc.example.com` sets the full name instead (pass one of the two; it replaces a saved
+domain); both are saved, so a re-run needs no flags.
 
 `computer chatgpt install` does everything, idempotently (re-running changes only what is missing or different):
 
-1. **Checks prerequisites before writing anything**: `node`, `npm`, `loginctl` (exit 127 with the install command), a reachable systemd
-   user manager, the `computer` executable the units will run, that the hostname's zone is served by Cloudflare (DNS-over-HTTPS NS
-   lookup; exit 2 when it is not, a warning when the lookup itself fails), and that the loopback ports are free or already this
-   stack's (exit 2 with the flag to pass otherwise).
+1. **Checks prerequisites before writing anything**: pinned builds for this CPU (x86_64 or aarch64, exit 2 otherwise), `node`, `npm`,
+   `loginctl` (exit 127 with the install command), a reachable systemd user manager, the `computer` executable the units will run,
+   that the hostname's zone is served by Cloudflare (DNS-over-HTTPS NS lookup; exit 2 when it is not, or when `--domain` is not the
+   zone itself; a warning when the lookup itself fails), and that the loopback ports are free or already this stack's (exit 2 with
+   the flag to pass otherwise).
 2. **Installs**: the shared Desktop Commander (`computer mcp install`), `mcp-auth-proxy` v2.10.2 and `cloudflared` 2026.10.7 (pinned
-   release assets, sha256-verified before they are placed), a generated login password (`~/.config/computer/chatgpt/auth.env`, mode 600,
-   never printed, logged or put in an argument list) and the systemd user units.
+   release assets, sha256-verified before they are placed) and a generated login password (`~/.config/computer/chatgpt/auth.env`,
+   mode 600, never printed, logged or put in an argument list).
 3. **Cloudflare**: when this target has no account certificate yet, runs `cloudflared tunnel login` (the ONLY interactive step: a
-   browser page where you authorize the zone of your hostname), creates the named tunnel (default `computer-<hostname with dashes>`,
-   `--tunnel-name` to choose), and routes the hostname to it. A NEW DNS record is created without a question; an EXISTING record that
-   points elsewhere is replaced only after you confirm (`--yes` answers yes; without consent install stops with exit 2).
+   URL where you authorize the zone of your hostname, see [A new machine](#a-new-machine-login-or-an-existing-certificate)), creates
+   the named tunnel (default: the machine name, `--tunnel-name` to choose), and routes the hostname to it. A tunnel of that name
+   that already exists with credentials in this target's directory is reused; one that exists WITHOUT them (another machine of the
+   same name, or a lost install) is refused with exit 2: pass `--machine-name`, delete the stale tunnel, or adopt it by naming it with
+   `--tunnel-name`. A NEW DNS record is created without a question; an EXISTING record that points elsewhere is replaced only after
+   you confirm (`--yes` answers yes; without consent install stops with exit 2).
    cloudflared's certificate, tunnel credentials and `config.yml` live in this target's own directory
    (`~/.config/computer/chatgpt/cloudflared`, mode 700; `--cloudflared-dir` to choose). `~/.cloudflared` is never read or written unless
    you point `--cloudflared-dir` at it, so a tunnel that already runs on this machine is left alone.
-4. **Starts**: enables lingering (the stack starts at boot without a login), enables and starts the units (restarting only those whose
-   file changed), and waits until the local chain answers.
+4. **Starts**: writes the systemd user units (only now, so a run that stopped in step 3 leaves them as they were and the corrected
+   re-run still restarts what changed), enables lingering (the stack starts at boot without a login), enables and starts the units
+   (restarting only those whose file changed), and waits until the local chain answers.
 5. **Waits for the public URL** (`--timeout`, default 180 s) until `https://<hostname>/mcp` answers 401 with the
    `WWW-Authenticate: Bearer resource_metadata=...` challenge ChatGPT's OAuth discovery needs.
-6. **Prints the ChatGPT connector fields**: where to add it (Plugins -> "+" -> *Add custom MCP server*), Name, Connection *Server URL*,
+6. **Prints the ChatGPT connector fields**: where to add it (Plugins -> "+" -> *Add custom MCP server*), Name (the machine name;
+   `--name` to choose), Connection *Server URL*,
    Server URL `https://<hostname>/mcp`, Authentication *OAuth* (dynamic client registration, nothing to type), the risk checkbox,
    *Create as a plugin*, and the file that holds the login password ChatGPT's login page asks for. If the URL did not answer in time
    it still prints them and exits 7.
 
 ChatGPT cannot be pre-filled (no link, API or CLI exists), so the clicking is yours. `computer chatgpt connect` then watches the
 connection live and says "connected" only after a real `tools/call` from a client the shim could verify as ChatGPT.
+
+### Several machines
+
+Run the same command on every machine; each gets its own tunnel, public URL and ChatGPT connector:
+
+```sh
+computer chatgpt install --domain example.com   # on ubuntu-pc: https://ubuntu-pc-mcp.example.com/mcp, tunnel ubuntu-pc
+computer chatgpt install --domain example.com   # on odroid:    https://odroid-mcp.example.com/mcp,    tunnel odroid
+```
+
+Then add one connector per machine in ChatGPT; `connect` and `install` suggest the machine name as the connector name, so they stay
+apart. The machine name is the short system hostname turned into a DNS label (lowercase; anything but letters and digits becomes
+`-`; at most 59 characters, so `<machine>-mcp` fits one 63-character label); `--machine-name <name>` chooses it. It and the domain are
+saved in `~/.config/computer/chatgpt/config.toml`, so a later hostname change does not move the URL.
+
+Why `<machine>-mcp.<domain>` and not `<machine>.mcp.<domain>`: Cloudflare's free Universal SSL certificate covers the zone apex and
+first-level subdomains only; deeper names "are not covered and will not serve a valid certificate" without a paid Advanced
+Certificate ([Cloudflare: Universal SSL limitations](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/limitations/),
+checked 2026-11-18). So `--domain` must be the zone itself; install refuses a subdomain of it.
+
+Two machines with the same hostname would collide on the tunnel name (tunnel names are per Cloudflare account): the second one is
+refused (see step 3) and `--machine-name` gives it another name. A configuration made with `--hostname` keeps working unchanged.
+
+CPUs: x86_64 and aarch64 (`mcp-auth-proxy` publishes Linux builds for amd64 and arm64 only), so an ARM board such as an Odroid needs
+a 64-bit OS; on another CPU install stops before writing anything. macOS is out of scope (the stack runs as systemd user units).
+
+### A new machine: login or an existing certificate
+
+The first `install` on a machine without a Cloudflare account certificate runs `cloudflared tunnel login`. It prints a URL (shown
+again on its own line) and waits; on a desktop it is opened in the browser, on a headless machine (no display, e.g. over ssh) open
+it on any device, log in to Cloudflare and authorize the zone; the command then continues by itself.
+
+Without a browser at all, reuse the certificate of a machine that is already logged in:
+
+```sh
+computer chatgpt install --domain example.com \
+  --cloudflare-cert <(ssh ubuntu-pc cat .config/computer/chatgpt/cloudflared/cert.pem)
+```
+
+The process substitution (bash, zsh) streams the certificate straight from the other machine: no copy is left on disk, whatever
+the exit code.
+
+The certificate is copied mode 600 into this target's cloudflared directory (a different certificate already there is refused, not
+replaced). It lets its holder create tunnels and DNS records in the account, so treat it like a password.
 
 ### How it runs
 
@@ -120,9 +174,9 @@ connection live and says "connected" only after a real `tools/call` from a clien
 
 | Command | What it does |
 |---|---|
-| `install` | the one-command setup above. Flags: `--hostname`, `--tunnel-name`, `--cloudflared-dir`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--yes`, `--skip-dns`, `--no-linger`, `--timeout`, `--name` |
-| `init` | building block: choose the mode (default `public`), write the config, install the pinned pieces, create the password (public) and unit files. Flags: `--mode`, `--hostname`, `--scheme`, `--tunnel-name`, `--tunnel-id`, `--tunnel-health-port`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--cloudflared-dir`, `--lang`, `--no-install`, `--no-units` |
-| `login` | building block: public: Cloudflare login, create the named tunnel, route the hostname (asks before replacing a record). Flags: `--tunnel-name`, `--yes`, `--skip-dns`. Tunnel mode: store the runtime API key. Flag: `--key-stdin` |
+| `install` | the one-command setup above. Flags: `--domain`, `--machine-name`, `--hostname`, `--tunnel-name`, `--cloudflare-cert`, `--cloudflared-dir`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--yes`, `--skip-dns`, `--no-linger`, `--timeout`, `--name` (default: the machine name) |
+| `init` | building block: choose the mode (default `public`), write the config, install the pinned pieces, create the password (public) and unit files. Flags: `--mode`, `--domain`, `--machine-name`, `--hostname`, `--scheme`, `--tunnel-name`, `--tunnel-id`, `--tunnel-health-port`, `--proxy-port`, `--shim-port`, `--metrics-port`, `--unit-prefix`, `--cloudflared-dir`, `--lang`, `--no-install`, `--no-units` |
+| `login` | building block: public: Cloudflare login, create the named tunnel (an existing one without local credentials only when named with `--tunnel-name`), route the hostname (asks before replacing a record). Flags: `--tunnel-name`, `--cloudflare-cert`, `--yes`, `--skip-dns`. Tunnel mode: store the runtime API key. Flag: `--key-stdin` |
 | `start` | enable and start the stack, wait until it serves. Flags: `--no-wait`, `--no-linger` |
 | `stop` | stop the stack now (stays enabled for the next boot) |
 | `restart` | restart in start order and wait until it serves |
@@ -130,7 +184,7 @@ connection live and says "connected" only after a real `tools/call` from a clien
 | `status` | units, local probes, last request and verified ChatGPT tool calls (tunnel mode: the daemon's state and counters); `--json`; exit 3 when unhealthy |
 | `logs` | the compact access log. Flags: `-n`/`--lines`, `--all`, `--tool`, `--rpc`, `--status`, `--client`, `--oauth` |
 | `doctor` | diagnose the chain end to end and say how to fix it, never restarts (tunnel mode: its own chain, nothing public). Flags: `--local`, `--json` |
-| `connect` | ChatGPT dialog fields, clipboard, live checklist. Flags: `--name`, `--no-open`, `--no-copy`, `--no-wait`, `--timeout` |
+| `connect` | ChatGPT dialog fields, clipboard, live checklist. Flags: `--name` (default: the machine name), `--no-open`, `--no-copy`, `--no-wait`, `--timeout` |
 | `run` | run the stack in the foreground without systemd (development, proofs on scratch ports); `--no-tunnel` (public mode) |
 | `uninstall` | remove the unit files; `--purge` also deletes config, password, tunnel key, OAuth state, logs, binaries and the default cloudflared directory. The shared Desktop Commander, the Cloudflare tunnel and its DNS record are kept (it says so) |
 | `shim`, `quiet` | internal: what the units run. `shim` takes `--external-url`, `--listen-port`, `--upstream-port`, `--log-file` |

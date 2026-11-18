@@ -38,7 +38,7 @@ def public_fields(server_url: str, name: str = "Computer", host: str | None = No
     machine = host or socket.gethostname()
     return [
         Field("Icon (optional)", "skip", "cosmetic only"),
-        Field("Name", name, "the name you @-mention in a chat; letters only avoids confusion"),
+        Field("Name", name, "the name you @-mention in a chat; one per machine keeps several machines apart"),
         Field(
             "Description (optional)", f"Files and terminal on {machine}", "helps ChatGPT pick the tool; shown in the plugin list"
         ),
@@ -55,7 +55,7 @@ def tunnel_fields(tunnel_id: str, name: str = "Computer", host: str | None = Non
     machine = host or socket.gethostname()
     return [
         Field("Icon (optional)", "skip", "cosmetic only"),
-        Field("Name", name, "the name you @-mention in a chat; letters only avoids confusion"),
+        Field("Name", name, "the name you @-mention in a chat; one per machine keeps several machines apart"),
         Field(
             "Description (optional)", f"Files and terminal on {machine}", "helps ChatGPT pick the tool; shown in the plugin list"
         ),

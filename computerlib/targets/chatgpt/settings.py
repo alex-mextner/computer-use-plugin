@@ -29,6 +29,10 @@ class Settings:
     scheme: str = "https"  # http only for local development (`run` on a scratch port); ChatGPT needs https
     hostname: str = ""
     tunnel_name: str = ""
+    # Multi-machine: a set `domain` means the hostname is derived as `<machine_name>-mcp.<domain>` on every run (machine.py);
+    # empty for a hostname given in full. `machine_name` names this machine: tunnel, hostname, ChatGPT connector.
+    domain: str = ""
+    machine_name: str = ""
     proxy_port: int = 8766
     shim_port: int = 8767
     metrics_port: int = 20241  # cloudflared readiness endpoint (127.0.0.1:<port>/ready)

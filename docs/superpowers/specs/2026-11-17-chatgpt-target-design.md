@@ -28,19 +28,25 @@ ChatGPT -> Cloudflare named tunnel -> shim 127.0.0.1:8767 -> mcp-auth-proxy 127.
 
 ## The one command
 
-1. Prerequisites before any write: node, npm, loginctl (127), the user manager (127), the `computer` executable, the hostname's zone
-   on Cloudflare (DoH NS lookup: 2 when it is elsewhere, a warning when the lookup fails), loopback ports free or already ours (2).
-2. `init` building block: config, password, `computer mcp install`, pinned downloads, unit files.
-3. `login` building block: login when no certificate, create the tunnel (or fetch the credentials of an existing one with
-   `tunnel token --cred-file`), `route dns`. cloudflared reports "already configured to route to your tunnel" for our own record; a
-   record that points elsewhere fails with "already exists" and is replaced (`--overwrite-dns`) only after consent (`--yes`).
-4. `start` building block: lingering, `enable --now`, restart of units whose file changed, wait for the local chain.
+1. Prerequisites before any write: pinned builds for this CPU, node, npm, loginctl (127), the user manager (127), the `computer`
+   executable, the hostname's zone on Cloudflare (DoH NS lookup: 2 when it is elsewhere, a warning when the lookup fails),
+   loopback ports free or already ours (2), a `--cloudflare-cert` that reads as an account certificate.
+2. `init` building block without the config: password, `computer mcp install`, pinned downloads.
+3. `login` building block: login when no certificate, create the tunnel (an existing one without local credentials only when
+   named with `--tunnel-name`: its credentials are fetched with `tunnel token --cred-file`; otherwise exit 2), `route dns`.
+   cloudflared reports "already configured to route to your tunnel" for our own record; a record that points elsewhere fails
+   with "already exists" and is replaced (`--overwrite-dns`) only after consent (`--yes`).
+4. config.toml and the unit files (only after `login` succeeded: a run stopped there leaves both unchanged, so the other
+   commands still describe the running stack and the corrected re-run still restarts the running units), then the `start`
+   building block: lingering, `enable --now`, restart of units whose file changed, wait for the local chain.
 5. Wait for the public URL to answer 401 with the challenge (`--timeout`, exit 7 after printing the fields when it does not).
 6. Print ChatGPT's connector fields and the password file location.
 
 ## Decisions
 
-- Default tunnel name `computer-<hostname with dashes>`: one tunnel per public hostname, stable across re-runs.
+- Default tunnel name `computer-<hostname with dashes>`: one tunnel per public hostname, stable across re-runs. Superseded in 0.3.0
+  (issue #18): the default is the machine name, and `--domain` derives the hostname `<machine>-mcp.<zone>` (README "Several
+  machines").
 - Default ports stay 8766/8767/20241 so an existing hand-made stack can be adopted (CUTOVER.md); the port check refuses to fight a
   foreign process for them.
 - The pins of all release binaries live in `computerlib/pins.py`, the one pin table.

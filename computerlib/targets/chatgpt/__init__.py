@@ -1,5 +1,6 @@
 """`computer chatgpt`: the ChatGPT adapter. ChatGPT reaches this PC through a public HTTPS URL (Cloudflare named tunnel -> shim ->
-mcp-auth-proxy -> `computer mcp serve`); `computer chatgpt install --hostname <name>` sets all of it up in one command."""
+mcp-auth-proxy -> `computer mcp serve`); `computer chatgpt install --domain <zone>` sets all of it up in one command, once per
+machine (`<machine>-mcp.<zone>`; `--hostname <name>` for a full name)."""
 
 from __future__ import annotations
 

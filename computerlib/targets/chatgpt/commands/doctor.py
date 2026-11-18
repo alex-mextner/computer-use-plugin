@@ -17,6 +17,7 @@ import json
 import stat
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from agenttools_errors import AgentToolError
 
@@ -118,6 +119,13 @@ def _desktop_commander() -> Check:
     return Check(name, True, f"{DESKTOP_COMMANDER_VERSION} with node {spec.node}")
 
 
+def _cloudflare_fix(ctx: Context, credentials: Path) -> str:
+    if credentials.is_file():
+        return "run `computer chatgpt install` (it logs in to Cloudflare)"
+    # A tunnel without local credentials is refused unless named: this machine's own tunnel is adopted only by name.
+    return f"run `computer chatgpt install --tunnel-name {ctx.settings.tunnel_name}` (fetches this machine's tunnel credentials)"
+
+
 def _cloudflare_files(ctx: Context) -> Check:
     credentials = ctx.layout.tunnel_credentials(ctx.settings.tunnel_name)
     missing = [str(path) for path in (ctx.layout.origin_cert, credentials) if not path.is_file()]
@@ -125,7 +133,7 @@ def _cloudflare_files(ctx: Context) -> Check:
         "cloudflare login and tunnel credentials",
         not missing,
         f"in {ctx.layout.cloudflared_dir}" if not missing else f"missing: {', '.join(missing)}",
-        "" if not missing else "run `computer chatgpt install` (or `computer chatgpt login`)",
+        "" if not missing else _cloudflare_fix(ctx, credentials),
     )
 
 

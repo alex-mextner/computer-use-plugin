@@ -6,23 +6,26 @@ never changes the default mode `public` by itself: the comparison table is alway
 the only way to another mode (a saved choice wins over the default, a flag wins over the saved choice).
 Desktop Commander comes from the shared core (`computer mcp install`); this command runs that install, never a second one.
 Tunnel mode installs tunnel-client (a pinned zip, one member), writes ONE unit, and creates no password: the runtime key is stored
-by `login`. `computer chatgpt install` runs the same steps (`prepare`) as part of its one-command setup.
+by `login`. `computer chatgpt install` runs the same steps (`prepare`, then `install_units` once its tunnel is settled) as part of
+its one-command setup.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import platform
 from dataclasses import replace
 
 from agenttools_errors import UsageError
 
 from computerlib import desktop_commander
 from computerlib.commandtree import Command
-from computerlib.pins import binary_pin, zip_member_pin
+from computerlib.pins import binary_pin, pinned_machines, zip_member_pin
 from computerlib.targets.chatgpt import compare
 from computerlib.targets.chatgpt.cloudflare import Cloudflare
 from computerlib.targets.chatgpt.install import ensure_binary, ensure_zip_member
+from computerlib.targets.chatgpt.machine import identify
 from computerlib.targets.chatgpt.password import ensure_password
 from computerlib.targets.chatgpt.processes import TUNNEL_SERVICE, processes
 from computerlib.targets.chatgpt.settings import MODES, Layout, Settings, load_settings, save_settings, validate
@@ -38,8 +41,22 @@ def _absolute(path: str) -> str:
 
 
 def add_public_options(parser: argparse.ArgumentParser) -> None:
-    """Options `init` and `install` share: where the public stack listens, what it is called, where cloudflared keeps its
-    state."""
+    """Options `init` and `install` share: how this machine is named, where the public stack listens, what it is called, where
+    cloudflared keeps its state."""
+    parser.add_argument(
+        "--domain",
+        help=(
+            "your domain (zone) on Cloudflare; the hostname becomes <machine>-mcp.<domain>, one label below the zone so the free "
+            "certificate covers it (saved; --hostname instead sets the full name)"
+        ),
+    )
+    parser.add_argument(
+        "--machine-name",
+        help=(
+            "name of this machine: hostname label, tunnel name, ChatGPT connector name "
+            "(default: the saved one, else the system hostname as a DNS label)"
+        ),
+    )
     parser.add_argument("--proxy-port", type=int, help="loopback port of mcp-auth-proxy (default 8766)")
     parser.add_argument("--shim-port", type=int, help="loopback port of the shim, where the tunnel points (default 8767)")
     parser.add_argument("--metrics-port", type=int, help="loopback port of cloudflared's readiness endpoint (default 20241)")
@@ -56,12 +73,15 @@ def add_public_options(parser: argparse.ArgumentParser) -> None:
 
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=MODES, help="connection mode (default: the saved choice, else public)")
-    parser.add_argument("--hostname", help="public hostname of the connector, e.g. dc.example.com (public mode)")
+    parser.add_argument(
+        "--hostname", help="public hostname in full, e.g. dc.example.com (public mode; --domain derives one instead)"
+    )
     parser.add_argument(
         "--scheme", choices=("https", "http"), help="http only for local development on a scratch port (default https)"
     )
     parser.add_argument(
-        "--tunnel-name", help="Cloudflare named tunnel that serves the hostname (leave out to run without cloudflared)"
+        "--tunnel-name",
+        help="Cloudflare named tunnel that serves the hostname (default: the saved one; with --domain, the machine name)",
     )
     parser.add_argument("--tunnel-id", help="OpenAI tunnel id to serve, tunnel_... (tunnel mode)")
     parser.add_argument(
@@ -74,11 +94,10 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 
 # Settings a flag of the same name can set; a flag that is absent, or that the running command does not have, changes nothing.
+# hostname, domain, machine_name and tunnel_name depend on each other: machine.identify resolves them.
 FLAG_SETTINGS = (
     "mode",
     "scheme",
-    "hostname",
-    "tunnel_name",
     "proxy_port",
     "shim_port",
     "metrics_port",
@@ -89,16 +108,47 @@ FLAG_SETTINGS = (
 )
 
 
-def apply_flags(saved: Settings, args: argparse.Namespace) -> Settings:
-    """`saved` with every flag the user passed on top."""
+def apply_flags(saved: Settings, args: argparse.Namespace, *, cloudflare: bool = False) -> Settings:
+    """`saved` with every flag the user passed on top. `cloudflare`: the run sets up a Cloudflare tunnel (install), so the
+    tunnel name defaults to the machine name."""
     passed = {name: getattr(args, name, None) for name in FLAG_SETTINGS}
-    return validate(replace(saved, **{name: value for name, value in passed.items() if value is not None}))
+    flagged = replace(saved, **{name: value for name, value in passed.items() if value is not None})
+    return validate(
+        identify(
+            flagged,
+            hostname=getattr(args, "hostname", None),
+            domain=getattr(args, "domain", None),
+            machine_name=getattr(args, "machine_name", None),
+            tunnel_name=getattr(args, "tunnel_name", None),
+            cloudflare=cloudflare,
+        )
+    )
 
 
 def _pinned(name: str) -> UsageError:
+    on = ", ".join(pinned_machines(name)) or "no CPU"
     return UsageError(
-        what=f"no pinned {name} for this CPU", why="the pin table covers x86_64 and aarch64", fix="install it by hand"
+        what=f"no pinned {name} for this CPU ({platform.machine()})",
+        why=f"the pin table has {name} for Linux on {on} only: its project publishes no build pinned for this CPU",
+        fix=(
+            f"run it on a Linux machine with one of these CPUs: {on} (a 32-bit board running a 64-bit capable CPU needs a "
+            "64-bit OS image)"
+        ),
     )
+
+
+def _needed(settings: Settings) -> list[str]:
+    if settings.mode == "tunnel":
+        return ["tunnel-client"]  # a zip member pin
+    return ["mcp-auth-proxy", *(["cloudflared"] if settings.tunnel_name else [])]  # binary pins
+
+
+def require_pins(settings: Settings) -> None:
+    """Refuse before anything is written when this CPU has no pinned build of a piece the mode needs."""
+    lookup = zip_member_pin if settings.mode == "tunnel" else binary_pin
+    for name in _needed(settings):
+        if lookup(name) is None:
+            raise _pinned(name)
 
 
 def _install_tunnel_client(layout: Layout) -> list[str]:
@@ -111,7 +161,7 @@ def _install_tunnel_client(layout: Layout) -> list[str]:
 
 def _install_public_binaries(settings: Settings, layout: Layout) -> list[str]:
     done: list[str] = []
-    for name in ["mcp-auth-proxy", *(["cloudflared"] if settings.tunnel_name else [])]:
+    for name in _needed(settings):
         pin = binary_pin(name)
         if pin is None:
             raise _pinned(name)
@@ -149,7 +199,7 @@ def _require_mode_inputs(settings: Settings) -> None:
         raise UsageError(
             what="no public hostname",
             why="public mode serves ChatGPT through a hostname you own",
-            fix="run `computer chatgpt install --hostname <name on a Cloudflare zone>`",
+            fix="run `computer chatgpt install --domain <your domain on Cloudflare>` (or --hostname <full name>)",
         )
 
 
@@ -172,31 +222,41 @@ def write_units(settings: Settings, layout: Layout) -> list[str]:
     return changed
 
 
-def prepare(settings: Settings, *, install: bool = True, units: bool = True) -> tuple[Layout, list[str]]:
-    """Everything `init` does after the flags are applied: config, secret, pinned installs, unit files. Starts nothing.
-    Returns the layout and the unit files that changed."""
+def install_units(settings: Settings, layout: Layout) -> list[str]:
+    """Write the unit files; returns the ones that changed (a running unit keeps its old command line until restarted)."""
+    if settings.mode == "public" and settings.tunnel_name:
+        # The tunnel unit names this directory's config.yml; it must exist even before (or without) `login`.
+        Cloudflare(layout.bin_dir / "cloudflared", layout.cloudflared_dir).prepare()
+    return write_units(settings, layout)
+
+
+def prepare(settings: Settings, *, install: bool = True, units: bool = True, save: bool = True) -> Layout:
+    """Everything `init` does after the flags are applied except the unit files: config, secret, pinned installs. Starts nothing.
+    The caller has run `require_pins` when `install`. `units`: the caller will write the unit files (`install_units`), so the
+    other mode's units are refused before anything is written. `save`: write config.toml now; install saves it only once the
+    tunnel step succeeded, so a refused run leaves the config describing the running stack."""
     _require_mode_inputs(settings)
     layout = Layout.of(settings)
     if units:
         _refuse_other_mode_units(settings, layout)
-    print(f"config: {save_settings(settings)}")
+    if save:
+        print(f"config: {save_settings(settings)}")
     _prepare_secret(settings, layout)
     if install:
         for line in install_pieces(settings, layout):
             print(line)
-    if units:
-        if settings.mode == "public" and settings.tunnel_name:
-            # The tunnel unit names this directory's config.yml; it must exist even before (or without) `login`.
-            Cloudflare(layout.bin_dir / "cloudflared", layout.cloudflared_dir).prepare()
-        return layout, write_units(settings, layout)
-    return layout, []
+    return layout
 
 
 def run(args: argparse.Namespace) -> int:
     settings = apply_flags(load_settings(), args)
     lang = args.lang or compare.language_from_environment(os.environ.get("LANG", ""))
     print(compare.render(lang))
-    prepare(settings, install=not args.no_install, units=not args.no_units)
+    if not args.no_install:
+        require_pins(settings)
+    layout = prepare(settings, install=not args.no_install, units=not args.no_units)
+    if not args.no_units:
+        install_units(settings, layout)
     if settings.mode == "tunnel":
         print("next: computer chatgpt login (stores the runtime key), computer chatgpt start, then computer chatgpt connect")
     elif settings.tunnel_name:

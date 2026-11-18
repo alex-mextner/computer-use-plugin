@@ -31,6 +31,7 @@ from computerlib.targets.chatgpt.accessview import LogTail
 from computerlib.targets.chatgpt.checklist import STEPS, Checklist
 from computerlib.targets.chatgpt.context import Context, load_context
 from computerlib.targets.chatgpt.lifecycle import tunnel_serving
+from computerlib.targets.chatgpt.machine import default_machine_name
 from computerlib.targets.chatgpt.probe import challenge_ok, local_alive
 from computerlib.targets.chatgpt.stack import external_url
 from computerlib.targets.chatgpt.tunnel import require_tunnel_id
@@ -42,7 +43,9 @@ CLIPBOARD_TOOLS: tuple[tuple[str, list[str]], ...] = (("wl-copy", []), ("xclip",
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--name", default="Computer", help="name to give the connector (default Computer)")
+    parser.add_argument(
+        "--name", help="name to give the connector (default: this machine's name, so several machines stay apart in ChatGPT)"
+    )
     parser.add_argument("--no-open", action="store_true", help="do not open the ChatGPT page in a browser")
     parser.add_argument("--no-copy", action="store_true", help="do not copy the server URL to the clipboard")
     parser.add_argument("--no-wait", action="store_true", help="print the fields and return, without the live checklist")
@@ -210,7 +213,7 @@ def run_tunnel(ctx: Context, args: argparse.Namespace) -> int:
         )
     if not tunnel_serving(health):
         print(f"warning: tunnel-client is {health.state} ({health.detail}); ChatGPT's discovery would fail until that is fixed")
-    print_tunnel_instructions(ctx, args.name)
+    print_tunnel_instructions(ctx, connector_name(ctx, args))
     if not args.no_copy:
         tool = copy_to_clipboard(tunnel_id)
         print(f"tunnel id copied to the clipboard ({tool})" if tool else f"tunnel id (no clipboard tool found): {tunnel_id}")
@@ -240,6 +243,10 @@ def run_tunnel(ctx: Context, args: argparse.Namespace) -> int:
     )
 
 
+def connector_name(ctx: Context, args: argparse.Namespace) -> str:
+    return args.name or ctx.settings.machine_name or default_machine_name("--name")
+
+
 def run(args: argparse.Namespace) -> int:
     ctx = load_context()
     if ctx.settings.mode == "tunnel":
@@ -257,7 +264,7 @@ def run(args: argparse.Namespace) -> int:
         print(
             f"warning: the public URL does not look ready ({detail}); ChatGPT would say it could not discover the OAuth settings"
         )
-    print_instructions(ctx, args.name, server_url)
+    print_instructions(ctx, connector_name(ctx, args), server_url)
     if not args.no_copy:
         tool = copy_to_clipboard(server_url)
         print(f"server URL copied to the clipboard ({tool})" if tool else f"server URL (no clipboard tool found): {server_url}")

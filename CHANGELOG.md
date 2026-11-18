@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0
+
+- Several machines, one command each: `computer chatgpt install --domain <zone>` serves this machine at
+  `https://<machine>-mcp.<zone>/mcp` through a Cloudflare tunnel named after the machine. The machine name is the short system
+  hostname as a DNS label (lowercase, `[a-z0-9-]`, at most 59 characters so `<machine>-mcp` is one label; one that reads as a
+  UUID is refused, since cloudflared refuses it as a tunnel name); `--machine-name` chooses it. One label below the zone because
+  Cloudflare's free Universal SSL covers only first-level subdomains; a `--domain`
+  that is not the zone itself is refused. `--hostname` still sets the full name (and clears a saved domain); configurations made
+  with `--hostname` keep working unchanged. `domain` and `machine_name` are saved in `config.toml`, so re-runs need no flags.
+- The default tunnel name is the machine name (was `computer-<hostname with dashes>`; a saved tunnel name is kept). A tunnel of
+  that name that exists on the account without credentials here (another machine of the same name, a lost install) is refused
+  with exit 2 instead of having its credentials fetched; naming it with `--tunnel-name` adopts it (an empty `--tunnel-name` is
+  refused, never taken for the saved name). A changed `--machine-name` moves the tunnel only when the hostname is derived from
+  `--domain`: with a fixed `--hostname` the tunnel serving it is kept, so its DNS record is never re-pointed.
+- `--cloudflare-cert <path>` (`install`, `login`) reuses the account certificate of an earlier `cloudflared tunnel login`, copied
+  mode 600, so a second machine needs no browser; the file is read once (`<(ssh … cat cert.pem)` works) and one that is not such
+  a certificate (as cloudflared reads it: one token block on its own lines, no unknown block) is refused before anything is
+  written, and a different certificate already in place is refused. On a filesystem without hard links a complete copy is
+  renamed into place under a lock instead, so no reader ever sees a partial certificate.
+- `install` saves `config.toml` and writes the unit files only after the tunnel and DNS step succeeded: a run that stops there (a
+  refused tunnel name, a DNS record kept) leaves both as they were, so `connect`, `doctor` and `uninstall` still describe the
+  running stack and the corrected re-run restarts the running services for the new name. `uninstall --purge` also runs without
+  a config, to clean up after a first install that stopped there. The refusal and `doctor` suggest `--machine-name` only where
+  it moves the tunnel (a `--domain` setup), otherwise `--tunnel-name <name>` for this machine's own tunnel.
+- The Cloudflare login URL is printed on its own line and flushed, and the browser is only started when there is a display: on a
+  headless machine (ssh) open the URL on any device and the command continues by itself.
+- `connect` and `install` suggest the machine name as the ChatGPT connector name (was `Computer`), so connectors stay apart.
+- A CPU without pinned builds is refused before anything is written, naming the covered ones (x86_64, aarch64; mcp-auth-proxy has
+  no 32-bit ARM build). macOS stays out of scope (no systemd).
+
 ## 0.2.2
 
 - `computer mcp serve` starts Desktop Commander with `--no-onboarding` (#21). In a HOME where Desktop Commander had never run (any

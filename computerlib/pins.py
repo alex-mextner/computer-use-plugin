@@ -9,6 +9,9 @@ regenerate the lock there (`npm install --package-lock-only --ignore-scripts`), 
 HOW TO BUMP a binary: change version, url and digest together. Release digests are the `digest` field GitHub publishes per asset
 (`gh api repos/<owner>/<repo>/releases/tags/<tag>`); the x86_64 ones were also compared with the binaries running on the author's
 PC.
+CPUs: Linux x86_64 and aarch64 (64-bit ARM boards such as an Odroid on a 64-bit OS). No 32-bit ARM: mcp-auth-proxy publishes Linux
+builds for amd64 and arm64 only (checked up to v2.10.6), so a cloudflared armhf pin alone could not run the stack; tunnel-client
+likewise ships amd64 and arm64 only. A missing pin is refused before anything is written (`init.require_pins`).
 """
 
 from __future__ import annotations
@@ -118,3 +121,8 @@ def zip_member_pin(name: str, machine: str | None = None) -> ZipMemberPin | None
         if pin.name == name and pin.machine == wanted:
             return pin
     return None
+
+
+def pinned_machines(name: str) -> tuple[str, ...]:
+    """The CPU architectures `name` is pinned for (binary or zip member), for a refusal that says what would work."""
+    return tuple(pin.machine for pin in (*BINARY_PINS, *ZIP_MEMBER_PINS) if pin.name == name)
