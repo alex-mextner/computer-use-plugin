@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyper-computer"
-version = "0.3.0"
+version = "0.3.1"
 description = "computer: connect Claude Desktop or ChatGPT (via a Cloudflare tunnel) to this PC's computer-use MCP server"
 readme = "README.md"
 requires-python = ">=3.13"
