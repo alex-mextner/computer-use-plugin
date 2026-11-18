@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- `computer mcp install` installs Desktop Commander 0.3.2 with its whole dependency tree locked: `npm ci --ignore-scripts` from a
+  bundled `package-lock.json` instead of `npm install` of the top-level package. Fixes the install failing on npm's 404 for
+  puppeteer-core 25.18.1 (the lock holds 25.18.0). Each lock is installed into its own tree (`trees/<lock sha256>`) in a staging
+  directory and switched to only when complete, so a failed install leaves the working one serving. Older trees (and the
+  `node_modules` of a 0.2.0 install) are left in place, since a client started from one may still run; delete them by hand after
+  restarting clients. An existing install is redone once this way.
+- Install scripts stay off, except puppeteer's browser download, which runs on its own afterwards (as the old `npm install` did)
+  so PDF output has a browser; if that download fails, install warns with the command to re-run and still succeeds. A tree is
+  activated only when the ripgrep binary for node's own platform is present (npm ci is run hoisted, with optional packages and
+  with `--os`/`--cpu` of the recorded node, whatever the npmrc or `npm_config_*` say).
+
 ## 0.2.0
 
 - ChatGPT target in one command: `computer chatgpt install --hostname <name on a Cloudflare zone>` checks the prerequisites (node,

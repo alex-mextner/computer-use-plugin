@@ -1,0 +1,12 @@
+{
+  "name": "computer-desktop-commander",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The managed Desktop Commander install of `computer mcp install`: one exact version, and package-lock.json pins everything below it with integrity hashes (installed with npm ci --ignore-scripts). puppeteer-core is held at 25.18.0 because the 25.18.1 tarball answered 404 on npm while npm view listed it (issue #11).",
+  "dependencies": {
+    "@wonderwhy-er/desktop-commander": "0.3.2"
+  },
+  "overrides": {
+    "puppeteer-core": "25.18.0"
+  }
+}

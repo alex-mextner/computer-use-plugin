@@ -1,8 +1,11 @@
 """The pin table: every external thing `computer` installs is named here with an exact version, nowhere else.
 
 Desktop Commander (npm): 0.3.2 is both the version that was already in the local npx cache when this pin was chosen and the latest
-stable on npm. The ChatGPT target's release binaries (mcp-auth-proxy, cloudflared, OpenAI tunnel-client) carry the sha256 of their
-release assets: nothing is fetched by "latest" and every download is verified before it can run.
+stable on npm. Everything below it is pinned by computerlib/data/desktop-commander/package-lock.json (versions and sha512
+integrity, installed with npm ci). The ChatGPT target's release binaries (mcp-auth-proxy, cloudflared, OpenAI tunnel-client)
+carry the sha256 of their release assets: nothing is fetched by "latest" and every download is verified before it can run.
+HOW TO BUMP Desktop Commander: change DESKTOP_COMMANDER_VERSION and the version in data/desktop-commander/package.json together,
+regenerate the lock there (`npm install --package-lock-only --ignore-scripts`), then prove a clean `npm ci` from it.
 HOW TO BUMP a binary: change version, url and digest together. Release digests are the `digest` field GitHub publishes per asset
 (`gh api repos/<owner>/<repo>/releases/tags/<tag>`); the x86_64 ones were also compared with the binaries running on the author's
 PC.

@@ -14,8 +14,9 @@ external pinned processes this tool installs and drives, never source in this re
 computerlib/            import package; dist name `hyper-computer`, command `computer`
   cli.py                build_parser()/main(argv)->int, --version from package metadata
   commandtree.py        Command + command_target(): a target package builds its TARGET from its commands/ modules
-  desktop_commander.py  managed pinned install (install.json, flock, npm --prefix) and launch_spec; pins.py is the one pin table
-                        (Desktop Commander and the sha256-pinned release binaries of the chatgpt target)
+  desktop_commander.py  managed pinned install (npm ci --ignore-scripts from the lock in data/desktop-commander, install.json,
+                        flock) and launch_spec; pins.py is the one pin table (Desktop Commander and the sha256-pinned release
+                        binaries of the chatgpt target)
   mcp_probe.py          real MCP handshake used by every adapter's status
   targets/<name>/       one package per target, exposes TARGET (self-registered, no registry to edit)
     <name>/commands/    one module per command exposing COMMAND (mcp: install, serve; claude: install, status, uninstall;
