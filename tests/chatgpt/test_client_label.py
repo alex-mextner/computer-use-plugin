@@ -78,7 +78,7 @@ def test_a_plain_public_client_exchange_is_attributed_and_labelled(tmp_path: Pat
         )
         _mcp_call(shim, token)
         labels = _labels(shim, 4)
-    assert labels[-2:] == ["client=openai-mcp", "client=openai-mcp"]
+    assert labels == ["client=unverified", "client=unverified", "client=openai-mcp", "client=openai-mcp"]
 
 
 AMBIGUOUS = [
@@ -122,7 +122,7 @@ def test_a_token_request_the_proxy_might_read_differently_names_no_client(
         token = _token_step(shim, "jti-x", body, content_type, extra)
         _mcp_call(shim, token)
         labels = _labels(shim, 4)
-    assert labels[-2:] == ["client=unverified", "client=unverified"]
+    assert labels == ["client=unverified"] * 4
 
 
 @pytest.mark.parametrize(
@@ -158,7 +158,7 @@ def test_a_forged_user_agent_from_curl_is_unverified_on_every_endpoint(tmp_path:
             "POST", "/mcp", headers={"Authorization": f"Bearer {jwt('never-issued')}", "User-Agent": OPENAI_UA}, body=b"{}"
         )
         labels = _labels(shim, 5)
-    assert labels[2:] == ["client=unverified"] * 3
+    assert labels == ["client=unverified"] * 5
 
 
 def test_a_forged_user_agent_with_a_foreign_registration_is_unverified(tmp_path: Path) -> None:
@@ -167,7 +167,7 @@ def test_a_forged_user_agent_with_a_foreign_registration_is_unverified(tmp_path:
         token = _token_step(shim, "jti-local", f"client_id={LOCAL}".encode())
         _mcp_call(shim, token)
         labels = _labels(shim, 4)
-    assert labels[-2:] == ["client=unverified", "client=unverified"]
+    assert labels == ["client=unverified"] * 4
 
 
 def test_a_rejected_call_never_gets_a_verified_label(tmp_path: Path) -> None:
@@ -177,7 +177,7 @@ def test_a_rejected_call_never_gets_a_verified_label(tmp_path: Path) -> None:
         shim.upstream.routes["/mcp"] = (401, {}, b"no")
         shim.request("POST", "/mcp", headers={"Authorization": f"Bearer {token}", "User-Agent": OPENAI_UA}, body=b"{}")
         labels = _labels(shim, 4)
-    assert labels[-1] == "client=unverified"
+    assert labels == ["client=unverified", "client=unverified", "client=openai-mcp", "client=unverified"]
 
 
 def test_a_flood_of_anonymous_registrations_cannot_evict_a_connected_chatgpt(tmp_path: Path) -> None:
@@ -187,8 +187,8 @@ def test_a_flood_of_anonymous_registrations_cannot_evict_a_connected_chatgpt(tmp
         for n in range(MAX_CLIENTS * 2):
             _register(shim, f"anon-{n}", "http://localhost:1/x", user_agent="curl/8")
         _mcp_call(shim, token)
-        last = _labels(shim, 3 + MAX_CLIENTS * 2)[-1]
-    assert last == "client=openai-mcp"
+        labels = _labels(shim, 3 + MAX_CLIENTS * 2)
+    assert labels == ["client=unverified", "client=openai-mcp", *["client=unverified"] * (MAX_CLIENTS * 2), "client=openai-mcp"]
 
 
 def test_the_exchanged_client_survives_a_flood_and_a_restart(tmp_path: Path) -> None:
@@ -202,7 +202,8 @@ def test_the_exchanged_client_survives_a_flood_and_a_restart(tmp_path: Path) -> 
     assert saved["exchanged"] == {CHATGPT: "openai"}
     with running_shim(tmp_path, log_file) as shim:
         _mcp_call(shim, token)
-        assert _labels(shim, 2 + MAX_CLIENTS + 5 + 1)[-1] == "client=openai-mcp"
+        labels = _labels(shim, 2 + MAX_CLIENTS + 5 + 1)
+    assert labels == ["client=unverified", "client=openai-mcp", *["client=unverified"] * (MAX_CLIENTS + 5), "client=openai-mcp"]
 
 
 def test_a_client_that_only_registered_is_still_evictable_and_never_verified_by_a_flood(tmp_path: Path) -> None:
@@ -214,4 +215,5 @@ def test_a_client_that_only_registered_is_still_evictable_and_never_verified_by_
             _register(shim, f"anon-{n}", "http://localhost:1/x", user_agent="curl/8")
         token = _token_step(shim, "jti-late", f"client_id={CHATGPT}".encode())
         _mcp_call(shim, token)
-        assert _labels(shim, 3 + MAX_CLIENTS + 1)[-1] == "client=unverified"
+        labels = _labels(shim, 3 + MAX_CLIENTS + 1)
+    assert labels == ["client=unverified"] * (3 + MAX_CLIENTS + 1)

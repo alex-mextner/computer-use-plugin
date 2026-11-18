@@ -47,9 +47,15 @@ class Stack:
     def log(self) -> list[str]:
         path = self.layout.access_log
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and not (path.exists() and path.read_text()):
+        while time.monotonic() < deadline and not _complete_lines(path):
             time.sleep(0.05)
-        return path.read_text().splitlines() if path.exists() else []
+        return _complete_lines(path)
+
+
+def _complete_lines(path: Path) -> list[str]:
+    """The log's finished lines: the shim may be mid-write, and a torn last line would fail the label checks spuriously."""
+    text = path.read_text() if path.exists() else ""
+    return text[: text.rfind("\n") + 1].splitlines()
 
 
 def _install_scratch_stack(settings: Settings, node_dir: Path) -> Layout:
@@ -70,8 +76,22 @@ def _wait_until_serving(port: int, process: subprocess.Popen[bytes]) -> None:
         except OSError:
             pass
         time.sleep(0.3)
-    detail = process.stderr.read(2000).decode() if process.stderr else ""
-    raise AssertionError(f"the stack did not come up: {detail}")
+    raise AssertionError(f"the stack did not come up: {_stderr_after_stopping(process)}")
+
+
+def _stderr_after_stopping(process: subprocess.Popen[bytes]) -> str:
+    """Stop `run` first: reading the pipe of a live process blocks until it writes or exits, hanging instead of failing.
+    SIGTERM lets `run` stop its children too; every wait is bounded because an orphaned child could hold the pipe open."""
+    process.terminate()
+    try:
+        _, err = process.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            _, err = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            return "(no stderr: the pipe stayed open after the kill)"
+    return err[-2000:].decode(errors="replace") if err else ""
 
 
 @pytest.fixture

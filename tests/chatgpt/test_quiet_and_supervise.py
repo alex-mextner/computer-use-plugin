@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Generator
 
 import pytest
 
@@ -96,11 +97,32 @@ def test_a_dash_dash_inside_the_command_is_left_alone() -> None:
     assert result.stdout == "a -- b\n"
 
 
+@contextlib.contextmanager
+def _restored_stop_handlers() -> Generator[None]:
+    """run_foreground installs SIGTERM/SIGINT handlers for the real `run` process; in pytest they would outlive the test."""
+    saved = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for signum, handler in saved.items():
+            signal.signal(signum, handler)
+
+
+def test_the_supervise_tests_leave_the_stop_handlers_as_they_found_them() -> None:
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+    short = Process("short", "d", (sys.executable, "-c", "raise SystemExit(0)"))
+    with _restored_stop_handlers():
+        assert run_foreground([short], settle_seconds=0.05) == 0
+        assert signal.getsignal(signal.SIGTERM) not in (before[0], None)  # supervise really replaced it
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == before
+
+
 def test_the_foreground_run_stops_everything_when_one_process_exits(tmp_path: object) -> None:
     long = Process("long", "d", (sys.executable, "-c", "import time; time.sleep(60)"))
     short = Process("short", "d", (sys.executable, "-c", "raise SystemExit(7)"))
     started = time.monotonic()
-    assert run_foreground([long, short], settle_seconds=0.05) == 7
+    with _restored_stop_handlers():
+        assert run_foreground([long, short], settle_seconds=0.05) == 7
     assert time.monotonic() - started < 10
 
 
@@ -112,7 +134,8 @@ def test_the_password_reaches_a_process_environment_not_its_argv(tmp_path: objec
     out = Path(str(tmp_path)) / "seen"
     code = f"import os, sys; open({str(out)!r}, 'w').write(os.environ.get('PASSWORD', '') + '|' + ' '.join(sys.argv))"
     process = Process("p", "d", (sys.executable, "-c", code), env_files=(secret_file,))
-    assert run_foreground([process], settle_seconds=0.05) == 0
+    with _restored_stop_handlers():
+        assert run_foreground([process], settle_seconds=0.05) == 0
     seen = out.read_text()
     assert seen.startswith("s3cret|")
     assert "s3cret" not in seen.split("|", 1)[1]

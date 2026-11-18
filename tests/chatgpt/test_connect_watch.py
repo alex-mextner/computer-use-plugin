@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from computerlib.targets.chatgpt.checklist import Checklist
 from computerlib.targets.chatgpt.commands.connect import report_timeout, watch
 from computerlib.targets.chatgpt.context import load_context
@@ -88,8 +90,12 @@ def test_a_log_rotation_during_the_wait_loses_none_of_the_steps(tmp_path: Path) 
             if self.round == 0:
                 writer.write(f"{T} 201 POST /.idp/register 1ms client=unverified")
                 writer.write(f"{T} 200 POST /mcp 1ms client=openai-mcp rpc=initialize")
-                while not Path(f"{log}.1").exists():  # the writer rotates once the file would pass its cap
+                for _ in range(1000):  # the writer rotates once the file would pass its cap; bounded so a broken writer fails
+                    if Path(f"{log}.1").exists():
+                        break
                     writer.write(pad)
+                else:
+                    pytest.fail("the RotatingLog never rotated after 1000 writes past its 400-byte cap")
                 writer.write(f"{T} 200 POST /mcp 1ms client=openai-mcp rpc=tools/list")
             else:
                 writer.write(f"{T} 200 POST /mcp 9ms client=openai-mcp rpc=tools/call tool=get_config")
