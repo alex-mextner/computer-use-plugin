@@ -13,9 +13,10 @@ import sys
 from computerlib.commandtree import Command
 from computerlib.desktop_commander import launch_spec
 
-# On Desktop Commander's first run in a HOME (no ~/.claude-server-commander/config.json), its `initialize` handler runs the
-# welcome-page onboarding first: it waits for the feature flags (up to 5 s) and, for users in the A/B arm that gets the page (100%
-# of them in the flags served on 2026-11-18), awaits `xdg-open https://desktopcommander.app/welcome/`. Where that starts a browser
+# Until Desktop Commander has opened its welcome page once in a HOME (a fresh HOME has no ~/.claude-server-commander/config.json
+# yet), its `initialize` handler runs the welcome-page onboarding first: it waits for the feature flags (up to 5 s) and, for users
+# in the A/B arm that gets the page (100% of them in the flags served on 2026-11-18), awaits
+# `xdg-open https://desktopcommander.app/welcome/`. Where that starts a browser
 # that stays in the foreground (a desktop session whose browser is not already running for this HOME), xdg-open returns only when
 # the browser closes, so `initialize` is never answered and mcp-auth-proxy exits (#21). The page is no use to the clients this
 # command serves, so the welcome page is always off.

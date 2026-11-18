@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from computerlib import desktop_commander
-from computerlib.targets.chatgpt import lifecycle, processes
+from computerlib.targets.chatgpt import dialog, lifecycle, processes
 from computerlib.targets.chatgpt.commands.connect import watch_tunnel
 from computerlib.targets.chatgpt.context import load_context
 from computerlib.targets.chatgpt.settings import Settings, config_file, load_settings, save_settings
@@ -35,6 +35,7 @@ from tests.chatgpt.cli_helpers import (
 )
 from tests.chatgpt.conftest import FakeMachine
 from tests.chatgpt.fake_daemon import Daemon, running_daemon
+from tests.fakes import write_executable
 
 UNIT = "computer-chatgpt-tunnel-client.service"
 PUBLIC_UNITS = ("computer-chatgpt-bridge.service", "computer-chatgpt-shim.service", "computer-chatgpt-tunnel.service")
@@ -603,6 +604,24 @@ def test_connect_needs_a_running_daemon(
     result = run_cli(capsys, "connect", "--no-wait", "--no-open", "--no-copy")
     assert result.code == 3
     assert "computer chatgpt start" in result.err
+
+
+def test_connect_without_a_display_prints_the_settings_page_instead_of_running_xdg_open(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Over ssh xdg-open is installed but has no display to open on: connect must say where to go, not claim a browser opened.
+    _init_tunnel(capsys, monkeypatch)
+    opened = tmp_path / "xdg-open.log"
+    write_executable(machine.bin_dir / "xdg-open", f'#!/bin/sh\necho "$@" >> "{opened}"\n')
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    with running_daemon(Daemon()) as port:
+        _use_health_port(port)
+        monkeypatch.setenv("PATH", str(machine.bin_dir))
+        result = run_cli(capsys, "connect", "--no-wait", "--no-copy")
+    assert result.code == 0, result.err
+    assert f"open {dialog.SETTINGS_PAGE} yourself" in result.out
+    assert not opened.exists()
 
 
 def test_connect_warns_when_the_daemon_cannot_poll_but_still_shows_the_fields(
