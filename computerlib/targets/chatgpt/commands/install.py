@@ -11,8 +11,9 @@ Chain (each step is idempotent, the building blocks stay available as `init`, `l
      install`), pinned and sha256-verified mcp-auth-proxy and cloudflared
   3. `login`: Cloudflare login when this target has no certificate yet (the only interactive step: a URL to open in a browser on
      any device; `--cloudflare-cert` reuses an existing account certificate instead), the named tunnel (an existing one without
-     local credentials is refused unless named with --tunnel-name), the DNS route (a record that points elsewhere is replaced only
-     after a question, or with --yes)
+     local credentials is refused unless named with --tunnel-name, and while it has live connections unless --force-takeover),
+     the DNS route (a record that points elsewhere is replaced only after a question, or with --yes; for a --domain hostname
+     only with --force-takeover, since a same-name machine derives the same hostname)
   4. config.toml and the systemd --user unit files, only now: a run that stops in `login` leaves the old ones, so `connect`,
      `doctor` and `uninstall` still describe the running stack and the corrected re-run sees the units change and restarts them
   5. `start`: lingering, enable + start the units (restarting any whose file changed), wait until the local chain serves
@@ -37,7 +38,13 @@ from computerlib.targets.chatgpt import zone
 from computerlib.targets.chatgpt.cloudflare import read_account_cert
 from computerlib.targets.chatgpt.commands.connect import connector_name, print_instructions
 from computerlib.targets.chatgpt.commands.init import add_public_options, apply_flags, install_units, prepare, require_pins
-from computerlib.targets.chatgpt.commands.login import add_cert_option, record_kept_error, require_tunnel_name, setup_tunnel
+from computerlib.targets.chatgpt.commands.login import (
+    add_cert_option,
+    add_takeover_option,
+    record_kept_error,
+    require_tunnel_name,
+    setup_tunnel,
+)
 from computerlib.targets.chatgpt.commands.start import start_stack
 from computerlib.targets.chatgpt.context import load_context
 from computerlib.targets.chatgpt.machine import require_hostname
@@ -60,12 +67,13 @@ def configure(parser: argparse.ArgumentParser) -> None:
         "--tunnel-name",
         help=(
             "Cloudflare tunnel name (default: the saved one, else the machine name); naming an existing tunnel this machine has "
-            "no credentials for adopts it"
+            "no credentials for adopts it (refused while it has live connections, unless forced)"
         ),
     )
     add_public_options(parser)
     add_cert_option(parser)
-    parser.add_argument("--yes", action="store_true", help="replace an existing DNS record of the hostname without asking")
+    add_takeover_option(parser)
+    parser.add_argument("--yes", action="store_true", help="replace an existing DNS record of a --hostname without asking")
     parser.add_argument(
         "--skip-dns", action="store_true", help="do not check the zone or touch DNS (you route the hostname yourself)"
     )
@@ -215,8 +223,10 @@ def run(args: argparse.Namespace) -> int:
         assume_yes=args.yes,
         skip_dns=args.skip_dns,
         adopt=args.tunnel_name is not None,
+        force_takeover=args.force_takeover,
         cert=cert,
     ):
+        # A --domain hostname never gets here: its conflicting record is refused inside setup_tunnel.
         raise record_kept_error(settings)
     print(f"config: {save_settings(settings)}")
     changed_units = install_units(settings, layout)

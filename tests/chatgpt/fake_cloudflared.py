@@ -1,9 +1,11 @@
 """A stand-in for the pinned `cloudflared` CLI: the subcommands `computer chatgpt` drives, with the real flag shapes and messages.
 
 It is installed as the "downloaded" binary (`stand_in_for_the_network(binaries={"cloudflared": FAKE_CLOUDFLARED})`), so the real
-command code runs against it. The account (tunnels, DNS records) lives in $FAKE_CF_STATE; every call is logged there with its HOME
-and PATH, so a test can prove that ~/.cloudflared was never used and that the login could not start a browser by itself.
-Messages are the real ones of cloudflared 2026.10.7 (`route dns` success/"already configured"/"already exists").
+command code runs against it. The account (tunnels with their ids and edge connections, DNS records) lives in $FAKE_CF_STATE;
+every call is logged there with its HOME and PATH, so a test can prove that ~/.cloudflared was never used and that the login could
+not start a browser by itself. Messages are the real ones of cloudflared 2026.10.7 (`route dns` success/"already
+configured"/"already exists"); JSON outputs have the real shapes: `tunnel list` without connections (Cloudflare dropped the
+field on 2026-10-05), `tunnel info` with its connectors and their connections (Cloudflare's connections endpoint).
 """
 
 from __future__ import annotations
@@ -63,35 +65,50 @@ if command in ("list", "create", "token", "route") and not os.path.isfile(origin
 if "--config" in options and not os.path.isfile(options["--config"]):
     fail("Cannot read config file " + options["--config"])
 tunnels = load("tunnels.json", [])
-def write_credentials(path):
-    Path(path).write_text(
-        json.dumps({"AccountTag": "acct", "TunnelSecret": "c2VjcmV0", "TunnelID": "00000000-0000-0000-0000-0000000000aa"})
-    )
+ids = load("ids.json", {})
+live = load("connections.json", {})
+def tunnel_id(name):
+    return ids.get(name, "00000000-0000-0000-0000-0000000000aa")
+def resolve(ref):
+    # cloudflared takes an id or a name wherever it takes a tunnel.
+    found = [n for n in tunnels if ref in (n, tunnel_id(n))]
+    if len(found) != 1:
+        fail("Tunnel not found" if not found else "ambiguous tunnel " + ref)
+    return found[0]
+def write_credentials(path, name):
+    Path(path).write_text(json.dumps({"AccountTag": "acct", "TunnelSecret": "c2VjcmV0", "TunnelID": tunnel_id(name)}))
     os.chmod(path, 0o400)
 if command == "list":
     name = rest[rest.index("--name") + 1]
-    print(json.dumps([{"id": "00000000-0000-0000-0000-0000000000aa", "name": n} for n in tunnels if n == name]))
+    print(json.dumps([{"id": tunnel_id(n), "name": n, "created_at": "2026-11-01T00:00:00Z"} for n in tunnels if n == name]))
+elif command == "info":
+    name = resolve(rest[-1])
+    info = {"id": tunnel_id(name), "name": name, "createdAt": "2026-11-01T00:00:00Z"}
+    counts = live.get(name, {"active": 0, "pending": 0})
+    if counts is not None:  # None: an answer without connectors (the unknown case)
+        conns = [{"colo_name": "fra08", "is_pending_reconnect": False}] * counts["active"]
+        conns += [{"colo_name": "fra08", "is_pending_reconnect": True}] * counts["pending"]
+        info["conns"] = [{"id": "11111111-1111-1111-1111-111111111111", "version": "2026.10.7", "conns": conns}] if conns else []
+    print(json.dumps(info))
 elif command == "create":
     name = rest[-1]
     if re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32}", name):
         fail("tunnel name cannot be a UUID")
     if name in tunnels:
         fail("failed to create tunnel: Create Tunnel API call failed: tunnel with name already exists")
-    write_credentials(rest[rest.index("--credentials-file") + 1])
+    write_credentials(rest[rest.index("--credentials-file") + 1], name)
     save("tunnels.json", tunnels + [name])
     print("Created tunnel " + name + " with id 00000000-0000-0000-0000-0000000000aa")
 elif command == "token":
-    name = rest[-1]
-    if name not in tunnels:
-        fail("Tunnel not found")
-    write_credentials(rest[rest.index("--cred-file") + 1])
+    write_credentials(rest[rest.index("--cred-file") + 1], resolve(rest[-1]))
 elif command == "route" and rest[1] == "dns":
     words = [w for w in rest[2:] if not w.startswith("--")]
     name, host = words
     routes = load("routes.json", {})
     if routes.get(host) == name:
         print(host + " is already configured to route to your tunnel tunnelID=00000000-0000-0000-0000-0000000000aa")
-    elif host in routes and "--overwrite-dns" not in rest:
+    # cloudflared reads TUNNEL_FORCE_PROVISIONING_DNS as --overwrite-dns
+    elif host in routes and "--overwrite-dns" not in rest and os.environ.get("TUNNEL_FORCE_PROVISIONING_DNS") != "true":
         fail(
             "Failed to add route: code: 1003, reason: Failed to create record " + host
             + " with err An A, AAAA, or CNAME record with that host already exists."
@@ -139,6 +156,31 @@ def existing_record(state: Path, host: str, points_at: str) -> None:
     """A DNS record that already exists in the zone (another tunnel, or anything that is not ours)."""
     state.mkdir(parents=True, exist_ok=True)
     (state / "routes.json").write_text(json.dumps({**routes(state), host: points_at}))
+
+
+def _set(state: Path, file: str, key: str, value: object) -> None:
+    state.mkdir(parents=True, exist_ok=True)
+    path = state / file
+    current = cast("dict[str, object]", json.loads(path.read_text())) if path.exists() else {}
+    path.write_text(json.dumps({**current, key: value}))
+
+
+def connected(state: Path, name: str, active: int, pending: int = 0) -> None:
+    """The tunnel `name` has `active` open edge connections (a cloudflared runs it right now, here or on another machine) and
+    `pending` recently closed ones that Cloudflare still lists as pending reconnect."""
+    _set(state, "connections.json", name, {"active": active, "pending": pending})
+
+
+def connections_unreported(state: Path, name: str) -> None:
+    """`tunnel info` answers for `name` without its connectors: whether it runs is unknown."""
+    _set(state, "connections.json", name, None)
+
+
+def recreated(state: Path, name: str, tunnel_id: str) -> None:
+    """The tunnel `name` was deleted and created again (by another machine): same name, new id."""
+    _set(state, "ids.json", name, tunnel_id)
+    if name not in tunnels(state):
+        (state / "tunnels.json").write_text(json.dumps([*tunnels(state), name]))
 
 
 def account_cert(account: str) -> str:
