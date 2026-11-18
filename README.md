@@ -248,7 +248,7 @@ names ignoring case and would read the last).
 | `end` | stop and disable; `--revoke` also deletes all OAuth sessions and registered clients (tunnel mode: the stored runtime key). Fails (exit 1) when a unit is still running or enabled afterwards, and refuses a symlinked data dir |
 | `status` | units, local probes, last request and verified ChatGPT tool calls (tunnel mode: the daemon's state and counters); `--json`; exit 3 when unhealthy |
 | `logs` | the compact access log. Flags: `-n`/`--lines`, `--all`, `--tool`, `--rpc`, `--status`, `--client`, `--oauth` |
-| `doctor` | diagnose the chain end to end and say how to fix it, never restarts (tunnel mode: its own chain, nothing public). Flags: `--local`, `--json` |
+| `doctor` | diagnose the chain end to end and say how to fix it, never restarts (tunnel mode: its own chain, nothing public). Flags: `--local`, `--json`; `--heal` instead runs one watchdog pass that restarts a hung unit (below) |
 | `connect` | ChatGPT dialog fields, clipboard, live checklist. Flags: `--name` (default: the machine name), `--no-open`, `--no-copy`, `--no-wait`, `--timeout` |
 | `run` | run the stack in the foreground without systemd (development, proofs on scratch ports); `--no-tunnel` (public mode) |
 | `uninstall` | remove the unit files; `--purge` also deletes config, password, tunnel key, OAuth state, logs, binaries and the default cloudflared directory. Without a config, `--purge` also stops and removes the unit files this tool wrote under another `--unit-prefix` (found by their marker line). The shared Desktop Commander, the Cloudflare tunnel and its DNS record are kept (it says so) |
@@ -258,6 +258,49 @@ As full command lines: `computer chatgpt install`, `computer chatgpt init`, `com
 `computer chatgpt stop`, `computer chatgpt restart`, `computer chatgpt end`, `computer chatgpt status`, `computer chatgpt logs`,
 `computer chatgpt doctor`, `computer chatgpt connect`, `computer chatgpt run`, `computer chatgpt uninstall`, `computer chatgpt shim`,
 `computer chatgpt quiet`.
+
+### Healing a hung unit (`doctor --heal`)
+
+`Restart=always` restarts a unit whose process exits. A process that stays up but stops answering is not restarted: a stopped
+(SIGSTOP) or deadlocked proxy keeps its port, connections are accepted and requests hang, and the shim in front of it hangs the
+same way; cloudflared with no edge connection stays active and answers its `/ready` with 503. `computer chatgpt doctor --heal`
+(public mode) is one bounded watchdog pass for that case:
+
+- it probes only locally: the bridge on the proxy port, the shim on the shim port (a shim that hangs while the bridge does not serve
+  is counted against the bridge, not restarted), and, with a tunnel, cloudflared's own `127.0.0.1:<metrics port>/ready`. The public
+  URL is never probed by `--heal`: its failures (DNS, Cloudflare, the internet) are not fixed by a restart, so plain `doctor`
+  reports them and nothing acts on them;
+- only an `active` unit is restarted (a failed or restarting one is systemd's job), after 3 failing passes in a row, at most 3 times
+  an hour per unit and 10 minutes apart; once the budget is spent it says so and exits 3 instead of looping;
+- no restart while the internet is unreachable (no TCP answer from 1.1.1.1:443 or 8.8.8.8:443, checked only when something
+  failed): one line says so and the failure counts start again after the outage;
+- a lock (`~/.local/state/computer/chatgpt/heal.lock`) keeps two passes from overlapping; the counts and restart times are in
+  `heal.json` next to it;
+- under systemd, a restart and the first pass a spent budget stops one are logged at warning priority, a counted failure and the
+  offline gate at info, everything else (a healthy pass, a unit that is not active) at debug.
+
+Nothing schedules it for you. To run it every two minutes, add a user timer (`command -v computer` gives the path for `ExecStart`):
+
+```ini
+# ~/.config/systemd/user/computer-chatgpt-heal.service
+[Unit]
+Description=Restart a hung unit of the computer chatgpt stack
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/computer chatgpt doctor --heal
+
+# ~/.config/systemd/user/computer-chatgpt-heal.timer
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+```
+
+then `systemctl --user daemon-reload && systemctl --user enable --now computer-chatgpt-heal.timer`, and
+`journalctl --user -u computer-chatgpt-heal.service -p warning` lists what it did.
 
 ### Modes
 

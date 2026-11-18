@@ -45,8 +45,8 @@ def request(url: str, method: str = "GET", body: bytes | None = None, timeout: f
         return None
 
 
-def local_alive(port: int) -> bool:
-    return request(f"http://127.0.0.1:{port}{PRM_PATH}") is not None
+def local_alive(port: int, timeout: float = 5.0) -> bool:
+    return request(f"http://127.0.0.1:{port}{PRM_PATH}", timeout=timeout) is not None
 
 
 def challenge_ok(base_url: str, timeout: float = 8.0) -> tuple[bool, str]:
