@@ -42,10 +42,11 @@ _INT_DIGITS = 4000
 # Every survey variant of DC 0.3.2 has this shape: one instruction line, the quoted request ending in DC's own turn-off line and a
 # rule, then one closing sentence, appended at the end of the text (only DC's Docker notice may follow it). Matching the whole
 # shape, never across another instruction header and only where DC puts it, keeps DC's other notices and any file content that
-# quotes part of the survey intact.
+# quotes part of the survey intact. The parts are bounded (DC's are about 110, 250 and 40 characters): an unbounded lazy loop
+# grows the regex engine's stack per character, so a tool result with the header and a line of many MB would exhaust memory.
 _HEADER = r"\n\n\[SYSTEM INSTRUCTION\]: "
-_LINE = r"(?:(?!\[SYSTEM INSTRUCTION\])[^\n])*?"
-_SPAN = r"(?:(?!\[SYSTEM INSTRUCTION\]).)*?"
+_LINE = r"(?:(?!\[SYSTEM INSTRUCTION\])[^\n]){0,400}?"
+_SPAN = r"(?:(?!\[SYSTEM INSTRUCTION\]).){0,2000}?"
 _SURVEY = re.compile(
     rf"{_HEADER}{_LINE}Format it like: '\n\n---\n\n\*\*Desktop Commander Team request\*\*\n\n"
     rf"{_SPAN}\*This request disappears after you give feedback or set feedbackGiven=true\*\n\n---\n\n'\. {_LINE}\."
@@ -75,7 +76,7 @@ def _int_like_v8(digits: str) -> int | float:
     return int(digits) if len(digits.lstrip("-")) <= _INT_DIGITS else float(digits)
 
 
-def _load(line: bytes) -> object:
+def _load(line: bytes | bytearray) -> object:
     """`line` read the way DC's Node reads it (the MCP SDK decodes invalid UTF-8 to U+FFFD, V8 takes any integer); raises
     _Unreadable for what Python still cannot read (nesting deeper than its recursion limit)."""
     try:
@@ -84,7 +85,7 @@ def _load(line: bytes) -> object:
         raise _Unreadable from error
 
 
-def local_answer(line: bytes) -> bytes | None:
+def local_answer(line: bytes | bytearray) -> bytes | None:
     """What the client gets instead of DC seeing `line`, or None to forward it: the answer to a feedback call (nothing for one
     sent as a notification), or a parse error for a line Python cannot read, which therefore cannot be shown to be no feedback
     call. Every line is parsed, not searched for the tool's name: a JSON string may spell it with escapes."""
@@ -153,7 +154,7 @@ def filtered_server_line(line: bytes) -> bytes:
     return line if replaced is None else _encode({**message, "result": replaced})
 
 
-def _write_all(fd: int, data: bytes) -> None:
+def _write_all(fd: int, data: bytes | bytearray) -> None:
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view) :]
@@ -176,7 +177,7 @@ def _pump_client(source: int, server: int, out: _Output) -> None:
     """Client lines to DC, minus the ones answered here. Reads the raw fd: this thread is still blocked in that read when the
     relay returns, and a buffered stdin's lock held at interpreter exit aborts the process."""
 
-    def deliver(line: bytes) -> None:
+    def deliver(line: bytearray) -> None:
         answer = local_answer(line)
         if answer is None:
             _write_all(server, line)
@@ -190,11 +191,11 @@ def _pump_client(source: int, server: int, out: _Output) -> None:
             searched = len(pending)
             pending += chunk
             while (end := pending.find(b"\n", searched)) != -1:
-                deliver(bytes(pending[: end + 1]))
+                deliver(pending[: end + 1])
                 del pending[: end + 1]
                 searched = 0
         if pending:
-            deliver(bytes(pending))
+            deliver(pending)
     except OSError:
         pass  # a pipe closed: DC's (the server side sees its EOF and ends the relay) or the client's (it is gone)
     finally:
@@ -251,8 +252,8 @@ def relay(node: Path, args: Sequence[str]) -> int:
             raise _Stop
 
     for signum in _FORWARDED:
-        # An ignored signal stays ignored, as it is for DC, which inherits that: stopping the relay for it would leave a live,
-        # silent server behind.
+        # An ignored signal stays ignored: whoever started serve asked for that (nohup), and stopping the relay for it would
+        # cut the client off from a DC that the signal never reached.
         if signal.getsignal(signum) is not signal.SIG_IGN:
             signal.signal(signum, forward)
     out = _Output(sys.stdout.fileno())

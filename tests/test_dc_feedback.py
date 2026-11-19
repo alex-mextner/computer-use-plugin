@@ -165,6 +165,38 @@ def test_lines_that_are_not_json_pass_through_unchanged() -> None:
     assert filtered_server_line(line) == line
 
 
+def test_a_long_line_after_the_marker_does_not_exhaust_memory() -> None:
+    """A file of one 20 MB line behind DC's instruction header, read by the model: the survey search stays near the text's size
+    (an unbounded lazy loop grew to about 1.3 GB)."""
+    code = (
+        "from computerlib.dc_relay import without_survey\n"
+        "text = '\\n\\n[SYSTEM INSTRUCTION]: ' + 'a' * 20_000_000\n"
+        "assert without_survey(text) == text\n"
+        "print(next(line.split()[1] for line in open('/proc/self/status') if line.startswith('VmHWM')))\n"
+    )
+    peak_kib = int(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout)
+    assert peak_kib < 300_000
+
+
+def test_a_request_longer_than_one_read_and_the_next_one_in_the_same_write_both_arrive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install(tmp_path, monkeypatch)
+    env, _ = _env_with_browser(tmp_path)
+    long_call: dict[str, object] = {
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "tools/call",
+        "params": {"name": "write_file", "arguments": {"c": "x" * 300_000}},
+    }
+    listing: dict[str, object] = {"jsonrpc": "2.0", "id": 22, "method": "tools/list", "params": {}}
+    with McpSession(SERVE, env) as session:
+        session.initialize(timeout=20)
+        session.send_line(json.dumps(long_call).encode() + b"\n" + json.dumps(listing).encode() + b"\n")
+        assert result_texts(session.reply(21, "tools/call", timeout=10)) == ["write_file done"]
+        assert len(items(session.reply(22, "tools/list", timeout=10), "tools")) == 3
+
+
 def test_serve_exits_with_desktop_commanders_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install(tmp_path, monkeypatch, "--crash")
     env, _ = _env_with_browser(tmp_path)
