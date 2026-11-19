@@ -12,7 +12,8 @@ upstream instead of growing memory, and a client that goes away (also while the 
 connection and end the helper thread. Hop-by-hop headers (RFC 9110 7.6.1) are not forwarded in either direction; rules never
 delay or change what is forwarded except the three documented changes (challenge header, protected-resource path, idle SSE
 comment); a logging failure never touches a request; an upstream failure is a 502 and one journal line per minute, as is a
-refused connection.
+refused connection. A request with more than one Authorization header is answered 400 and never forwarded, so the label can only
+name the credential the proxy checked.
 NOTE: a generic engine belongs in agent-tools/lib (L2 work); this is the target-specific minimum until it ships, kept to the same
 hook points so the swap is local to this file.
 """
@@ -309,6 +310,12 @@ class _Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         path = self.path.partition("?")[0]
         rules = self.server.rules
+        if len(self.headers.get_all("Authorization") or ()) > 1:
+            # The proxy authenticates one of them (Go's Header.Get: the first) and the label would name the client of whichever
+            # the rules read. Collapsing to the proxy's pick would tie the shim to that detail; no client sends two of a
+            # singleton field (RFC 9110 11.6.2), so the request is refused before it is forwarded or logged.
+            self._reply_error(400)
+            return
         request_headers = {name.lower(): value for name, value in self.headers.items()}
         kind = rules.peek_kind(self.command, path, request_headers)
         keep = PEEK_MAX_BYTES if kind == "mcp" else CAPTURE_MAX_BYTES if kind == "learn" else 0

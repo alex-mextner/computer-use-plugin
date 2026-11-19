@@ -1,8 +1,8 @@
 """Writes small bbolt files in the layout mcp-auth-proxy's `db` has (go.etcd.io/bbolt v1.4), for the shim's store reader.
 
-Layouts: `leaf` (the bucket's own leaf page), `inline` (the bucket stored inside its parent's value, as bbolt does for a small
-bucket), `branch` (a branch page over two leaf pages). A value bigger than a page spills into overflow pages as in bbolt. Only
-what the reader needs: no freelist contents, one transaction.
+Layouts: `leaf` (every entry in the bucket's one leaf page, however big), `inline` (the bucket stored inside its parent's value,
+as bbolt does for a small bucket), `branch` (a branch page over two leaf pages). A value bigger than a page spills into overflow
+pages as in bbolt. Only what the reader needs: no freelist contents, one transaction.
 """
 
 from __future__ import annotations

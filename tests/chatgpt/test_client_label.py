@@ -1,10 +1,11 @@
 """The verified client label: a User-Agent alone never earns it, and a token request that the proxy might read differently than
 the shim names no client (regressions of the #149 review: `?client_id=` parsing, duplicates, truncated bodies, and the flood of
-anonymous registrations)."""
+anonymous registrations; #60: duplicate Authorization headers)."""
 
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 from pathlib import Path
 from urllib.parse import urlencode
@@ -178,6 +179,44 @@ def test_a_rejected_call_never_gets_a_verified_label(tmp_path: Path) -> None:
         shim.request("POST", "/mcp", headers={"Authorization": f"Bearer {token}", "User-Agent": OPENAI_UA}, body=b"{}")
         labels = _labels(shim, 4)
     assert labels == ["client=unverified", "client=unverified", "client=openai-mcp", "client=unverified"]
+
+
+@pytest.mark.parametrize(
+    "names_and_order",
+    [
+        pytest.param((("Authorization", "forged"), ("Authorization", "valid")), id="forged-first"),
+        pytest.param((("Authorization", "valid"), ("Authorization", "forged")), id="forged-last"),
+        pytest.param((("authorization", "forged"), ("AUTHORIZATION", "valid")), id="names-differing-in-case"),
+    ],
+)
+def test_a_request_with_two_authorization_headers_is_refused_and_never_labelled(
+    tmp_path: Path, names_and_order: tuple[tuple[str, str], ...]
+) -> None:
+    """The proxy authenticates one of the two (Go's Header.Get: the first) and the shim would label by another: a direct
+    connection to the shim could then earn a forged token the label of a valid one. Authorization is a singleton field (RFC 9110
+    11.6.2), so the shim refuses the request before it reaches the proxy or the access log."""
+    with running_shim(tmp_path) as shim:
+        _register(shim, CHATGPT, REDIRECTS[CHATGPT])
+        tokens = {"valid": _token_step(shim, "jti-ok", f"client_id={CHATGPT}".encode()), "forged": jwt("jti-forged")}
+        shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
+        body = b'{"method":"tools/list"}'
+        connection = http.client.HTTPConnection("127.0.0.1", shim.port, timeout=10)
+        try:
+            connection.putrequest("POST", "/mcp")
+            for name, which in names_and_order:
+                connection.putheader(name, f"Bearer {tokens[which]}")
+            connection.putheader("User-Agent", OPENAI_UA)
+            connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body)
+            response = connection.getresponse()
+            response.read()
+        finally:
+            connection.close()
+        assert response.status == 400
+        _mcp_call(shim, tokens["valid"])  # the next line in the log is this call's, so the refused one wrote none
+        labels = _labels(shim, 3)
+    assert labels == ["client=unverified", "client=openai-mcp", "client=openai-mcp"]
+    assert [seen.target for seen in shim.upstream.seen].count("/mcp") == 1
 
 
 def test_a_flood_of_anonymous_registrations_cannot_evict_a_connected_chatgpt(tmp_path: Path) -> None:

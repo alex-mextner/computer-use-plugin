@@ -363,7 +363,9 @@ Never written: query strings, bodies, tool arguments, Authorization headers, coo
 accepted and that token belongs to an OAuth client registered with `https://chatgpt.com/...` redirect URIs. Anything else is
 `client=unverified`. The shim learns which client a token belongs to from the token exchange it forwards; for a token it never saw
 issued (one ChatGPT already held before a restart, a reinstall or a lost state directory) it reads the client from mcp-auth-proxy's
-own OAuth store, read only, so a valid ChatGPT token keeps its label.
+own OAuth store, read only, so a valid ChatGPT token keeps its label; that lookup reads a few KiB per call, so even a multi-MiB
+registration a stranger stores next to the token cannot hide it. A request with two Authorization headers is answered 400 and never
+forwarded: the proxy would check one and the label could name another.
 
 ### Security
 

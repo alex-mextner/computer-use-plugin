@@ -9,12 +9,15 @@ is the third segment of the JWT (fosite's DefaultJWTStrategy); the value holds t
 client is stored under `client-<id>`.
 INVARIANTS: never takes the bbolt file lock and never writes: the running proxy holds an exclusive flock and a reader that
 waited for it would hang the label, while a stray write could corrupt the proxy's state. A lookup descends the B+tree to the two
-keys it needs (pread, page by page; never the whole file, so a store bloated by open registrations costs nothing extra) under
-the newest meta page whose checksum is valid (either of the two, as bbolt itself recovers). bbolt is copy-on-write: the pages of
-transaction T's tree are freed only by T+1 and reused from T+2 on, so if the newest meta is still T after the lookup, every page
-read belonged to T's tree; if a commit landed meanwhile the lookup is repeated. Every page is checked (its own id, its kind,
-its bounds) and anything inconsistent gives no answer, which keeps the line `unverified`. Only the client id and its redirect
-URIs leave this module; tokens, secrets and session data are never kept.
+keys it needs under the newest meta page whose checksum is valid (either of the two, as bbolt itself recovers). It reads with
+pread, element by element, never a whole page: a binary search reads each probed element header and at most one byte more of
+its key than the key sought, and only the matching value is read, if it is no bigger than MAX_VALUE_BYTES. Registration is open
+to anyone, so a stranger's multi-MiB record can share a leaf with ChatGPT's token; it is never read, it cannot hide the token,
+and one lookup reads a few KiB whatever the store holds. bbolt is copy-on-write: the pages of transaction T's tree are freed
+only by T+1 and reused from T+2 on, so if the newest meta is still T after the lookup, every page read belonged to T's tree; if
+a commit landed meanwhile the lookup is repeated. Every page is checked (its own id, its kind) and every element read lies inside
+its page; anything inconsistent gives no answer, which keeps the line `unverified`. Only the client id and its redirect URIs
+leave this module; tokens, secrets and session data are never kept.
 Format reference: go.etcd.io/bbolt v1.4 internal/common (page.go, meta.go, bucket.go), db.go (meta recovery).
 """
 
@@ -38,7 +41,7 @@ BUCKET_HEADER = struct.Struct("<QQ")  # root pgid (0 = inline), sequence
 BRANCH, LEAF, META_PAGE = 0x01, 0x02, 0x04
 BUCKET_LEAF = 0x01
 PAGE_SIZES = (4096, 8192, 16384, 32768, 65536)  # where the second meta page may sit when the first cannot say
-MAX_PAGE_BYTES = 1024 * 1024  # a page with its overflow; a client or token record is a few KiB
+MAX_VALUE_BYTES = 256 * 1024  # a token or client record is a few KiB; a bigger value is never read
 MAX_DEPTH = 16
 ATTEMPTS = 3
 
@@ -92,81 +95,112 @@ def _newest_meta(fd: int) -> _Meta:
     return max(valid, key=lambda m: m.txid)
 
 
+@dataclass(frozen=True)
+class _Page:
+    """A page read on demand, never whole: from the file at `start`, or from an inline bucket's bytes."""
+
+    fd: int
+    start: int
+    length: int  # with its overflow pages; every read stays inside it
+    flags: int
+    count: int
+    inline: bytes | None = None
+
+    def read(self, offset: int, size: int) -> bytes:
+        if offset < PAGE_HEADER.size or offset + size > self.length:
+            raise Inconsistent("element out of page")
+        data = os.pread(self.fd, size, self.start + offset) if self.inline is None else self.inline[offset : offset + size]
+        if len(data) != size:
+            raise Inconsistent("page beyond the end of the file")
+        return data
+
+
 class _Reader:
     def __init__(self, fd: int, meta: _Meta) -> None:
         self.fd = fd
         self.meta = meta
 
-    def page(self, pgid: int) -> bytes:
-        """Page `pgid` with its overflow pages, id- and bounds-checked."""
+    def page(self, pgid: int) -> _Page:
+        """Page `pgid` by its header alone, id-checked; its elements are read when a search probes them."""
         size = self.meta.page_size
         if pgid < 2:
             raise Inconsistent("page id out of range")
         head = os.pread(self.fd, PAGE_HEADER.size, pgid * size)
         if len(head) < PAGE_HEADER.size:
             raise Inconsistent("page beyond the end of the file")
-        page_id, _, _, overflow = PAGE_HEADER.unpack_from(head, 0)
-        length = (overflow + 1) * size
-        if page_id != pgid or length > MAX_PAGE_BYTES:
+        page_id, flags, count, overflow = PAGE_HEADER.unpack(head)
+        if page_id != pgid:
             raise Inconsistent("page does not identify as itself")
-        data = os.pread(self.fd, length, pgid * size)
-        if len(data) < length:
-            raise Inconsistent("page beyond the end of the file")
-        return data
+        return _Page(self.fd, pgid * size, (overflow + 1) * size, flags, count)
 
-    def get(self, buffer: bytes, offset: int, key: bytes, depth: int = 0) -> tuple[bytes, int] | None:
-        """(value, flags) of `key` in the subtree whose page starts at `offset` in `buffer`, or None when it is absent."""
+    def get(self, page: _Page, key: bytes, depth: int = 0) -> tuple[bytes, int] | None:
+        """(value, flags) of `key` in the subtree under `page`, or None when it is absent."""
         if depth > MAX_DEPTH:
             raise Inconsistent("tree too deep")
-        _, flags, count, _ = PAGE_HEADER.unpack_from(buffer, offset)
-        base = offset + PAGE_HEADER.size
-        if flags == BRANCH:
-            child = _branch_child(buffer, base, count, key)
-            return None if child is None else self.get(self.page(child), 0, key, depth + 1)
-        if flags != LEAF:
+        if page.flags == BRANCH:
+            child = _branch_child(page, key)
+            return None if child is None else self.get(self.page(child), key, depth + 1)
+        if page.flags != LEAF:
             raise Inconsistent("neither a leaf nor a branch page")
-        return _leaf_value(buffer, base, count, key)
+        return _leaf_value(page, key)
 
-    def bucket(self, name: bytes) -> tuple[bytes, int] | None:
-        """(buffer, offset) of the bucket's root page; an inline bucket's page sits inside its parent's value."""
-        found = self.get(self.page(self.meta.root), 0, name)
+    def bucket(self, name: bytes) -> _Page | None:
+        """The bucket's root page; an inline bucket's page sits inside its parent's value."""
+        found = self.get(self.page(self.meta.root), name)
         if found is None or not found[1] & BUCKET_LEAF:
             return None
         value = found[0]
         if len(value) < BUCKET_HEADER.size:
             raise Inconsistent("short bucket header")
         root, _ = BUCKET_HEADER.unpack_from(value, 0)
-        return (value, BUCKET_HEADER.size) if root == 0 else (self.page(root), 0)
+        if root:
+            return self.page(root)
+        inline = value[BUCKET_HEADER.size :]
+        if len(inline) < PAGE_HEADER.size:
+            raise Inconsistent("short inline bucket")
+        _, flags, count, _ = PAGE_HEADER.unpack_from(inline, 0)
+        return _Page(self.fd, 0, len(inline), flags, count, inline)
 
 
-def _branch_child(buffer: bytes, base: int, count: int, key: bytes) -> int | None:
-    """The page id of the child of a branch page that holds `key`: the last one whose first key is not past it."""
-    child = None
-    for index in range(count):
-        at = base + index * BRANCH_ELEMENT.size
-        if at + BRANCH_ELEMENT.size > len(buffer):
-            raise Inconsistent("branch element out of page")
-        pos, ksize, pgid = BRANCH_ELEMENT.unpack_from(buffer, at)
-        first = buffer[at + pos : at + pos + ksize]
-        if len(first) != ksize:
-            raise Inconsistent("branch key out of page")
-        if index > 0 and first > key:
-            break
-        child = pgid
+def _order(page: _Page, start: int, ksize: int, tail: int, key: bytes) -> int:
+    """-1, 0 or 1 as the stored key at `start` sorts against `key`. One byte past `key`'s length decides the order as well as the
+    whole stored key would, so no more is read; the key and the `tail` bytes after it (its value) must lie inside the page."""
+    if start + ksize + tail > page.length:
+        raise Inconsistent("element out of page")
+    stored = page.read(start, min(ksize, len(key) + 1))
+    return (stored > key) - (stored < key)
+
+
+def _branch_child(page: _Page, key: bytes) -> int | None:
+    """The page id of the child that holds `key`: the last element whose first key is not past it, else the first (as bbolt)."""
+    if page.count == 0:
+        return None
+    low, high = 0, page.count
+    while low < high:  # the first element whose key is past `key`
+        middle = (low + high) // 2
+        at = PAGE_HEADER.size + middle * BRANCH_ELEMENT.size
+        pos, ksize, _ = BRANCH_ELEMENT.unpack(page.read(at, BRANCH_ELEMENT.size))
+        if _order(page, at + pos, ksize, 0, key) <= 0:
+            low = middle + 1
+        else:
+            high = middle
+    at = PAGE_HEADER.size + max(low - 1, 0) * BRANCH_ELEMENT.size
+    _, _, child = BRANCH_ELEMENT.unpack(page.read(at, BRANCH_ELEMENT.size))
     return child
 
 
-def _leaf_value(buffer: bytes, base: int, count: int, key: bytes) -> tuple[bytes, int] | None:
-    for index in range(count):
-        at = base + index * LEAF_ELEMENT.size
-        if at + LEAF_ELEMENT.size > len(buffer):
-            raise Inconsistent("leaf element out of page")
-        element_flags, pos, ksize, vsize = LEAF_ELEMENT.unpack_from(buffer, at)
-        start = at + pos
-        if start + ksize + vsize > len(buffer):
-            raise Inconsistent("leaf value out of page")
-        if buffer[start : start + ksize] == key:
-            return buffer[start + ksize : start + ksize + vsize], element_flags
+def _leaf_value(page: _Page, key: bytes) -> tuple[bytes, int] | None:
+    low, high = 0, page.count
+    while low < high:
+        middle = (low + high) // 2
+        at = PAGE_HEADER.size + middle * LEAF_ELEMENT.size
+        flags, pos, ksize, vsize = LEAF_ELEMENT.unpack(page.read(at, LEAF_ELEMENT.size))
+        order = _order(page, at + pos, ksize, vsize, key)
+        if order == 0:
+            if vsize > MAX_VALUE_BYTES:
+                raise Inconsistent("value too big for a token or client record")
+            return page.read(at + pos + ksize, vsize), flags
+        low, high = (middle + 1, high) if order < 0 else (low, middle)
     return None
 
 
@@ -179,13 +213,13 @@ def _client(value: object) -> IssuedClient | None:
     return IssuedClient(client_id, tuple(u for u in uris if isinstance(u, str)))
 
 
-def _registered(reader: _Reader, root: tuple[bytes, int], issued: IssuedClient) -> IssuedClient:
+def _registered(reader: _Reader, root: _Page, issued: IssuedClient) -> IssuedClient:
     """The registration as it stands now wins over the copy the token carries; same id, by construction."""
     try:
-        current = reader.get(*root, f"client-{issued.client_id}".encode())
+        current = reader.get(root, f"client-{issued.client_id}".encode())
     except Inconsistent:
-        # A leaf the open registration endpoint bloated past MAX_PAGE_BYTES: the copy the token carries is enough
-        # (the txid check in client_of_token still guards the pages that were read).
+        # A registration past MAX_VALUE_BYTES or a damaged page: the copy the token carries is enough (the txid check in
+        # client_of_token still guards the pages that were read).
         return issued
     registered = _client(parse_object(current[0])) if current is not None else None
     return registered if registered is not None and registered.client_id == issued.client_id else issued
@@ -197,7 +231,7 @@ def _lookup_once(fd: int, signature: str) -> tuple[IssuedClient | None, int]:
     root = reader.bucket(BUCKET)
     if root is None:
         return None, meta.txid
-    token = reader.get(*root, f"access_token-{signature}".encode("ascii"))
+    token = reader.get(root, f"access_token-{signature}".encode("ascii"))
     issued = _client(parse_object(token[0]).get("Client")) if token is not None and not token[1] & BUCKET_LEAF else None
     return (None if issued is None else _registered(reader, root, issued)), meta.txid
 
