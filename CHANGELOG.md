@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.4
 
 - `computer chatgpt doctor --heal` keeps the limits it promises when things are slow or go wrong: a local probe now gives up
   after its timeout even when the server trickles bytes or never ends a chunked answer, so a pass cannot hang on the lock;
@@ -11,8 +11,8 @@
 - `computer chatgpt uninstall --purge` without a config no longer leaves dangling enablement links behind: a unit whose file was
   already deleted kept its link in `default.target.wants/` (or another `.wants/`/`.requires/` directory), which `disable` cannot
   drop without the file; a link that still reaches a unit file elsewhere is kept. It also no longer crashes on a
-  `*-<service>.service` file it cannot read (mode 000, or deleted between the listing and the read), nor hangs on a FIFO of
-  that name: such a file is skipped as not its own, and the managed units are still stopped (#52).
+  `*-<service>.service` file it cannot read (mode 000, or deleted between the listing and the read): such a
+  file is skipped as not its own, and the managed units are still stopped (#52).
 
 ## 0.4.2
 
