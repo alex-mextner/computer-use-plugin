@@ -112,7 +112,11 @@ Installing a packaged Google Chrome or Chromium does not help while the cache ho
 `node-options` setting as `NODE_OPTIONS`, as it would under npm: when an npmrc sets it (for example `node-options=--use-system-ca`
 behind a TLS-intercepting proxy), it replaces your own `NODE_OPTIONS` for the download instead of being appended, because two
 option sets can conflict (`--use-openssl-ca` with `--use-bundled-ca`) and node then does not start. With no npm setting, your
-`NODE_OPTIONS` is kept.
+`NODE_OPTIONS` is kept. The setting is read as the install's own `npm ci --prefix <tree>` reads its config: run from your
+directory, so a relative `NPM_CONFIG_USERCONFIG` or `NPM_CONFIG_GLOBALCONFIG` resolves there. `--prefix` also moves npm's default
+global npmrc (`etc/npmrc` under node's install prefix) into the tree, so a `node-options` there is not seen: put it in your user
+npmrc, or point `NPM_CONFIG_GLOBALCONFIG` at that file. A global npmrc your npm package names itself (its built-in `globalconfig`)
+is still read.
 
 ## Claude Desktop: `computer claude`
 

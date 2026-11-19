@@ -25,6 +25,16 @@
   (408), also when it trickles in a byte at a time; a bigger upload to `/mcp` is not timed. A body to any other path (OAuth,
   login) may be at most 64 KiB (413), also under a percent-encoded path. A stranger who wants to keep every slot busy so the
   owner's connector gets 503 now has to open about 13 such requests a second instead of 2 (#69).
+- A stopped `computer mcp install` no longer leaves npm or the browser download running when the stop lands at an unlucky
+  moment: a SIGTERM, SIGHUP or Ctrl-C while it cleans up after a timeout, or a Ctrl-C the moment npm starts. Those signals are
+  now held while npm or the download runs and acted on where the session is in hand, so its whole session is stopped and reaped
+  before the install exits, instead of writing on into a directory the install then deletes. An install stopped by SIGTERM or
+  SIGHUP still dies of it when a Ctrl-C follows. A cleanup that cannot finish (a child that left the session keeps npm's output
+  open) ends at the next Ctrl-C, or at most 5 seconds after the kill, instead of holding the install lock for good (#48).
+- npm's `node-options` setting for the PDF browser download is now read as the install's own `npm ci --prefix <tree>` reads its
+  config: from your directory, so a relative `NPM_CONFIG_USERCONFIG` or `NPM_CONFIG_GLOBALCONFIG` path is honoured and
+  `--use-system-ca` behind a TLS proxy reaches the download. Like `npm ci`, it no longer sees npm's default global npmrc, which
+  `--prefix` moves into the tree; the README says where to put the setting instead (#48).
 
 ## 0.4.6
 

@@ -12,6 +12,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -314,9 +315,17 @@ def _running(pid: int) -> bool:
     """Alive and not a zombie (a killed orphan waits for init to reap it, and a zombie writes nothing)."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # ESRCH: it was reaped between opening the file and reading it
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def test_a_process_reaped_while_its_stat_is_read_is_not_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    def reaped_mid_read(_path: Path) -> str:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(Path, "read_text", reaped_mid_read)
+    assert not _running(os.getpid())
 
 
 def _eventually(condition: Callable[[], bool], seconds: float = 10) -> bool:
@@ -355,7 +364,7 @@ def _installer_mid_npm(tmp_path: Path) -> tuple[subprocess.Popen[bytes], int, in
     return installer, int(npm_pid), int(child_pid), Path(prefix)
 
 
-def _stop_session(leader: int) -> None:
+def _kill_session(leader: int) -> None:
     with suppress(ProcessLookupError):
         os.killpg(leader, signal.SIGKILL)
 
@@ -379,7 +388,7 @@ def test_a_retry_after_a_killed_installer_never_shares_the_staging_its_npm_still
     toolchain: Path, tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
     installer, npm_pid, _, orphan_prefix = _installer_mid_npm(tmp_path)
-    request.addfinalizer(lambda: _stop_session(npm_pid))
+    request.addfinalizer(lambda: _kill_session(npm_pid))
     installer.kill()  # SIGKILL runs no cleanup at all: npm, in a session of its own, lives on
     installer.wait(timeout=30)
     assert _running(npm_pid)
@@ -390,37 +399,145 @@ def test_a_retry_after_a_killed_installer_never_shares_the_staging_its_npm_still
     assert retry_prefix.parent == orphan_prefix.parent
     assert orphan_prefix.is_dir()  # not deleted under the orphan, and never activated
     assert launch_spec().entry == tree_dir(tmp_path / "home") / ENTRY
-    _stop_session(npm_pid)
+    _kill_session(npm_pid)
     assert _eventually(lambda: not _running(npm_pid))
     assert main(["mcp", "install"]) == 0  # nothing writes there any more, so it is reclaimed
     assert sorted(path.name for path in (managed_dir(tmp_path / "home") / "trees").iterdir()) == [LOCK_SHA256]
 
 
-def test_a_termination_the_moment_npm_starts_still_stops_it(tmp_path: Path) -> None:
+def _npm_prelude(pid_file: Path, *, times_out: bool, signal_at_start: int | None = None, wait_for: Path | None = None) -> str:
+    """Installer prelude: npm ci's pid goes to `pid_file`, then `signal_at_start` is handled right there (inside Popen) and
+    `wait_for` waited for; with `times_out` npm ci times out at once. Ctrl-C is KeyboardInterrupt, as in a terminal."""
+    lines = ["import os, signal, subprocess, sys, time", "import computerlib.desktop_commander as dc"]
+    if times_out:
+        lines.append("dc._NPM_TIMEOUT_SECONDS = 0")
+    lines += [
+        "signal.signal(signal.SIGINT, signal.default_int_handler)",
+        "real_popen = subprocess.Popen",
+        "def popen(args, *rest, **kwargs):",
+        "    proc = real_popen(args, *rest, **kwargs)",
+        "    if 'ci' in args:",
+        f"        with open({str(pid_file)!r}, 'w') as out:",
+        "            out.write(str(proc.pid))",
+    ]
+    if signal_at_start is not None:
+        lines.append(f"        signal.raise_signal({signal_at_start})")
+    if wait_for is not None:
+        lines += [
+            "        until = time.monotonic() + 10",
+            f"        while not os.path.exists({str(wait_for)!r}) and time.monotonic() < until:",
+            "            time.sleep(0.01)",
+        ]
+    lines += ["    return proc", "subprocess.Popen = popen", ""]
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize("then_ctrl_c", [False, True], ids=["alone", "then_ctrl_c_before_the_kill"])
+@pytest.mark.parametrize("arrives", ["as_npm_starts", "in_the_timeout_cleanup_before_the_kill"])
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_stops_npm_before_the_installer_dies_of_it_wherever_it_arrives(
+    tmp_path: Path, signum: signal.Signals, arrives: str, then_ctrl_c: bool
+) -> None:
     bin_dir = tmp_path / "hanging"
     fake_node(bin_dir)
     fake_npm(bin_dir, mode="hang")
     pid_file = tmp_path / "npm.pid"
-    # SIGTERM handled inside Popen, right after npm ci started: before the caller holds the process it has to stop.
-    prelude = (
-        "import os, signal, subprocess\n"
-        "real_popen = subprocess.Popen\n"
-        "def popen(args, *rest, **kwargs):\n"
-        "    proc = real_popen(args, *rest, **kwargs)\n"
-        "    if 'ci' in args:\n"
-        f"        with open({str(pid_file)!r}, 'w') as out:\n"
-        "            out.write(str(proc.pid))\n"
-        "        signal.raise_signal(signal.SIGTERM)\n"
-        "    return proc\n"
-        "subprocess.Popen = popen\n"
+    in_cleanup = arrives != "as_npm_starts"
+    # As npm starts the signal is handled inside Popen, before the caller holds the process it has to stop. In the cleanup
+    # (after a timeout or that signal) it, or a Ctrl-C after it, is handled just before the session is killed.
+    signals_in_cleanup = ([int(signum)] if in_cleanup else []) + ([int(signal.SIGINT)] if then_ctrl_c else [])
+    prelude = _npm_prelude(pid_file, times_out=in_cleanup, signal_at_start=None if in_cleanup else int(signum)) + (
+        "real_killpg = os.killpg\n"
+        "def killpg(pgid, signum):\n"
+        "    if sys.exc_info()[1] is not None:\n"
+        f"        for each in {signals_in_cleanup}:\n"
+        "            signal.raise_signal(each)\n"
+        "    real_killpg(pgid, signum)\n"
+        "os.killpg = killpg\n"
     )
     installer = _start_installer(bin_dir, prelude)
-    assert installer.wait(timeout=30) == -signal.SIGTERM
+    assert installer.wait(timeout=30) == -signum  # a termination is what it dies of, also after a later Ctrl-C
     npm_pid = int(pid_file.read_text())
     orphaned = _running(npm_pid)
-    _stop_session(npm_pid)  # a failing run must not leave the orphan behind
-    assert not orphaned
+    _kill_session(npm_pid)  # a failing run must not leave the orphan behind
+    assert not orphaned  # killed and reaped before the installer died of the signal, not eventually
     assert not any(path.name.startswith(".staging-") for path in (managed_dir(tmp_path / "home") / "trees").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("signum", "grace", "exit_code"),
+    [
+        (signal.SIGINT, 60, -signal.SIGINT),  # a grace longer than the test waits: only the Ctrl-C can end the reap
+        (signal.SIGTERM, 1, -signal.SIGTERM),  # no terminal left to press Ctrl-C
+        (None, 1, 7),  # an unattended timeout: npm ci timed out (network exit), nothing else comes
+    ],
+    ids=["ctrl_c", "termination", "timeout_alone"],
+)
+def test_the_install_gets_out_of_a_stop_whose_reap_never_ends(
+    tmp_path: Path, request: pytest.FixtureRequest, signum: signal.Signals | None, grace: int, exit_code: int
+) -> None:
+    bin_dir = tmp_path / "hanging"
+    fake_node(bin_dir)
+    escapee = tmp_path / "escapee.pid"
+    # A child that left npm's session keeps its output pipes open, so the stop's reap never sees them close.
+    fake_npm(
+        bin_dir, mode="hang", side_effect=f'setsid /bin/sleep 60 & echo $! > "{escapee}.tmp" && mv "{escapee}.tmp" "{escapee}"'
+    )
+    pid_file = tmp_path / "npm.pid"
+    prelude = _npm_prelude(pid_file, times_out=True, wait_for=escapee) + f"dc._REAP_GRACE_SECONDS = {grace}\n"
+    if signum is not None:  # handled during the stop's first reap poll
+        prelude += (
+            "real_killpg, real_communicate, killed = os.killpg, real_popen.communicate, []\n"
+            "def killpg(pgid, signum):\n"
+            "    killed.append(pgid)\n"
+            "    real_killpg(pgid, signum)\n"
+            "def communicate(self, *args, **kwargs):\n"
+            "    if killed == [self.pid]:\n"
+            "        killed.append(None)\n"
+            f"        signal.raise_signal({int(signum)})\n"
+            "    return real_communicate(self, *args, **kwargs)\n"
+            "os.killpg, real_popen.communicate = killpg, communicate\n"
+        )
+    installer = _start_installer(bin_dir, prelude)
+    request.addfinalizer(installer.kill)
+    request.addfinalizer(lambda: _kill_session(int(escapee.read_text())))
+    assert installer.wait(timeout=30) == exit_code  # long before the escaped child ends (60 s)
+    assert not _running(int(pid_file.read_text()))  # npm itself was killed
+
+
+def test_a_ctrl_c_the_moment_npm_starts_still_stops_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    bin_dir = tmp_path / "hanging"
+    fake_node(bin_dir)
+    fake_npm(bin_dir, mode="hang")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    spawn = subprocess.Popen
+    started: list[int] = []
+
+    # Ctrl-C handled inside Popen, right after npm ci started: before the caller holds the process it has to stop. In a session
+    # of its own, npm does not get the terminal's SIGINT itself. Any mirrors Popen's overloaded signature.
+    def spawn_then_ctrl_c(args: Any, *rest: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        proc = spawn(args, *rest, **kwargs)
+        if "ci" in args:
+            started.append(proc.pid)
+            signal.raise_signal(signal.SIGINT)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", spawn_then_ctrl_c)
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
+
+    def stop_what_started() -> None:
+        for pid in started:
+            _kill_session(pid)
+
+    request.addfinalizer(stop_what_started)
+    with pytest.raises(KeyboardInterrupt):
+        install()
+    assert not _running(started[0])
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    assert not any((managed_dir(tmp_path / "home") / "trees").iterdir())
 
 
 def test_a_timed_out_browser_download_stops_its_children(
@@ -454,6 +571,7 @@ def test_npms_node_options_reach_the_browser_download(
     seen = tmp_path / "node-options"
     fake_node(bin_dir, browser_side_effect=f'echo "$NODE_OPTIONS" > "{seen}"')
     fake_npm(bin_dir)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
     monkeypatch.setenv("FAKE_NPM_CONFIG", npm_setting)  # what `node-options=` in an npmrc makes npm answer
     if caller:
@@ -462,9 +580,24 @@ def test_npms_node_options_reach_the_browser_download(
         monkeypatch.delenv("NODE_OPTIONS", raising=False)
     assert main(["mcp", "install"]) == 0
     assert seen.read_text().strip() == expected
-    # Asked from the tree, where puppeteer's postinstall ran under npm.
+    # Asked as npm ci ran: from the caller's directory, with the tree as the prefix.
     tree = tree_dir(tmp_path / "home")
-    assert (bin_dir / "npm-config.log").read_text().split() == [str(tree), "config", "get", "node-options"]
+    asked = (bin_dir / "npm-config.log").read_text().split()
+    assert asked == [str(Path.cwd()), "config", "get", "node-options", "--prefix", str(tree)]
+
+
+def test_npms_node_options_are_found_through_a_relative_userconfig_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bin_dir = tmp_path / "bin"
+    seen = tmp_path / "node-options"
+    fake_node(bin_dir, browser_side_effect=f'echo "$NODE_OPTIONS" > "{seen}"')
+    fake_npm(bin_dir)
+    (tmp_path / "proxy.npmrc").write_text("node-options=--use-system-ca\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.delenv("FAKE_NPM_CONFIG", raising=False)
+    monkeypatch.setenv("NPM_CONFIG_USERCONFIG", "proxy.npmrc")  # npm resolves it against the directory it runs in
+    assert main(["mcp", "install"]) == 0
+    assert seen.read_text().strip() == "--use-system-ca"
 
 
 def test_npms_node_options_are_found_through_a_relative_path_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,7 +606,7 @@ def test_npms_node_options_are_found_through_a_relative_path_entry(tmp_path: Pat
     fake_node(bin_dir, browser_side_effect=f'echo "$NODE_OPTIONS" > "{seen}"')
     fake_npm(bin_dir)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PATH", "bin:/usr/bin:/bin")  # npm config get runs from the tree, where `bin` is not
+    monkeypatch.setenv("PATH", "bin:/usr/bin:/bin")  # found only from the caller's directory, as npm itself was
     monkeypatch.setenv("FAKE_NPM_CONFIG", "--use-system-ca")
     assert main(["mcp", "install"]) == 0
     assert seen.read_text().strip() == "--use-system-ca"

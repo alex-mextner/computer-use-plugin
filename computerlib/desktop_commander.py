@@ -32,7 +32,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from importlib import resources
@@ -51,6 +51,10 @@ from computerlib.pins import DESKTOP_COMMANDER_PACKAGE, DESKTOP_COMMANDER_VERSIO
 EXPECTED_TOOLS = ("start_process", "read_file", "write_file")
 
 _NPM_TIMEOUT_SECONDS = 900
+# How often a running npm or browser download is checked for a held Ctrl-C or termination; also bounds how late one is acted on.
+_POLL_SECONDS = 0.1
+# How long a stop waits to reap its killed session before giving up on a child that left the session and keeps its pipes.
+_REAP_GRACE_SECONDS = 5
 # In each staging directory: held (flock) by the installer and inherited by its npm, so it stays locked while that npm lives.
 _WRITER_LOCK = ".writer.lock"
 _MIN_NODE_MAJOR = 18
@@ -141,7 +145,8 @@ class _Terminated(BaseException):
 
 
 class _Termination:
-    """SIGTERM and SIGHUP of an install in the main thread, made to unwind like Ctrl-C does before the process dies of them.
+    """SIGTERM and SIGHUP of an install in the main thread, made to unwind like Ctrl-C does before the process dies of them,
+    and, while a child session runs, those and Ctrl-C held back until the session can be stopped.
 
     Their default action kills Python without running a `finally`, and npm runs in a session of its own (so a stop can reach
     its whole tree), so it would keep writing into the staging prefix after the install lock is released. Only the main thread
@@ -149,16 +154,23 @@ class _Termination:
 
     def __init__(self) -> None:
         self.taken: list[int] = []
-        self.starting = False
+        self.received: int | None = None
+        self.holding = False
         self.pending: int | None = None
+        self.interrupts = 0
+        self.sigint_handler: Callable[[int, FrameType | None], object] | None = None
 
     def _handle(self, signum: int, _frame: FrameType | None) -> None:
         for each in self.taken:  # a repeated signal must not cut the cleanup short
             signal.signal(each, signal.SIG_IGN)
-        if self.starting:
+        self.received = signum
+        if self.holding:
             self.pending = signum
             return
         raise _Terminated(signum)
+
+    def _hold_interrupt(self, _signum: int, _frame: FrameType | None) -> None:
+        self.interrupts += 1
 
     def _restore(self) -> None:
         for signum in self.taken:
@@ -170,33 +182,57 @@ class _Termination:
         if threading.current_thread() is not threading.main_thread():
             yield
             return
+        self.received = None
         self.taken = [signum for signum in (signal.SIGTERM, signal.SIGHUP) if signal.getsignal(signum) is signal.SIG_DFL]
         for signum in self.taken:
             signal.signal(signum, self._handle)
         try:
             yield
-        except _Terminated as terminated:
+        except BaseException:
             self._restore()
-            signal.raise_signal(terminated.signum)  # exit status says "killed by SIGTERM", as without the handler
+            if self.received is not None:
+                # Exit status says "killed by SIGTERM", as without the handler, also when a later Ctrl-C ended the unwinding.
+                signal.raise_signal(self.received)
             raise
         finally:
             self._restore()
 
     @contextmanager
-    def held_while_starting(self) -> Generator[None]:
-        """Hold a termination back while a child starts and raise it after: raised inside Popen, it would leave a started child
-        that nothing stops."""
+    def held(self) -> Generator[None]:
+        """Hold a termination or a Ctrl-C back while a child session runs; `deliver()` raises it where the session is in hand,
+        and leaving the hold raises one still held. Raised anywhere else (inside Popen, inside the stop before the kill) it would
+        leave the session running, and in a session of its own the child does not get the terminal's Ctrl-C itself. Not
+        reentrant: entering resets what an earlier hold cut short by a signal may have left."""
         if threading.current_thread() is not threading.main_thread():
             yield
             return
-        self.starting = True
+        self.pending, self.interrupts, self.sigint_handler = None, 0, None
+        interrupt = signal.getsignal(signal.SIGINT)
+        # Holding before the swap: a termination handled in between would otherwise leave SIGINT swapped for good.
+        self.holding = True
         try:
+            # Only a Python handler (KeyboardInterrupt by default) can be run later; an ignored SIGINT needs no holding, and a
+            # default one kills this process without any cleanup either way.
+            if callable(interrupt):
+                self.sigint_handler = interrupt
+                signal.signal(signal.SIGINT, self._hold_interrupt)
             yield
         finally:
-            self.starting = False
-            if self.pending is not None:
-                signum, self.pending = self.pending, None
-                raise _Terminated(signum)
+            try:
+                if callable(interrupt):
+                    signal.signal(signal.SIGINT, interrupt)
+            finally:
+                self.holding = False
+                self.deliver()
+
+    def deliver(self) -> None:
+        """Raise a termination held so far, else run the caller's SIGINT handler for a held Ctrl-C."""
+        signum, self.pending = self.pending, None
+        interrupted, self.interrupts = self.interrupts > 0, 0
+        if signum is not None:
+            raise _Terminated(signum)
+        if interrupted and self.sigint_handler is not None:
+            self.sigint_handler(signal.SIGINT, None)
 
 
 _TERMINATION = _Termination()
@@ -342,11 +378,12 @@ def _browser_env(node: str, tree: Path) -> dict[str, str]:
     if found is None:  # a reused tree needs no npm; without one there is no npm setting to honour either
         return env
     try:
-        # In the tree, as the postinstall ran there: npm reads the user's and global npmrc and the tree's own (none) from it.
-        # Absolute, as a relative PATH entry would not resolve from there.
+        # From the caller's directory with the tree as the prefix, as npm ci ran: a relative userconfig or globalconfig path
+        # (NPM_CONFIG_USERCONFIG=.npmrc) resolves where the user meant it, and the project npmrc is the tree's (none), not one
+        # of a project the caller happens to stand in. Like npm ci's, the default global npmrc is then the tree's too.
         done = subprocess.run(
-            [os.path.abspath(found), "config", "get", "node-options"],
-            cwd=tree,
+            # Absolute, as `_require` made npm ci's: a bare name (an empty PATH entry) would be looked up again on node's PATH.
+            [os.path.abspath(found), "config", "get", "node-options", "--prefix", str(tree)],
             env=env,
             capture_output=True,
             text=True,
@@ -367,28 +404,52 @@ def _run_session(
     """Run `command` in a session of its own and stop that whole session on any way out: a timeout, Ctrl-C, SIGTERM.
 
     npm and puppeteer's download start children, and killing only the direct child would leave them writing (into the
-    staging prefix, into the browser cache) after the install lock is released. Raises subprocess.TimeoutExpired."""
-    proc: subprocess.Popen[str] | None = None
-    try:
-        with _TERMINATION.held_while_starting():
-            proc = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-                pass_fds=pass_fds,
-            )
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except BaseException:
-        if proc is not None:
-            with suppress(ProcessLookupError):  # the session may have exited between the interruption and here
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-        raise
-    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    staging prefix, into the browser cache) after the install lock is released. Ctrl-C and terminations are held for the whole
+    run and raised only between polls, where the session is in hand: raised inside Popen or inside the stop before the kill,
+    they would leave it running. Raises subprocess.TimeoutExpired."""
+    deadline = time.monotonic() + timeout
+    with _TERMINATION.held():
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            pass_fds=pass_fds,
+        )
+        try:
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=min(_POLL_SECONDS, max(deadline - time.monotonic(), 0)))
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(command, timeout) from None
+                else:
+                    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+                # Not in the handler above: a Ctrl-C would then show the poll's timeout as what it interrupted.
+                _TERMINATION.deliver()
+        except BaseException:
+            _stop_session(proc)
+            raise
+
+
+def _stop_session(proc: subprocess.Popen[str]) -> None:
+    """Kill the whole session and reap its leader, still held, so nothing of it writes once the caller cleans up.
+
+    A reap that never ends (a child that left the session keeps the pipes open) ends at the next Ctrl-C or after a grace
+    period: the session is killed by then, waiting longer gains nothing, and an unattended install (no Ctrl-C can come) would
+    otherwise hold the install lock, and so block every later install, for good."""
+    with suppress(ProcessLookupError):  # the session may have exited between the interruption and here
+        os.killpg(proc.pid, signal.SIGKILL)
+    interrupts, grace_ends = _TERMINATION.interrupts, time.monotonic() + _REAP_GRACE_SECONDS
+    while True:
+        with suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=_POLL_SECONDS)
+            return
+        if _TERMINATION.interrupts != interrupts or time.monotonic() >= grace_ends:
+            return
 
 
 # Exit 0 only when the browser puppeteer launches by default (no executablePath) exists; executablePath() is async in v25.
