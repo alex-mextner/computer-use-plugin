@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.3
+## 0.4.5
 
 - A chat client can no longer open a browser on your computer through Desktop Commander's feedback tool, or hang a tool call
   until that browser is closed: `computer mcp serve` (used by Claude and ChatGPT alike) leaves
@@ -8,7 +8,8 @@
   and removes the survey request Desktop Commander adds to a tool result when its remote `user_surveys` flag is on, so the model
   is never asked to run that survey. Desktop Commander 0.3.2 has no setting that hides the tool, so serve now relays its stdio
   instead of replacing itself with it; everything else passes through unchanged, serve still ends the way Desktop Commander
-  ended, and Desktop Commander stops when serve is killed (#24).
+  ended, and Desktop Commander stops when serve is killed. A request nested more than 256 levels deep is answered with an
+  invalid-request error instead of being passed on, the same on every Python version (#24).
 
 ## 0.4.4
 
@@ -23,6 +24,7 @@
   drop without the file; a link that still reaches a unit file elsewhere is kept. It also no longer crashes on a
   `*-<service>.service` file it cannot read (mode 000, or deleted between the listing and the read): such a
   file is skipped as not its own, and the managed units are still stopped (#52).
+
 ## 0.4.2
 
 - A stranger can no longer make a valid ChatGPT token read `client=unverified` after a shim restart: the shim refused any page

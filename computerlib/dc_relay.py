@@ -9,10 +9,12 @@ config key that hides the tool (dist/server.js `shouldIncludeTool` drops it only
 which is not ours to claim) and its survey opt-out is a `feedbackGiven` value in its config.json that the model can set back
 with `set_config_value`, so the one place every client passes through, this relay, withholds both (#24).
 INVARIANTS: stdout carries only DC's own messages, in DC's order, plus the local answers below; a DC line that is not the
-tools/list answer or a result carrying the survey goes through byte for byte. Every client line is read as DC's Node reads it
-before it is forwarded: a feedback call is answered here, and a line Python still cannot read is answered with a parse error
-rather than handed to a parser that might run it. DC gets the signals this process acts on (one it was started ignoring stays
-ignored and is not passed on), dies with it, and ends it the way DC ended (`childexit.exit_like`); stderr is DC's, untouched.
+tools/list answer or a result carrying the survey goes through byte for byte, and one that must be cleaned but cannot be written
+back is replaced by an error, never passed on uncleaned. Every client line is read as DC's Node reads it before it is
+forwarded: a feedback call is answered here, a line Python cannot read is answered with a parse error, and one nested deeper
+than _MAX_DEPTH with an invalid-request error, rather than handed to a parser that might run it. DC gets the signals this
+process acts on (one it was started ignoring stays ignored and is not passed on), dies with it, and ends it the way DC ended
+(`childexit.exit_like`); stderr is DC's, untouched.
 """
 
 from __future__ import annotations
@@ -39,6 +41,11 @@ _FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 _PR_SET_PDEATHSIG = 1
 # Python refuses longer integer literals (sys.get_int_max_str_digits, 4300 by default); V8 reads them as a double.
 _INT_DIGITS = 4000
+# A client line nested deeper is refused outright. How deep Python's json can go depends on the interpreter (3.13 stops near its
+# recursion limit of 1000, 3.14 went past 100 000), so without a fixed cap the same request would be inspected on one machine
+# and refused on another. No MCP request nests anywhere near this. DC's own lines are not capped: refusing one there would pass
+# it on uncleaned.
+_MAX_DEPTH = 256
 # Every survey variant of DC 0.3.2 has this shape: one instruction line, the quoted request ending in DC's own turn-off line and a
 # rule, then one closing sentence, appended at the end of the text (only DC's Docker notice may follow it). Matching the whole
 # shape, never across another instruction header and only where DC puts it, keeps DC's other notices and any file content that
@@ -60,7 +67,7 @@ WITHHELD_ANSWER = (
 
 
 class _Unreadable(Exception):
-    """A line Python cannot read as JSON even the way Node reads it."""
+    """A line Python cannot read as JSON even the way Node reads it (its json gave up, or it is not JSON)."""
 
 
 def without_survey(text: str) -> str:
@@ -76,27 +83,48 @@ def _int_like_v8(digits: str) -> int | float:
     return int(digits) if len(digits.lstrip("-")) <= _INT_DIGITS else float(digits)
 
 
+def _deeper_than(value: object, limit: int) -> bool:
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        if not isinstance(item, (dict, list)):
+            continue
+        if depth > limit:
+            return True
+        children = cast("dict[str, object]", item).values() if isinstance(item, dict) else cast("list[object]", item)
+        pending.extend((child, depth + 1) for child in children)
+    return False
+
+
 def _load(line: bytes | bytearray) -> object:
     """`line` read the way DC's Node reads it (the MCP SDK decodes invalid UTF-8 to U+FFFD, V8 takes any integer); raises
-    _Unreadable for what Python still cannot read (nesting deeper than its recursion limit)."""
+    _Unreadable for what Python cannot read."""
     try:
         return json.loads(line.decode("utf-8", "replace"), parse_int=_int_like_v8)
     except (ValueError, RecursionError) as error:
         raise _Unreadable from error
 
 
+def _error(request_id: object, code: int, message: str) -> bytes:
+    error: dict[str, object] = {"code": code, "message": message}
+    return _encode({"jsonrpc": "2.0", "id": request_id, "error": error})
+
+
 def local_answer(line: bytes | bytearray) -> bytes | None:
     """What the client gets instead of DC seeing `line`, or None to forward it: the answer to a feedback call (nothing for one
-    sent as a notification), or a parse error for a line Python cannot read, which therefore cannot be shown to be no feedback
-    call. Every line is parsed, not searched for the tool's name: a JSON string may spell it with escapes."""
+    sent as a notification), or an error for a line that cannot be shown to be no feedback call: one Python cannot read, or
+    one nested deeper than _MAX_DEPTH. Every line is parsed, not searched for the tool's name: a JSON string may spell it with
+    escapes."""
     if not line.strip():
         return None
     try:
         loaded = _load(line)
     except _Unreadable:
-        error: dict[str, object] = {"code": -32700, "message": "Parse error: the request cannot be read"}
-        return _encode({"jsonrpc": "2.0", "id": None, "error": error})
+        return _error(None, -32700, "Parse error: the request cannot be read")
     message = as_dict(loaded)
+    # Only a line with more brackets than the cap can nest past it; the walk is skipped for every other line.
+    if line.count(b"[") + line.count(b"{") > _MAX_DEPTH and _deeper_than(loaded, _MAX_DEPTH):
+        return _error(message.get("id"), -32600, f"Invalid request: nested deeper than {_MAX_DEPTH} levels")
     if message.get("method") != "tools/call" or as_dict(message.get("params")).get("name") != FEEDBACK_TOOL:
         return None
     if "id" not in message:
@@ -151,7 +179,14 @@ def filtered_server_line(line: bytes) -> bytes:
         return line
     result = as_dict(message["result"])
     replaced = _without_feedback_tool(result) or _without_survey_content(result)
-    return line if replaced is None else _encode({**message, "result": replaced})
+    if replaced is None:
+        return line
+    try:
+        return _encode({**message, "result": replaced})
+    except RecursionError:
+        # Too deep for this interpreter's json to write back: the client gets an error for that answer, never the survey or
+        # the tool.
+        return _error(message.get("id"), -32603, "Internal error: the answer is nested too deep to pass on")
 
 
 def _write_all(fd: int, data: bytes | bytearray) -> None:

@@ -97,11 +97,37 @@ def test_a_feedback_call_python_reads_differently_from_node_is_still_withheld(ar
     assert json.loads(answer)["result"]["isError"] is True  # the lone-surrogate id is echoed back intact
 
 
-def test_a_line_python_cannot_read_is_answered_not_forwarded() -> None:
-    deep = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":' + b"[" * 100_000 + b"]" * 100_000
-    answer = local_answer(deep + b"}}\n")
+def _call_nested(arrays: int) -> bytes:
+    """A tools/call whose arguments hold `arrays` nested arrays: the line nests 2 + arrays deep (message, params, the arrays)."""
+    start = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":'
+    return start + b"[" * arrays + b"]" * arrays + b"}}\n"
+
+
+def test_a_request_nested_past_the_cap_is_refused_with_its_id() -> None:
+    answer = json.loads(local_answer(_call_nested(255)) or b"null")
+    assert answer["id"] == 1
+    assert answer["error"]["code"] == -32600
+
+
+def test_a_request_past_any_interpreters_json_limit_is_refused_not_forwarded() -> None:
+    """3.13's json gives up near depth 1000 (no id can be read) while 3.14's read 100 000 levels (CI): refused either way."""
+    answer = local_answer(_call_nested(100_000))
     assert answer is not None
-    assert json.loads(answer)["error"]["code"] == -32700
+    assert json.loads(answer)["error"]["code"] in (-32700, -32600)
+
+
+def test_a_request_nested_up_to_the_cap_is_forwarded() -> None:
+    assert local_answer(_call_nested(254)) is None
+
+
+def test_a_deeply_nested_result_from_dc_is_still_cleaned_of_the_survey() -> None:
+    """The cap is the client's only: a DC answer with a field 300 levels deep still loses its survey."""
+    deep: object = []
+    for _ in range(300):
+        deep = [deep]
+    result = {"content": [{"type": "text", "text": f"done{SURVEYS['1']}"}], "structuredContent": {"tree": deep}}
+    line = json.dumps({"jsonrpc": "2.0", "id": 5, "result": result}).encode() + b"\n"
+    assert json.loads(filtered_server_line(line))["result"]["content"] == [{"type": "text", "text": "done"}]
 
 
 def test_a_survey_result_with_a_lone_surrogate_is_still_cleaned() -> None:
