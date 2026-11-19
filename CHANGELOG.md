@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `computer chatgpt doctor --heal` keeps the limits it promises when things are slow or go wrong: a local probe now gives up
+  after its timeout even when the server trickles bytes or never ends a chunked answer, so a pass cannot hang on the lock;
+  spacing and the hourly budget count from when a restart really ran, not from the start of a slow pass; a restart that errors
+  no longer drops the other units' results of that pass; the tunnel or shim is not restarted while a unit it starts with
+  (`Wants=`) is stopped when heal decides, so it does not bring back a bridge or shim the owner stopped; and a refused
+  `try-restart` of a unit that still runs is reported as a failed restart instead of "stopped during the pass" (#61).
+
 ## 0.4.2
 
 - A stranger can no longer make a valid ChatGPT token read `client=unverified` after a shim restart: the shim refused any page

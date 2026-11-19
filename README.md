@@ -272,12 +272,15 @@ same way; cloudflared with no edge connection stays active and answers its `/rea
   reports them and nothing acts on them;
 - only an `active` unit is restarted (a failed or restarting one is systemd's job), after 3 failing passes in a row, at most 3 times
   an hour per unit and 10 minutes apart; once the budget is spent it says so and exits 3 instead of looping;
+- a stop wins: a unit stopped while heal runs stays stopped, and the shim or the tunnel is not restarted while a unit it starts
+  with (`Wants=`: the bridge, and for the tunnel the shim too) is stopped when heal decides, since the restart would start it;
 - no restart while the internet is unreachable (no TCP answer from 1.1.1.1:443 or 8.8.8.8:443, checked only when something
   failed): one line says so and the failure counts start again after the outage;
 - a lock (`~/.local/state/computer/chatgpt/heal.lock`) keeps two passes from overlapping; the counts and restart times are in
   `heal.json` next to it;
-- under systemd, a restart and the first pass a spent budget stops one are logged at warning priority, a counted failure and the
-  offline gate at info, everything else (a healthy pass, a unit that is not active) at debug.
+- under systemd, a restart, a restart that failed and the first pass a spent budget stops one are logged at warning priority, a
+  counted failure, a held-back restart and the offline gate at info, everything else (a healthy pass, a unit that is not active)
+  at debug.
 
 Nothing schedules it for you. To run it every two minutes, add a user timer (`command -v computer` gives the path for `ExecStart`):
 

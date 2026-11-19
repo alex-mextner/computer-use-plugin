@@ -7,12 +7,15 @@ keeps two passes (a timer and a hand run) from overlapping. `reachable` is the c
 WHY LOCAL: the agent-tools watchdog lib (ultrabricks/agent-tools#1205) has not shipped; `Watched`, `Policy`, `heal_pass`,
 `exclusive` and `reachable` are the minimum it should replace, kept free of chatgpt specifics so the swap is one import.
 INVARIANTS: only the units passed are restarted, one `restart` call per unit; a unit that is not active is left to systemd, and
-`restart` must leave a unit that stopped during the pass stopped (it returns False then: a `stop` or `end` wins over heal); a
-failure explained by the unit it depends on (the shim proxies the bridge, so a hung bridge makes the shim's probe hang too) is not
-counted against it; no restart while the internet is unreachable, and the failure counts start again from zero after an outage
-(the outage, not the unit, may have failed those probes); a restart is recorded in the budget before it runs, so a restart that
-fails still spends it; warning-priority lines are written only when the pass restarts a unit or when the budget first stops a
-restart of a failing streak.
+`restart` must leave a unit that stopped during the pass stopped and say "stopped" (a `stop` or `end` wins over heal), "failed"
+for any other refusal; a unit is not restarted while a unit it Wants= is stopped, since the restart would start that one too (one
+systemd is restarting does not hold it back: starting it early undoes nothing); a failure explained by the unit it depends on
+(the shim proxies the bridge, so a hung bridge makes the shim's probe hang too) is not counted against it; no restart while the
+internet is unreachable, and the failure counts start again from zero after an outage (the outage, not the unit, may have failed
+those probes); a restart is recorded in the budget, at the clock read for it, before it runs, so a restart that fails still
+spends it; a `restart` that raises stops further restarts in the pass but every unit's count is still saved before the error
+propagates; warning-priority lines are written only when the pass restarts a unit, a restart fails, or when the budget first
+stops a restart of a failing streak.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
 
 from computerlib.fileio import atomic_write
 from computerlib.targets.chatgpt.shim.jsonish import as_list, as_object
@@ -39,10 +42,21 @@ Say = Callable[[int, str], None]
 
 
 @dataclass(frozen=True)
+class RestartResult:
+    outcome: Literal["restarted", "stopped", "failed"]
+    detail: str = ""  # why a failed restart failed, in the service manager's words
+
+
+# The states a stop leaves a unit in (`failed` when it was killed or exited non-zero on the way down).
+STOPPED_STATES = frozenset({"inactive", "deactivating", "failed"})
+
+
+@dataclass(frozen=True)
 class Watched:
     unit: str
     probe: Callable[[], str | None]  # None when healthy, else what failed
     depends_on: str = ""  # a watched unit whose failure explains this one's
+    wants: tuple[str, ...] = ()  # units a restart of this one would start (its Wants=, transitively)
 
 
 @dataclass(frozen=True)
@@ -166,12 +180,36 @@ def _verdict(unit: str, record: _Record, reason: str | None, now: float, policy:
     return "restart"
 
 
+def _stopped_want(item: Watched, active_state: Callable[[str], str]) -> tuple[str, str] | None:
+    """The first unit `item` Wants= that is stopped, with its state; None when all of them run or are being started.
+
+    `deactivating` does not count: that unit already has a stop job, which `--job-mode=fail` keeps the Wants= start from
+    replacing, and it is also how systemd's own restart after a crash begins."""
+    for other in item.wants:
+        state = active_state(other)
+        if state in {"inactive", "failed"}:
+            return other, state
+    return None
+
+
+def _report(unit: str, result: RestartResult, restarts: int, reason: str, policy: Policy, say: Say) -> None:
+    if result.outcome == "restarted":
+        say(
+            WARNING,
+            f"heal: restarted {unit} ({restarts} of {policy.budget} this hour): {reason}, {policy.threshold} passes in a row",
+        )
+    elif result.outcome == "stopped":
+        say(INFO, f"heal: {unit} stopped during the pass: not restarted (a stop or end wins over heal)")
+    else:
+        say(WARNING, f"heal: restarting {unit} failed: {result.detail or 'no reason given'} (it was unhealthy: {reason})")
+
+
 def heal_pass(
     watched: Sequence[Watched],
     *,
     state_file: Path,
     active_state: Callable[[str], str],
-    restart: Callable[[str], bool],
+    restart: Callable[[str], RestartResult],
     online: Callable[[], bool],
     clock: Callable[[], float],
     say: Say,
@@ -185,7 +223,6 @@ def heal_pass(
         say(priority, text)
 
     records = _load(state_file)
-    now = clock()
     healthy, failing = _failing(watched, active_state, tell)
     _excuse_dependents(watched, healthy, failing, tell)
     if failing and not online():
@@ -193,24 +230,29 @@ def heal_pass(
         _save(state_file, {unit: _Record(0, r.restarts) for unit, r in records.items()})
         return False
     spent = False
+    due: list[tuple[Watched, _Record, str]] = []
     for item in watched:
         record = records.setdefault(item.unit, _Record())
         reason = failing.get(item.unit)
-        verdict = _verdict(item.unit, record, reason, now, policy, tell)
+        # Read per decision, not once per pass: slow probes would otherwise date a restart before it ran and let the real
+        # spacing and hourly count drift past the policy.
+        verdict = _verdict(item.unit, record, reason, clock(), policy, tell)
         spent = spent or verdict == "spent"
-        if verdict == "restart":
-            record.restarts.append(now)
-            record.failures = 0
-            _save(state_file, records)
-            if not restart(item.unit):
-                tell(INFO, f"heal: {item.unit} stopped during the pass: not restarted (a stop or end wins over heal)")
-                continue
-            tell(
-                WARNING,
-                f"heal: restarted {item.unit} ({len(record.restarts)} of {policy.budget} this hour): {reason}, "
-                f"{policy.threshold} passes in a row",
-            )
+        if verdict == "restart" and reason is not None:
+            due.append((item, record, reason))
+    # Every unit's count is on disk before any restart runs, so a restart that raises loses none of them.
     _save(state_file, records)
+    for item, record, reason in due:
+        stopped = _stopped_want(item, active_state)
+        if stopped:
+            # Restarting would start every unit it Wants=, undoing the owner's stop of it.
+            other, state = stopped
+            tell(INFO, f"heal: {item.unit} unhealthy: not restarted while {other}, which it Wants=, is {state}: {reason}")
+            continue
+        record.restarts.append(clock())
+        record.failures = 0
+        _save(state_file, records)
+        _report(item.unit, restart(item.unit), len(record.restarts), reason, policy, tell)
     if not said:
         tell(DEBUG, f"heal: {len(watched)} unit(s) healthy, nothing to do")
     return spent

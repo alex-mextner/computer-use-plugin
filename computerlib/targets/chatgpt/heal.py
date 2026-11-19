@@ -63,12 +63,15 @@ def _edge_ready(metrics_port: int) -> Probe:
 def watched(ctx: Context) -> list[watchdog.Watched]:
     settings = ctx.settings
     bridge = unit_name(settings.unit_prefix, "bridge")
+    shim = unit_name(settings.unit_prefix, "shim")
+    # The Wants= chain of stack.py's units (tunnel -> shim -> bridge): a restart would start what the owner stopped.
     units = [
         watchdog.Watched(bridge, _answers(settings.proxy_port)),
-        watchdog.Watched(unit_name(settings.unit_prefix, "shim"), _answers(settings.shim_port), depends_on=bridge),
+        watchdog.Watched(shim, _answers(settings.shim_port), depends_on=bridge, wants=(bridge,)),
     ]
     if settings.tunnel_name:
-        units.append(watchdog.Watched(unit_name(settings.unit_prefix, "tunnel"), _edge_ready(settings.metrics_port)))
+        tunnel = unit_name(settings.unit_prefix, "tunnel")
+        units.append(watchdog.Watched(tunnel, _edge_ready(settings.metrics_port), wants=(shim, bridge)))
     return units
 
 
