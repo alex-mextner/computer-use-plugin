@@ -172,8 +172,26 @@ class _RequestBody:
             self._client.settimeout(timeout)
 
     def _readline(self, limit: int) -> bytes:
-        self._wait()
-        return self._rfile.readline(limit)
+        """A framing line (chunk size, chunk end, trailer) of at most `limit` bytes, taken only as far as the client has sent it:
+        a client that pauses inside one must not keep the upstream's early answer waiting either (#56). `readline` would block
+        for the rest of the line once its first byte is buffered."""
+        line = b""
+        while len(line) < limit and not line.endswith(b"\n"):
+            self._wait()
+            piece = self._line_piece(limit - len(line))
+            if not piece:
+                break  # EOF: the caller sees a short line
+            line += piece
+        return line
+
+    def _line_piece(self, limit: int) -> bytes:
+        """What `rfile` holds of the current line, up to `limit` bytes. Reads the socket at most once, which `_wait` made sure
+        does not block, and takes nothing past the newline: the bytes after it are the next frame's."""
+        if not _is_reader(self._rfile):
+            return self._rfile.read(1)
+        available = self._rfile.peek(1)[:limit]
+        newline = available.find(b"\n")
+        return self._rfile.read(newline + 1 if newline >= 0 else len(available))
 
     def _read(self, count: int) -> Generator[bytes]:
         while count:

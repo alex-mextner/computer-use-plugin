@@ -10,6 +10,8 @@ line on a gone stderr must not stop the accept loop.
 from __future__ import annotations
 
 import http.client
+import os
+import select
 import socket
 import subprocess
 import sys
@@ -23,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from computerlib.targets.chatgpt.shim import build_server, proxy
-from computerlib.targets.chatgpt.shim.proxy import MAX_REQUEST_BYTES, ShimServer
+from computerlib.targets.chatgpt.shim.proxy import MAX_REQUEST_BYTES, Request, ShimServer
 from tests.chatgpt.shim_harness import EXTERNAL, running_shim
 
 UPLOADS = 64
@@ -244,6 +246,21 @@ class _RejectingSlowly(_Rejecting):
         self.wfile.write(b"6\r\ndenied\r\n0\r\n\r\n")
 
 
+class _RejectingOnceDrained(_Rejecting):
+    """A 401 sent only once the shim has read all a paused client sent and waits for more (`drained`, set by the test), so that
+    wait is what the test exercises however the threads run: after a fixed delay a slow shim could see the 401 before it got
+    there."""
+
+    drained = threading.Event()
+
+    def do_POST(self) -> None:
+        self.drained.wait(
+            timeout=5
+        )  # past the client's 3 s: a shim that never waits on its client fails the test, never hangs it
+        self.drained.clear()
+        super().do_POST()
+
+
 def _read_head(sock: socket.socket) -> bytes:
     data = b""
     while b"\r\n\r\n" not in data and (piece := sock.recv(4096)):
@@ -297,8 +314,31 @@ def test_many_requests_on_one_keep_alive_connection_leave_no_threads_behind(tmp_
     assert after <= threads + 2, f"{after} threads after 200 requests on one connection, {threads} after the first"
 
 
-def test_small_keep_alive_responses_do_not_wait_on_nagle(tmp_path: Path) -> None:
-    """Headers and body are two writes; with Nagle on, the body waited for the client's delayed ACK, about 40 ms each (#51)."""
+def test_the_shim_turns_nagle_off_on_every_connection_it_accepts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Headers and body are two writes; with Nagle on, the body waited for the client's delayed ACK, about 40 ms each (#51).
+    Checked on the accepted socket, not by timing requests: a busy runner can be slower than that delay with the fix on (#66)."""
+    nodelay: list[int] = []
+    finish_request = ShimServer.finish_request
+
+    def recording(server: ShimServer, request: Request, client_address: tuple[str, int]) -> None:
+        finish_request(server, request, client_address)
+        assert isinstance(request, socket.socket)
+        nodelay.append(request.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
+    monkeypatch.setattr(ShimServer, "finish_request", recording)
+    with running_shim(tmp_path) as shim:
+        shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
+        assert shim.request("POST", "/mcp", body=b"{}")[0] == 200
+        assert _until(lambda: bool(nodelay), 5), "the shim never finished the connection"
+    assert nodelay[0], "TCP_NODELAY is off on the socket the shim accepted"
+
+
+@pytest.mark.skipif(
+    os.environ.get("COMPUTER_BENCHMARK") != "1",
+    reason="timing benchmark, not a gate (a loaded runner is slower than Nagle's delay): set COMPUTER_BENCHMARK=1 to run it",
+)
+def test_benchmark_small_keep_alive_responses_do_not_wait_on_nagle(tmp_path: Path) -> None:
+    """The latency #51 was about: 200 keep-alive POST /mcp took 41 ms each with Nagle on, about 1 ms with it off."""
     with running_shim(tmp_path) as shim:
         shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
         connection = http.client.HTTPConnection("127.0.0.1", shim.port, timeout=5)
@@ -341,31 +381,64 @@ def test_an_upload_the_upstream_rejects_early_gets_its_401_with_the_challenge(tm
     assert b"Connection: close" in head
 
 
+def _assert_a_paused_upload_gets_its_401_at_once_and_frees_its_slot(port: int, sent: bytes) -> None:
+    """`sent` is all the client sends before it pauses; the only handler slot must come back while it stays connected."""
+    paused = socket.create_connection(("127.0.0.1", port), timeout=3)  # far below the 65 s idle timeout
+    try:
+        paused.sendall(sent)  # and then nothing more
+        head = _read_head(paused)
+        assert head.startswith(b"HTTP/1.1 401 "), head
+        assert b"WWW-Authenticate: Bearer resource_metadata=" in head
+
+        def next_upload_answered() -> bool:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+                    sock.sendall(sent)
+                    return _read_head(sock).startswith(b"HTTP/1.1 401 ")
+            except OSError:
+                return False
+
+        # the paused client is still connected: only the shim itself can have given the one slot back
+        assert _until(next_upload_answered, 3), "the rejected upload kept the only handler slot"
+    finally:
+        paused.close()
+
+
 @pytest.mark.parametrize("sent", [b"", b"{"], ids=["headers-only", "one-byte"])
 def test_a_paused_upload_the_upstream_rejects_gets_its_401_at_once_and_frees_its_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: bytes
 ) -> None:
     monkeypatch.setattr(ShimServer, "max_handlers", 1)
     with rejecting_shim(tmp_path) as port:
-        paused = socket.create_connection(("127.0.0.1", port), timeout=3)  # far below the 65 s idle timeout
-        try:
-            paused.sendall(_upload_head(MAX_REQUEST_BYTES) + sent)  # and then nothing more
-            head = _read_head(paused)
-            assert head.startswith(b"HTTP/1.1 401 "), head
-            assert b"WWW-Authenticate: Bearer resource_metadata=" in head
+        _assert_a_paused_upload_gets_its_401_at_once_and_frees_its_slot(port, _upload_head(MAX_REQUEST_BYTES) + sent)
 
-            def next_upload_answered() -> bool:
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
-                        sock.sendall(_upload_head(MAX_REQUEST_BYTES) + sent)
-                        return _read_head(sock).startswith(b"HTTP/1.1 401 ")
-                except OSError:
-                    return False
 
-            # the paused client is still connected: only the shim itself can have given the one slot back
-            assert _until(next_upload_answered, 3), "the rejected upload kept the only handler slot"
-        finally:
-            paused.close()
+@pytest.mark.parametrize(
+    "sent",
+    [b"1", b"1;ext", b"1\r\nx\r", b"1\r\nx\r\n0\r\nX-Trailer: 1"],
+    ids=["partial-size-line", "partial-size-extension", "partial-chunk-end", "partial-trailer"],
+)
+def test_a_chunked_upload_paused_inside_a_framing_line_gets_its_401_at_once_and_frees_its_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: bytes
+) -> None:
+    """Once a byte of a chunk-size line, chunk end or trailer had come, the shim waited for the rest of the line without
+    watching the upstream: the proxy's 401 sat until the 65 s idle timeout and the slot stayed taken (#56)."""
+    monkeypatch.setattr(ShimServer, "max_handlers", 1)
+    drained = threading.Event()
+    monkeypatch.setattr(_RejectingOnceDrained, "drained", drained)
+    body_wait = proxy._RequestBody._wait  # pyright: ignore[reportPrivateUsage]
+
+    def waiting(body: proxy._RequestBody) -> None:  # pyright: ignore[reportPrivateUsage]
+        client = select.poll()  # not select(): the accepted socket's descriptor can be past FD_SETSIZE on a busy runner
+        client.register(body._client, select.POLLIN)  # pyright: ignore[reportPrivateUsage]
+        if body.upstream is not None and not body._buffered() and not client.poll(0):  # pyright: ignore[reportPrivateUsage]
+            drained.set()
+        body_wait(body)
+
+    monkeypatch.setattr(proxy._RequestBody, "_wait", waiting)  # pyright: ignore[reportPrivateUsage]
+    head = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+    with rejecting_shim(tmp_path, _RejectingOnceDrained) as port:
+        _assert_a_paused_upload_gets_its_401_at_once_and_frees_its_slot(port, head + sent)
 
 
 def test_a_chunked_upload_reaches_the_upstream_whole(tmp_path: Path) -> None:

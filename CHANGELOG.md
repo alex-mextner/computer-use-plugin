@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The ChatGPT shim relays mcp-auth-proxy's 401 at once to a chunked upload that pauses inside a chunk-size line, a chunk end or
+  a trailer, and frees its connection slot. It read such a line to its end once one byte of it had come, so the 401 waited for
+  the 65 s idle timeout and a stranger's paused uploads could hold slots until the owner's connector got 503 (#56).
+- The shim's Nagle test now checks that `TCP_NODELAY` is on for every connection the shim accepts instead of timing 200
+  requests, which a busy CI runner could fail with the fix working; the timing is a benchmark run with `COMPUTER_BENCHMARK=1`
+  (#66).
+
 ## 0.4.1
 
 - The ChatGPT shim no longer delays each small response by about 40 ms: it wrote the headers and the body in two writes with
