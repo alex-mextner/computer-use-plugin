@@ -11,8 +11,8 @@ with `set_config_value`, so the one place every client passes through, this rela
 INVARIANTS: stdout carries only DC's own messages, in DC's order, plus the local answers below; a DC line that is not the
 tools/list answer or a result carrying the survey goes through byte for byte. Every client line is read as DC's Node reads it
 before it is forwarded: a feedback call is answered here, and a line Python still cannot read is answered with a parse error
-rather than handed to a parser that might run it. DC gets the signals this process gets, dies with it, and ends it the way DC
-ended (`childexit.exit_like`); stderr is DC's, untouched.
+rather than handed to a parser that might run it. DC gets the signals this process acts on (one it was started ignoring stays
+ignored and is not passed on), dies with it, and ends it the way DC ended (`childexit.exit_like`); stderr is DC's, untouched.
 """
 
 from __future__ import annotations

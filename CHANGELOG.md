@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3
 
 - A chat client can no longer open a browser on your computer through Desktop Commander's feedback tool, or hang a tool call
   until that browser is closed: `computer mcp serve` (used by Claude and ChatGPT alike) leaves
@@ -36,6 +36,7 @@
 - The shim's Nagle test now checks that `TCP_NODELAY` is on for every connection the shim accepts instead of timing 200
   requests, which a busy CI runner could fail with the fix working; the timing is a benchmark run with `COMPUTER_BENCHMARK=1`
   (#66).
+
 ## 0.4.1
 
 - The ChatGPT shim no longer delays each small response by about 40 ms: it wrote the headers and the body in two writes with
