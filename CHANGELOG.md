@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.2
+
+- A stranger can no longer make a valid ChatGPT token read `client=unverified` after a shim restart: the shim refused any page
+  of mcp-auth-proxy's OAuth store bigger than 1 MiB, so one open registration with a multi-MiB redirect URI list that landed next
+  to ChatGPT's token hid it. The lookup now reads only the elements it searches and the one record it needs (at most 256 KiB),
+  a few KiB per call whatever else the store holds. A request with more than one Authorization header is now answered 400 and
+  not forwarded, since the proxy checks one of them and the label could name the client of another (#60).
+- The ChatGPT shim relays mcp-auth-proxy's 401 at once to a chunked upload that pauses inside a chunk-size line, a chunk end or
+  a trailer, and frees its connection slot. It read such a line to its end once one byte of it had come, so the 401 waited for
+  the 65 s idle timeout and a stranger's paused uploads could hold slots until the owner's connector got 503 (#56).
+- The shim's Nagle test now checks that `TCP_NODELAY` is on for every connection the shim accepts instead of timing 200
+  requests, which a busy CI runner could fail with the fix working; the timing is a benchmark run with `COMPUTER_BENCHMARK=1`
+  (#66).
+
 ## 0.4.1
 
 - The ChatGPT shim no longer delays each small response by about 40 ms: it wrote the headers and the body in two writes with

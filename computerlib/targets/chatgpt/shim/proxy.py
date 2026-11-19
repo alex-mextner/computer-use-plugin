@@ -12,7 +12,8 @@ upstream instead of growing memory, and a client that goes away (also while the 
 connection and end the helper thread. Hop-by-hop headers (RFC 9110 7.6.1) are not forwarded in either direction; rules never
 delay or change what is forwarded except the three documented changes (challenge header, protected-resource path, idle SSE
 comment); a logging failure never touches a request; an upstream failure is a 502 and one journal line per minute, as is a
-refused connection.
+refused connection. A request with more than one Authorization header is answered 400 and never forwarded, so the label can only
+name the credential the proxy checked.
 NOTE: a generic engine belongs in agent-tools/lib (L2 work); this is the target-specific minimum until it ships, kept to the same
 hook points so the swap is local to this file.
 """
@@ -29,8 +30,7 @@ import threading
 import time
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BufferedIOBase, BufferedReader
-from typing import TypeIs
+from io import BufferedReader
 
 from computerlib.targets.chatgpt.shim.rules import (
     CAPTURE_MAX_BYTES,
@@ -103,10 +103,6 @@ class _UpstreamAnswered(Exception):
     """The upstream answered while the shim was still reading the client's body for it."""
 
 
-def _is_reader(stream: BufferedIOBase) -> TypeIs[BufferedReader]:
-    return isinstance(stream, BufferedReader)
-
-
 class _BodyError(Exception):
     """The client's request body cannot be forwarded whole; `status` is what the shim answers (400 bad framing, 413 too big) or
     499 (the client went away or stalled past the idle timeout)."""
@@ -120,7 +116,7 @@ class _RequestBody:
     """A request body read from the client as the upstream takes it, so the shim never holds it whole (#29). `length` is None for
     a chunked body, which is passed on chunked. Keeps a copy only while the body is at most `keep` bytes, for the rules."""
 
-    def __init__(self, rfile: BufferedIOBase, client: socket.socket, length: int | None, keep: int) -> None:
+    def __init__(self, rfile: BufferedReader, client: socket.socket, length: int | None, keep: int) -> None:
         self.length = length
         self.upstream: socket.socket | None = None  # while set, an answer from it ends the body (see `_wait`)
         self._rfile = rfile
@@ -162,8 +158,6 @@ class _RequestBody:
     def _buffered(self) -> bool:
         """True when `rfile` already holds client bytes (the socket then says nothing about them). Peeks with the socket
         non-blocking, so an empty buffer costs one read that returns at once."""
-        if not _is_reader(self._rfile):
-            return False  # an unbuffered rfile holds nothing the socket does not show
         timeout = self._client.gettimeout()
         self._client.setblocking(False)
         try:
@@ -172,8 +166,24 @@ class _RequestBody:
             self._client.settimeout(timeout)
 
     def _readline(self, limit: int) -> bytes:
-        self._wait()
-        return self._rfile.readline(limit)
+        """A framing line (chunk size, chunk end, trailer) of at most `limit` bytes, taken only as far as the client has sent it:
+        a client that pauses inside one must not keep the upstream's early answer waiting either (#56). `readline` would block
+        for the rest of the line once its first byte is buffered."""
+        line = b""
+        while len(line) < limit and not line.endswith(b"\n"):
+            self._wait()
+            piece = self._line_piece(limit - len(line))
+            if not piece:
+                break  # EOF: the caller sees a short line
+            line += piece
+        return line
+
+    def _line_piece(self, limit: int) -> bytes:
+        """What `rfile` holds of the current line, up to `limit` bytes. Reads the socket at most once, which `_wait` made sure
+        does not block, and takes nothing past the newline: the bytes after it are the next frame's."""
+        available = self._rfile.peek(1)
+        newline = available.find(b"\n", 0, limit)
+        return self._rfile.read(newline + 1 if newline >= 0 else min(limit, len(available)))
 
     def _read(self, count: int) -> Generator[bytes]:
         while count:
@@ -283,6 +293,8 @@ class _Handler(BaseHTTPRequestHandler):
     # Headers and body go out in separate writes: with Nagle on, the body waits for the client's delayed ACK (~40 ms a response).
     disable_nagle_algorithm = True
     server: ShimServer  # pyright: ignore[reportIncompatibleVariableOverride]
+    # rbufsize is -1, so the stream handler's makefile gives a BufferedReader: `_RequestBody` peeks into its buffer.
+    rfile: BufferedReader  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def log_message(self, format: str, *args: object) -> None:
         """The access log is the shim's own; the stdlib's stderr line per request would leak paths with queries."""
@@ -291,6 +303,12 @@ class _Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         path = self.path.partition("?")[0]
         rules = self.server.rules
+        if len(self.headers.get_all("Authorization") or ()) > 1:
+            # The proxy authenticates one of them (Go's Header.Get: the first) and the label would name the client of whichever
+            # the rules read. Collapsing to the proxy's pick would tie the shim to that detail; no client sends two of a
+            # singleton field (RFC 9110 11.6.2), so the request is refused before it is forwarded or logged.
+            self._reply_error(400)
+            return
         request_headers = {name.lower(): value for name, value in self.headers.items()}
         kind = rules.peek_kind(self.command, path, request_headers)
         keep = PEEK_MAX_BYTES if kind == "mcp" else CAPTURE_MAX_BYTES if kind == "learn" else 0

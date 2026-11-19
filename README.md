@@ -363,7 +363,9 @@ Never written: query strings, bodies, tool arguments, Authorization headers, coo
 accepted and that token belongs to an OAuth client registered with `https://chatgpt.com/...` redirect URIs. Anything else is
 `client=unverified`. The shim learns which client a token belongs to from the token exchange it forwards; for a token it never saw
 issued (one ChatGPT already held before a restart, a reinstall or a lost state directory) it reads the client from mcp-auth-proxy's
-own OAuth store, read only, so a valid ChatGPT token keeps its label.
+own OAuth store, read only, so a valid ChatGPT token keeps its label; that lookup reads a few KiB per call, so even a multi-MiB
+registration a stranger stores next to the token cannot hide it. A request with two Authorization headers is answered 400 and never
+forwarded: the proxy would check one and the label could name another.
 
 ### Security
 
@@ -384,8 +386,10 @@ uv sync --group dev
 uv run --group dev ruff check . && uv run --group dev pyright && uv run --group dev pytest -q
 COMPUTER_INTEGRATION=1 COMPUTER_PROXY_BIN=/path/to/mcp-auth-proxy uv run --group dev pytest tests/chatgpt/test_end_to_end.py
 COMPUTER_INTEGRATION=1 COMPUTER_TUNNEL_BIN=/path/to/tunnel-client uv run --group dev pytest tests/chatgpt/test_tunnel_end_to_end.py
+COMPUTER_BENCHMARK=1 uv run --group dev pytest tests/chatgpt/test_shim_uploads.py -k benchmark
 ```
 
 Tests are hermetic (scratch HOME, no network, fake systemctl/cloudflared/npm). The integration tests start the real `mcp-auth-proxy`
 (with `computer mcp serve` as its child) or the real `tunnel-client` against a stand-in control plane, on scratch ports. Never develop
-against a running install: use a scratch `HOME` and other ports (see AGENTS.md).
+against a running install: use a scratch `HOME` and other ports (see AGENTS.md). Timing benchmarks (the shim's keep-alive latency)
+run only with `COMPUTER_BENCHMARK=1`: a loaded machine would fail them with nothing broken.

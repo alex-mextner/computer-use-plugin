@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,19 @@ def test_the_lookup_finds_the_client_of_a_token_in_every_bucket_layout(tmp_path:
     assert oauthdb.client_of_token(db, "f" * 342) is None
 
 
+@pytest.mark.parametrize("layout", ["leaf", "branch"])
+def test_every_key_among_many_is_found_by_the_element_search(tmp_path: Path, layout: str) -> None:
+    """The lookup bisects the sorted elements of each page; every key, the first and the last included, must be reachable."""
+    tokens: dict[bytes, object] = {
+        f"access_token-{n:03d}".encode(): fake_bbolt.token_record(f"cid-{n}", LOCAL_REDIRECT) for n in range(200)
+    }
+    db = fake_bbolt.write(tmp_path / "db", tokens, layout)
+    for n in range(200):
+        assert oauthdb.client_of_token(db, f"{n:03d}") == oauthdb.IssuedClient(f"cid-{n}", (LOCAL_REDIRECT,)), n
+    for absent in ("200", "00", "0000", "/"):
+        assert oauthdb.client_of_token(db, absent) is None, absent
+
+
 def test_the_current_registration_wins_over_the_copy_the_token_carries(tmp_path: Path) -> None:
     entries = _entries()
     entries[f"access_token-{SIG_LOCAL}".encode()] = fake_bbolt.token_record(LOCAL, CHATGPT_REDIRECT)
@@ -80,6 +94,53 @@ def test_a_store_bloated_by_open_registrations_still_answers(tmp_path: Path) -> 
     db = fake_bbolt.write(tmp_path / "db", entries, "branch")
     assert db.stat().st_size > 3 * 1024 * 1024
     assert oauthdb.client_of_token(db, SIG_CHATGPT) == oauthdb.IssuedClient(CHATGPT, (CHATGPT_REDIRECT,))
+
+
+FLOOD_BYTES = 4 * 1024 * 1024
+LOOKUP_READ_BOUND = 64 * 1024  # what one lookup may read in all, whatever else the store holds
+
+
+def _requested_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """The byte count of every pread the lookup asks for: what it allocates, whatever the file returns."""
+    requested: list[int] = []
+    real = os.pread
+
+    def counting(fd: int, length: int, offset: int) -> bytes:
+        requested.append(length)
+        return real(fd, length, offset)
+
+    monkeypatch.setattr(os, "pread", counting)
+    return requested
+
+
+def test_a_token_sharing_a_leaf_with_a_multi_mib_registration_is_attributed_with_bounded_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#60: registration is open to anyone, so a stranger's multi-MiB client can land in the leaf that holds ChatGPT's token and
+    registration; the lookup reads only the elements it probes and the values it needs, never the stranger's record."""
+    entries = _entries()
+    entries[f"access_token-{SIG_CHATGPT}".encode()] = fake_bbolt.token_record(CHATGPT, "https://chatgpt.com/connector/oauth/old")
+    entries[b"client-zz-flood"] = fake_bbolt.client_record("zz-flood", "https://x/" + "a" * FLOOD_BYTES)
+    db = fake_bbolt.write(tmp_path / "db", entries)
+    _, _, count, overflow = oauthdb.PAGE_HEADER.unpack_from(db.read_bytes(), 4 * fake_bbolt.PAGE)
+    assert count == len(entries) and (overflow + 1) * fake_bbolt.PAGE > FLOOD_BYTES  # one leaf holds them all
+    requested = _requested_reads(monkeypatch)
+    # The redirect URI comes from the current registration in that same leaf, not from the stale copy the token carries.
+    assert oauthdb.client_of_token(db, SIG_CHATGPT) == oauthdb.IssuedClient(CHATGPT, (CHATGPT_REDIRECT,))
+    assert sum(requested) < LOOKUP_READ_BOUND, requested
+    requested.clear()
+    assert oauthdb.client_of_token(db, "f" * 342) is None
+    assert sum(requested) < LOOKUP_READ_BOUND, requested
+
+
+def test_a_record_too_big_to_be_a_token_gives_no_answer_without_being_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    huge = fake_bbolt.token_record(CHATGPT, CHATGPT_REDIRECT) | {"SessionData": {"pad": "x" * FLOOD_BYTES}}
+    db = fake_bbolt.write(tmp_path / "db", {f"access_token-{SIG_CHATGPT}".encode(): huge})
+    requested = _requested_reads(monkeypatch)
+    assert oauthdb.client_of_token(db, SIG_CHATGPT) is None
+    assert sum(requested) < LOOKUP_READ_BOUND, requested
 
 
 @pytest.mark.parametrize("corrupt", [(False, True), (True, False)], ids=["second-meta-damaged", "first-meta-damaged"])
