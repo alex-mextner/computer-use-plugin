@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import stat
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -555,6 +556,22 @@ def test_doctor_names_the_failure_of_each_link_and_how_to_fix_it_without_changin
     layout().tunnel_key_file.chmod(0o644)
     assert "chmod 600" in run_cli(capsys, "doctor").out
     assert [c for c in machine.calls()[len(before) :] if not c.startswith("show ")] == []
+
+
+def test_the_runtime_key_chmod_hint_pastes_safely_for_a_path_with_a_space_and_shell_syntax(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    odd = tmp_path / "my home $(touch pwned)"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(odd / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(odd / "data"))
+    _init_tunnel(capsys, monkeypatch)
+    _store_key()
+    key = layout().tunnel_key_file
+    key.chmod(0o644)
+    out = run_cli(capsys, "doctor").out
+    subprocess.run(["sh", "-c", "chmod 600 " + out.split("chmod 600 ", 1)[1].splitlines()[0]], cwd=tmp_path, check=True)
+    assert stat.S_IMODE(key.stat().st_mode) == 0o600
+    assert not (tmp_path / "pwned").exists()
 
 
 def test_doctor_flags_a_tampered_client_binary_and_a_daemon_that_cannot_poll(
