@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- The ChatGPT shim no longer delays each small response by about 40 ms: it wrote the headers and the body in two writes with
+  Nagle's algorithm on, so the body waited for the client's delayed ACK. It now sends them at once; 200 keep-alive `POST /mcp`
+  on loopback take well under 10 ms each instead of 41 ms (#51).
+
 ## 0.4.0
 
 - `computer chatgpt doctor --heal` runs one bounded watchdog pass (public mode) for a unit that stays active but stops

@@ -280,11 +280,7 @@ def test_a_slow_early_answer_to_a_paused_upload_is_relayed_whole(tmp_path: Path)
     assert b"6\r\ndenied\r\n0\r\n\r\n" in data, data
 
 
-def test_many_requests_on_one_keep_alive_connection_leave_no_threads_behind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # each response otherwise waits ~40 ms on Nagle (#51); a fast burst is what piles up threads a request leaves behind
-    monkeypatch.setattr("computerlib.targets.chatgpt.shim.proxy._Handler.disable_nagle_algorithm", True)
+def test_many_requests_on_one_keep_alive_connection_leave_no_threads_behind(tmp_path: Path) -> None:
     with running_shim(tmp_path) as shim:
         shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
         connection = http.client.HTTPConnection("127.0.0.1", shim.port, timeout=5)
@@ -299,6 +295,24 @@ def test_many_requests_on_one_keep_alive_connection_leave_no_threads_behind(
         finally:
             connection.close()
     assert after <= threads + 2, f"{after} threads after 200 requests on one connection, {threads} after the first"
+
+
+def test_small_keep_alive_responses_do_not_wait_on_nagle(tmp_path: Path) -> None:
+    """Headers and body are two writes; with Nagle on, the body waited for the client's delayed ACK, about 40 ms each (#51)."""
+    with running_shim(tmp_path) as shim:
+        shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
+        connection = http.client.HTTPConnection("127.0.0.1", shim.port, timeout=5)
+        try:
+            connection.request("POST", "/mcp", body=b"{}")
+            connection.getresponse().read()
+            started = time.monotonic()
+            for _ in range(200):
+                connection.request("POST", "/mcp", body=b"{}")
+                connection.getresponse().read()
+            each = (time.monotonic() - started) / 200
+        finally:
+            connection.close()
+    assert each < 0.010, f"{each * 1000:.1f} ms per keep-alive POST /mcp through the shim"
 
 
 def test_an_upload_the_upstream_rejects_early_gets_its_401_with_the_challenge(tmp_path: Path) -> None:
