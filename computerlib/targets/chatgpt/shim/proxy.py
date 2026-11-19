@@ -280,6 +280,8 @@ class ShimServer(ThreadingHTTPServer):
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = IDLE_TIMEOUT_SECONDS
+    # Headers and body go out in separate writes: with Nagle on, the body waits for the client's delayed ACK (~40 ms a response).
+    disable_nagle_algorithm = True
     server: ShimServer  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def log_message(self, format: str, *args: object) -> None:
