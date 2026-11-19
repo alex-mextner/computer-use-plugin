@@ -76,8 +76,13 @@ confinement); the downloaded build has none. The shell and file tools are not af
 
 `computer mcp install` (and so `computer claude install` and `computer chatgpt install`) prints a `warning:` when the restriction
 is on and no profile in `/etc/apparmor.d` covers the Chrome write_pdf will launch; `computer chatgpt doctor` shows it as a `[warn]`
-check and `computer claude status` as a `[warn] pdf:` line. Neither changes their exit code, and nothing here changes system
-settings: both fixes need root, following
+check and `computer claude status` as a `[warn] pdf:` line. When several profiles match that Chrome, the most specific one
+decides, as in the kernel: the one that matches more of the path before its first `*` (an exact path matches all of it), and a
+tie applies none. A profile on disk counts only once the kernel lists a profile of that name as loaded, in
+`/sys/kernel/security/apparmor/profiles` (readable by root) or `/sys/kernel/security/apparmor/policy/profiles` (readable by any
+user); when neither can be read or the kernel does not list it, the warning says the coverage is unverified and names the
+`apparmor_parser -r` command that loads it. A profile edited after it was loaded is judged by its file, so reload it after an
+edit. Neither changes their exit code, and nothing here changes system settings: both fixes need root, following
 [Chromium's guide](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md).
 
 1. Recommended: an AppArmor profile for the downloaded build only. Save this as `/etc/apparmor.d/desktop-commander-chrome` and
@@ -115,12 +120,16 @@ option sets can conflict (`--use-openssl-ca` with `--use-bundled-ca`) and node t
   to the absolute path of this `computer` executable with `mcp serve`, runs `computer mcp install`, and makes sure
   `~/.config/autostart/claude-desktop.desktop` exists, is enabled and starts a program that exists. Every other key of the config
   is preserved, the write is atomic, a timestamped backup is made first, and invalid JSON is refused (exit 2) without touching the
-  file. An autostart entry that is fine is never rewritten (it may carry your own Exec); a disabled one is re-enabled, one whose
-  Exec is missing or names a program that does not exist gets only its Exec line replaced, and an empty file or one without a
-  `[Desktop Entry]` section is replaced; each after a backup. Exec is written with the Desktop Entry spec's quoting and escaping.
-  Claude Desktop is never restarted by this tool: restart it yourself to pick the change up.
+  file. An autostart entry that is fine is never rewritten (it may carry your own Exec; the entry is read and judged right
+  before a repair, so one fixed in the meantime is kept); a disabled one is re-enabled, one whose Exec is missing, cannot
+  be parsed (an unterminated quote) or names a program that does not exist or is not executable gets only its Exec line
+  replaced, and an empty file or one without a `[Desktop Entry]` section is replaced; each after a backup. The Exec written names
+  `/usr/lib/claude-desktop/claude-desktop` when it is executable, else `claude-desktop` found in an absolute PATH entry,
+  quoted and escaped per the Desktop Entry spec. Claude Desktop is never restarted by this tool: restart it yourself to pick the
+  change up.
 - `computer claude status` checks the config entry, the executable, the autostart entry (present, has a `[Desktop Entry]`
-  section, enabled, Exec program exists), and performs a real MCP handshake
+  section, enabled, Exec parses the way GIO parses it when GNOME starts it at login and names an executable program), and
+  performs a real MCP handshake
   (`initialize`, `tools/list`) against the configured command under a minimal environment. Exit 0 healthy, 3 unhealthy.
 - `computer claude uninstall` removes only the `desktop-commander` entry (after a backup); the managed install and the autostart
   entry stay.

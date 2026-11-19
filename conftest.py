@@ -22,9 +22,11 @@ def hermetic_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
         monkeypatch.delenv(name, raising=False)
     for name in CREDENTIAL_ENV:
         monkeypatch.delenv(name, raising=False)
-    # The host's userns restriction and profiles would add a write_pdf warning to install, doctor and status output.
+    # The host's userns restriction and profiles (on disk or loaded) would add a write_pdf warning to install, doctor and status.
     monkeypatch.setattr(pdf_sandbox, "RESTRICTION_FILE", tmp_path / "apparmor_restrict_unprivileged_userns")
     monkeypatch.setattr(pdf_sandbox, "PROFILE_DIR", tmp_path / "apparmor.d")
+    monkeypatch.setattr(pdf_sandbox, "LOADED_PROFILES", tmp_path / "apparmor_profiles")
+    monkeypatch.setattr(pdf_sandbox, "POLICY_PROFILES", tmp_path / "apparmor_policy_profiles")
     yield
 
 

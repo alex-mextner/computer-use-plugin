@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from agenttools_errors import MissingTargetError
 
 from computerlib import pdf_sandbox
 from computerlib.cli import main
@@ -480,6 +481,106 @@ def test_status_accepts_a_relative_exec_found_on_path(computer_bin: Path, claude
     assert main(["claude", "install"]) == 0
     autostart_path.write_text("[Desktop Entry]\nType=Application\nExec=sh -c true\nX-GNOME-Autostart-enabled=true\n")
     assert main(["claude", "status"]) == 0
+
+
+@pytest.mark.parametrize(
+    "exec_line", ['Exec="/bin/sh', 'Exec=/bin/sh "x', "Exec='/bin/sh -c true", "Exec=/bin/sh -c true\\\\", "Exec=/bin/sh #"]
+)
+def test_status_fails_and_install_repairs_an_exec_with_an_unterminated_quote(
+    exec_line: str, computer_bin: Path, claude_binary: Path, autostart_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # GIO parses Exec with g_shell_parse_argv and will not start an entry it cannot parse, though /bin/sh exists.
+    autostart_path.parent.mkdir(parents=True)
+    autostart_path.write_text(f"[Desktop Entry]\nName=Mine\n{exec_line}\nX-GNOME-Autostart-enabled=true\n")
+    assert main(["claude", "status"]) == 3
+    assert "[FAIL] autostart: broken-exec" in (out := capsys.readouterr().out) and "Exec cannot be parsed" in out
+    assert main(["claude", "install"]) == 0
+    assert autostart_path.read_text() == (
+        f'[Desktop Entry]\nName=Mine\nExec="{claude_binary}" --startup\nX-GNOME-Autostart-enabled=true\n'
+    )
+    assert main(["claude", "status"]) == 0
+
+
+@pytest.mark.parametrize(
+    "exec_line",
+    ['Exec="/bin/s"h -c \'echo "%%x"\'', 'Exec=/bin/sh -c "say \\\\"hi\\\\""', "Exec=\\\\/bin/sh", "Exec=/bin/sh # a note#"],
+)
+def test_status_accepts_the_quoting_gio_accepts(
+    exec_line: str, computer_bin: Path, claude_binary: Path, autostart_path: Path
+) -> None:
+    assert main(["claude", "install"]) == 0
+    autostart_path.write_text(f"[Desktop Entry]\n{exec_line}\nX-GNOME-Autostart-enabled=true\n")
+    assert main(["claude", "status"]) == 0
+
+
+def test_install_keeps_an_exec_fixed_between_inspect_and_repair(
+    computer_bin: Path,
+    claude_binary: Path,
+    autostart_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    autostart_path.parent.mkdir(parents=True)
+    autostart_path.write_text("[Desktop Entry]\nExec=/gone\nX-GNOME-Autostart-enabled=true\n")
+    fixed = "[Desktop Entry]\nExec=/bin/sh -c mine\nX-GNOME-Autostart-enabled=true\n"
+    find_binary = autostart.find_binary
+
+    def user_fixes_it_meanwhile() -> str | None:
+        # The user's editor saves a working Exec after install has judged the entry broken, before it repairs it.
+        autostart_path.write_text(fixed)
+        return find_binary()
+
+    monkeypatch.setattr(autostart, "find_binary", user_fixes_it_meanwhile)
+    assert main(["claude", "install"]) == 0
+    assert autostart_path.read_text() == fixed
+    assert not list(autostart_path.parent.glob("*.bak-*"))
+    assert f"autostart already enabled ({autostart_path})" in capsys.readouterr().out
+
+
+def test_install_skips_a_non_executable_packaged_launcher_for_the_one_on_path(
+    tmp_path: Path, computer_bin: Path, autostart_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    packaged = tmp_path / "usr/lib/claude-desktop/claude-desktop"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_text("#!/bin/sh\n")  # no execute bit: the session could not start it
+    monkeypatch.setattr(autostart, "CLAUDE_DESKTOP_BINARIES", (str(packaged),))
+    on_path = write_executable(tmp_path / "bin/claude-desktop", "#!/bin/sh\n")
+    assert autostart.find_binary() == str(on_path)
+    assert main(["claude", "install"]) == 0
+    assert f'Exec="{on_path}" --startup\n' in autostart_path.read_text()
+    assert main(["claude", "status"]) == 0
+    # The repair sticks: the next install finds nothing to change.
+    capsys.readouterr()
+    assert main(["claude", "install"]) == 0
+    assert f"autostart already enabled ({autostart_path})" in capsys.readouterr().out
+
+
+def test_a_packaged_launcher_without_its_execute_bit_is_named_when_nothing_else_is_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packaged = tmp_path / "usr/lib/claude-desktop/claude-desktop"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(autostart, "CLAUDE_DESKTOP_BINARIES", (str(packaged),))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(MissingTargetError) as raised:
+        autostart.ensure()
+    assert raised.value.why == f"{packaged} is not executable and no other claude-desktop launcher was found on PATH"
+    assert raised.value.fix.startswith(f"make it executable (`chmod +x {packaged}`, as root) or reinstall Claude Desktop")
+
+
+def test_a_launcher_found_only_through_a_relative_or_empty_path_entry_is_not_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session resolves Exec at login from elsewhere, and inspection rejects a relative path: only absolute entries count.
+    on_path = write_executable(tmp_path / "bin/claude-desktop", "#!/bin/sh\n")
+    write_executable(tmp_path / "claude-desktop", "#!/bin/sh\n")
+    monkeypatch.setattr(autostart, "CLAUDE_DESKTOP_BINARIES", ())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "bin::.")
+    assert autostart.find_binary() is None
+    monkeypatch.setenv("PATH", f"bin:{on_path.parent}")
+    assert autostart.find_binary() == str(on_path)
 
 
 def test_install_disabled_and_broken_exec_is_repaired_in_one_backup(

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- `computer claude status` now fails an autostart entry whose Exec has an unterminated quote or ends in a backslash
+  (`Exec="/bin/sh`): it reads Exec with GLib's shell quoting, as GIO does when GNOME starts the entry at login, and GIO refuses
+  such a line, so the entry never started though status called it healthy. `computer claude install` reads the entry right
+  before a repair, after the launcher lookup, and decides on that content, so an Exec fixed in the meantime is kept instead of
+  replaced, and it only writes a packaged launcher into Exec when the launcher is executable (else `claude-desktop` from an
+  absolute PATH entry), so a launcher without its execute bit no longer makes every install repeat the repair with a new
+  backup; with no other launcher, install now says the packaged one lacks its execute bit instead of "not found" (#55).
+- The write_pdf AppArmor warning of `computer mcp install`, `computer chatgpt doctor` and `computer claude status` no longer
+  calls Chrome covered when it is not. A profile on disk counts only once the kernel lists a profile of that name as loaded,
+  read from its per-profile policy directories (any user) or its root-only list; when neither list can be read or the kernel
+  does not list it, the warning says the coverage is unverified and names the `apparmor_parser -r` command that loads the
+  profile. Of several profiles matching Chrome the most specific one decides, as in the kernel, so a generic grant no longer
+  hides an exact profile that denies `userns`, and two copies of one profile are no longer read as a conflict. A comma inside a
+  path glob (`/srv/{a,userns,b} r,`) no longer reads as a `userns` rule, and a literal brace in a path (`[{]`, `\{`) or a
+  header brace right after its flags (`flags=(complain){`) no longer hides the profiles after it or breaks the match. The scan
+  also got faster: a profile's includes are followed only when it attaches to Chrome (#64).
+
 ## 0.4.6
 
 - The ChatGPT bridge no longer writes a journal line per request with the OAuth login's query strings (client_id,
