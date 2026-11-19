@@ -160,11 +160,22 @@ def _glob_regex(glob: str) -> re.Pattern[str]:
 
 
 def _included(profiles: Path, name: str) -> list[Path]:
-    """The files `include <name>` (relative to the profile directory) or `include "/path"` names; a directory means its files."""
+    """The files `include <name>` (relative to the profile directory) or `include "/path"` names; a directory means its files.
+    A directory this user cannot list gives nothing: its rules stay unknown, so they never count as a grant."""
     target = Path(name) if name.startswith("/") else profiles / name
     if target.is_dir():
-        return sorted(path for path in target.iterdir() if _loaded(path))
+        try:
+            return sorted(path for path in target.iterdir() if _loaded(path))
+        except OSError:
+            return []
     return [target] if target.is_file() else []
+
+
+def _line_userns(rule: str) -> tuple[bool, bool]:
+    """(allowed, denied) by one line. Rules end at a comma and a line may hold several (`userns, deny userns,`): each counts."""
+    statements = [statement.strip() for statement in rule.split(",")]
+    allowed = any(_USERNS.match(statement + ",") is not None for statement in statements)
+    return allowed, any(_DENY_USERNS.match(statement) is not None for statement in statements)
 
 
 def _userns_rules(body: list[str], profiles: Path, nesting: int = 0) -> tuple[bool, bool]:
@@ -178,17 +189,20 @@ def _userns_rules(body: list[str], profiles: Path, nesting: int = 0) -> tuple[bo
                 more_allowed, more_denied = _userns_rules(_lines(path), profiles, nesting + 1)
                 allowed, denied = allowed or more_allowed, denied or more_denied
         elif depth == 0:
-            allowed = allowed or _USERNS.match(rule) is not None
-            denied = denied or _DENY_USERNS.match(rule) is not None
+            more_allowed, more_denied = _line_userns(rule)
+            allowed, denied = allowed or more_allowed, denied or more_denied
         depth += rule.count("{") - rule.count("}")
     return allowed, denied
 
 
 def _userns_attachments(lines: list[str], profiles: Path) -> list[str]:
-    """The attachment paths of the profiles in one file that allow `userns` and do not deny it (a deny rule wins)."""
+    """The attachment paths of the top-level profiles in one file that allow `userns` and do not deny it (a deny rule wins).
+    A child profile (a header inside another profile's braces) is not attached globally, so it is skipped."""
     found: list[str] = []
+    file_depth = 0
     for start, line in enumerate(lines):
-        header = _HEADER.match(line)
+        header = _HEADER.match(line) if file_depth == 0 else None
+        file_depth += line.count("{") - line.count("}")
         if header is None:
             continue
         depth = 1

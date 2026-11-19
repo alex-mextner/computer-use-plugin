@@ -200,6 +200,27 @@ def test_status_warns_about_the_pdf_sandbox_without_failing(
     assert "[warn] pdf: write_pdf cannot start Chrome" in out and "       fix: as root, add an AppArmor profile" in out
 
 
+def test_status_checks_the_pdf_sandbox_under_the_home_of_the_entry(
+    computer_bin: Path,
+    claude_binary: Path,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Desktop Commander keeps its Chrome under the HOME the entry gives it, so that is where status looks."""
+    pdf_sandbox.RESTRICTION_FILE.write_text("1\n")
+    monkeypatch.setattr(pdf_sandbox, "SYSTEM_CHROMES", ())
+    assert main(["claude", "install"]) == 0
+    data = json.loads(config_path.read_text())
+    server_home = tmp_path / "server-home"
+    data["mcpServers"]["desktop-commander"].setdefault("env", {})["HOME"] = str(server_home)
+    seed_config(config_path, data)
+    capsys.readouterr()
+    main(["claude", "status"])
+    assert f"downloads into {server_home}/.claude-server-commander/puppeteer-cache/chrome)" in capsys.readouterr().out
+
+
 def test_status_unhealthy_without_config(computer_bin: Path, claude_binary: Path) -> None:
     assert main(["claude", "status"]) == 3
 
