@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import IO
 
 import pytest
 
 from computerlib.targets.chatgpt.settings import Layout, Settings
 from computerlib.targets.chatgpt.stack import Process, stack
-from computerlib.targets.chatgpt.units import exec_quote, render_unit, unit_name
+from computerlib.targets.chatgpt.units import exec_quote, managed_prefixes, render_unit, unit_name
 
 LAUNCHER = ("/opt/tools/computer",)
 
@@ -93,3 +94,22 @@ def test_arguments_with_spaces_and_systemd_specials_are_quoted_and_escaped() -> 
 def test_a_process_environment_is_rendered_quoted() -> None:
     text = render_unit(Process("p", "d", ("/bin/true",), env=(("PATH", "/a b:/c"),)), "x")
     assert 'Environment="PATH=/a b:/c"' in text
+
+
+def test_managed_prefixes_skips_a_unit_file_that_vanishes_while_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between the directory listing and the read the file can be deleted: not ours to prove, so skipped, never raised."""
+    ours = tmp_path / unit_name("kept", "shim")
+    ours.write_text(render_unit(Process(name="shim", description="d", argv=("x",)), "kept"))
+    gone = tmp_path / unit_name("gone", "shim")
+    gone.write_text("x")
+    real_open = Path.open
+
+    def vanishing_open(self: Path, mode: str = "r") -> IO[bytes]:
+        if self == gone:
+            raise FileNotFoundError(self)
+        return real_open(self, mode)  # pyright: ignore[reportReturnType]
+
+    monkeypatch.setattr(Path, "open", vanishing_open)
+    assert managed_prefixes(tmp_path, ["shim"]) == ["kept"]

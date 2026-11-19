@@ -148,6 +148,15 @@ class Systemd:
     def remove(self, names: list[str]) -> None:
         for name in names:
             (self._unit_dir / name).unlink(missing_ok=True)
+            # `disable` cannot drop an enablement link once the unit file is gone, so a purge without a config would leave
+            # it behind. `render_unit` only enables into default.target.wants/; .requires/ covers links the user added by
+            # hand. Only the folders are globbed (a discovered prefix may hold glob syntax). The file in unit_dir is gone by
+            # now, so a link to it dangles; a link that still reaches a file (a same-named unit in another search path) is
+            # the user's and kept.
+            for folder in (*self._unit_dir.glob("*.wants"), *self._unit_dir.glob("*.requires")):
+                link = folder / name
+                if link.is_symlink() and not link.exists():
+                    link.unlink(missing_ok=True)
         self._ctl("daemon-reload", check=False)
         # A unit that exited non-zero on stop stays listed as "not-found failed" after its file is gone; forget it too.
         self._ctl("reset-failed", *names, check=False)

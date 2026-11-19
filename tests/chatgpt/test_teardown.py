@@ -199,3 +199,63 @@ def test_an_existing_world_readable_env_file_becomes_private_before_the_password
     assert ensure_password(path) is True
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert read_password(path)
+
+
+def test_purge_without_a_config_removes_the_enablement_links_of_units_whose_files_are_gone(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real `enable` leaves a link in default.target.wants/ (or another .wants/.requires); with the unit file already gone
+    `disable` cannot drop it, so purge does, and leaves the links of other units alone."""
+    _running_stack(capsys, monkeypatch)
+    units = layout().unit_dir
+    wants = units / "default.target.wants"
+    requires = units / "timers.target.requires"
+    wants.mkdir()
+    requires.mkdir()
+    for name in (BRIDGE, SHIM):
+        (wants / name).symlink_to(units / name)
+        (requires / name).symlink_to(units / name)
+        (units / name).unlink()
+    users_own = wants / "mine.service"
+    users_own.symlink_to(units / "mine.service")
+    config_file().unlink()
+    purged = run_cli(capsys, "uninstall", "--purge")
+    assert purged.code == 0, purged.err
+    for name in (BRIDGE, SHIM):
+        assert not (wants / name).is_symlink() and not (requires / name).is_symlink()
+    assert users_own.is_symlink()
+    assert machine.unit_state(BRIDGE, "active") == "inactive"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_purge_without_a_config_survives_an_unreadable_unit_file(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `*-shim.service` file purge cannot read is not one it can prove it wrote: skipped, never a crash before the managed
+    units are stopped."""
+    _running_stack(capsys, monkeypatch)
+    unreadable = layout().unit_dir / "locked-shim.service"
+    unreadable.write_text("[Service]\nExecStart=/bin/true\n")
+    unreadable.chmod(0)
+    config_file().unlink()
+    try:
+        purged = run_cli(capsys, "uninstall", "--purge")
+    finally:
+        unreadable.chmod(0o600)
+    assert purged.code == 0, purged.err
+    assert machine.unit_state(BRIDGE, "active") == "inactive" and machine.unit_state(SHIM, "active") == "inactive"
+    assert unreadable.exists() and not any("locked-shim" in call for call in machine.calls())
+
+
+def test_purge_without_a_config_skips_a_fifo_named_like_a_unit(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening a FIFO blocks until a writer appears: purge must not open it, or it hangs before it stops anything."""
+    _running_stack(capsys, monkeypatch)
+    fifo = layout().unit_dir / "piped-shim.service"
+    os.mkfifo(fifo)
+    config_file().unlink()
+    purged = run_cli(capsys, "uninstall", "--purge")
+    assert purged.code == 0, purged.err
+    assert machine.unit_state(BRIDGE, "active") == "inactive" and machine.unit_state(SHIM, "active") == "inactive"
+    assert stat.S_ISFIFO(fifo.lstat().st_mode) and not any("piped-shim" in call for call in machine.calls())
