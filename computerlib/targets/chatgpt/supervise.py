@@ -3,6 +3,9 @@ signal.
 
 No restarts here: this is for development and for proving the stack on scratch ports; systemd (Restart=always) is the supervisor
 of a real install.
+
+`run` ends the way the process that stopped the stack ended (`childexit.exit_like`, shared with every wrapper), so a stop by
+SIGTERM is seen as one: returned as a status, -15 would be exit 241.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from computerlib import childexit
 from computerlib.targets.chatgpt.password import PASSWORD_VARIABLE, read_password
 from computerlib.targets.chatgpt.stack import Process
 
@@ -31,7 +35,7 @@ def _environment(process: Process, base: dict[str, str]) -> dict[str, str]:
 
 
 def run_foreground(processes: Sequence[Process], settle_seconds: float = 0.3) -> int:
-    """Start the processes in order; return when the first one exits (after stopping the rest) with its exit status, or 0 on a
+    """Start the processes in order; when the first one exits, stop the rest and end like it (`childexit.exit_like`); 0 on a
     signal."""
     children: list[subprocess.Popen[bytes]] = []
     stopping = False
@@ -49,12 +53,15 @@ def run_foreground(processes: Sequence[Process], settle_seconds: float = 0.3) ->
         while not stopping and all(child.poll() is None for child in children):
             time.sleep(0.2)
         exited = [c.returncode for c in children if c.poll() is not None]
-        return 0 if stopping or not exited else exited[0]
+        code = 0 if stopping or not exited else exited[0]
     finally:
-        _stop_all(children)
+        stop_all(children)
+    # Only after the rest are stopped: dying of the child's signal any earlier would orphan them.
+    return childexit.exit_like(code)
 
 
-def _stop_all(children: Sequence[subprocess.Popen[bytes]]) -> None:
+def stop_all(children: Sequence[subprocess.Popen[bytes]]) -> None:
+    """Terminate the children still running (last started first), killing any that outlive the grace period, and reap them."""
     for child in reversed(children):
         if child.poll() is None:
             child.terminate()

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- The ChatGPT bridge no longer writes a journal line per request with the OAuth login's query strings (client_id,
+  redirect_uri, state): mcp-auth-proxy logs its access records to stderr, which `quiet` passed through untouched. `quiet` now
+  filters stderr like stdout, each stream on its own so a silent one never holds back the other; errors and warnings still reach
+  the journal on the stream they came from. `quiet` ends when its command does, even if a process it started still holds a
+  stream open, and when it cannot write a line it stops the command and fails instead of hanging (#26).
+- `computer chatgpt run` stopped by one of its processes dying of a signal now ends the same way (killed by SIGTERM, 143 in a
+  shell) instead of exiting 241, so a clean stop no longer looks like a crash. It stops the other processes first, and shares the
+  rule with `quiet` (#28).
+
 ## 0.4.5
 
 - A chat client can no longer open a browser on your computer through Desktop Commander's feedback tool, or hang a tool call
@@ -38,7 +49,6 @@
 - The shim's Nagle test now checks that `TCP_NODELAY` is on for every connection the shim accepts instead of timing 200
   requests, which a busy CI runner could fail with the fix working; the timing is a benchmark run with `COMPUTER_BENCHMARK=1`
   (#66).
-
 ## 0.4.1
 
 - The ChatGPT shim no longer delays each small response by about 40 ms: it wrote the headers and the body in two writes with
