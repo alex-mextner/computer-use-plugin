@@ -17,7 +17,6 @@ counts as a tunnel's only when its TunnelID is the id `tunnel list` shows (`cred
 
 from __future__ import annotations
 
-import base64
 import binascii
 import fcntl
 import json
@@ -41,16 +40,23 @@ LOGIN_URL = re.compile(r"https://\S+argotunnel\S*")
 # credentials.OriginCertToken).
 # Delimiters as Go's pem.Decode reads them: on their own line, trailing spaces and tabs allowed, any type (hyphens too); a
 # block collapsed onto one line is no block. No nested quantifiers over the same whitespace, so a malformed file fails fast.
+# The body holds only what pem.Decode decodes: the base64 alphabet and the spaces, tabs and line breaks it skips. Any other
+# blank (a vertical tab, a form feed, a no-break space) fails its base64 decoding, so cloudflared would find no token.
 ACCOUNT_CERT = re.compile(
-    r"^-----BEGIN ARGO TUNNEL TOKEN-----[ \t]*$(?P<body>[A-Za-z0-9+/=\s]*?)^-----END ARGO TUNNEL TOKEN-----[ \t]*$",
+    r"^-----BEGIN ARGO TUNNEL TOKEN-----[ \t]*$(?P<body>[A-Za-z0-9+/= \t\r\n]*?)^-----END ARGO TUNNEL TOKEN-----[ \t]*$",
     re.MULTILINE,
 )
+PEM_BLANKS = str.maketrans("", "", " \t\r\n")
 PEM_BEGIN = re.compile(r"^-----BEGIN (?P<type>[^\n]*?)-----[ \t]*$", re.MULTILINE)
 # The block types cloudflared's decodeOriginCert accepts (the legacy layout adds a key and a certificate); any other is an error.
 PEM_TYPES = frozenset({"ARGO TUNNEL TOKEN", "PRIVATE KEY", "CERTIFICATE"})
 ACCOUNT_CERT_FIELDS = ("zoneID", "accountID", "apiToken")
-# Every string field of OriginCertToken; encoding/json matches keys case-insensitively and fails on a non-string value.
+# Every string field of OriginCertToken (lowercase); encoding/json fails on a non-string value for one of them.
 ACCOUNT_CERT_STRINGS = frozenset({"zoneid", "accountid", "apitoken", "endpoint"})
+# encoding/json gives a key to a field when foldName makes them equal: ASCII letters uppercased, any other rune replaced by the
+# smallest rune of its unicode.SimpleFold orbit. Only two orbits hold a non-ASCII rune and an ASCII letter (long s with S, the
+# Kelvin sign with K); the dotted capital I and the dotless i fold only onto themselves, so a key spelled with them is ignored.
+GO_FOLD = str.maketrans({"\u017f": "S", "\u212a": "K"})
 CONFIG_TEXT = (
     "# Managed by `computer chatgpt`: passed as --config to every cloudflared call of this target, "
     "so cloudflared never falls back\n"
@@ -109,24 +115,105 @@ def _detail(result: subprocess.CompletedProcess[str]) -> str:
     return ((result.stderr or "") + (result.stdout or "")).strip()[-400:] or f"exit {result.returncode}"
 
 
-def _require_account_cert(text: str, source: Path) -> None:
-    """`text` must be what `cloudflared tunnel login` writes, or a usage error: a published certificate means "logged in"."""
+@dataclass(frozen=True)
+class _JsonObject:
+    """A decoded JSON object with every key as written, repeats included: a dict keeps only the last of a repeated key."""
+
+    pairs: list[tuple[str, object]]
+
+
+def _no_constant(name: str) -> object:
+    raise ValueError(f"{name} is not JSON")  # Python's json accepts NaN and Infinity, encoding/json does not
+
+
+def _token_field(key: str) -> str | None:
+    """The OriginCertToken string field (lowercase) encoding/json decodes `key` into, or None for a key it ignores."""
+    folded = "".join(char.upper() if char.isascii() else char for char in key.translate(GO_FOLD))
+    return folded.lower() if folded.isascii() and folded.lower() in ACCOUNT_CERT_STRINGS else None
+
+
+# encoding/json allows 10000 levels, but Python's decoder recurses and overflows near 1000 on some versions and not on others;
+# a bound well below both gives the same answer on every Python. A real token is one flat object.
+TOKEN_DEPTH = 100
+
+
+def _json_depth(text: str) -> int:
+    """How deep arrays and objects nest in the JSON `text` (brackets inside strings do not count)."""
+    depth = deepest = 0
+    in_string = escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif char in "]}":
+            depth -= 1
+    return deepest
+
+
+def _decode_token(body: str) -> _JsonObject | str:
+    """The JSON object in the base64 `body` of the token block, or why there is none."""
+    try:
+        # Strict UTF-8: a byte-order mark or UTF-16 is a syntax error to encoding/json, though json.loads(bytes) takes it.
+        payload = binascii.a2b_base64(body.translate(PEM_BLANKS), strict_mode=True).decode()
+    except (binascii.Error, ValueError):  # UnicodeDecodeError is a ValueError
+        return "its token block is not base64 of UTF-8 text"
+    if _json_depth(payload) > TOKEN_DEPTH:
+        return f"its token nests JSON deeper than {TOKEN_DEPTH} levels"
+    try:
+        token = json.loads(payload, object_pairs_hook=_JsonObject, parse_constant=_no_constant)
+    except ValueError:  # JSONDecodeError is a ValueError
+        token = None
+    return token if isinstance(token, _JsonObject) else "its token block is not base64 of a UTF-8 JSON object"
+
+
+def _token_problem(token: _JsonObject) -> str | None:
+    """Why encoding/json would not fill OriginCertToken from `token` with every field cloudflared needs, or None."""
+    fields: dict[str, object] = {}
+    for key, value in token.pairs:
+        field = _token_field(key)
+        if field is None:
+            continue
+        # encoding/json matches names ignoring case and the last value wins, but a wrongly typed earlier one still fails the
+        # decoding: a repeated field is refused outright instead of guessing which value cloudflared would end up with.
+        if field in fields:
+            return f"its token sets the field {field} more than once (cloudflared reads field names ignoring case)"
+        if not isinstance(value, str | None):
+            return f"the field {field} of its token is not a string"
+        fields[field] = value
+    missing = [name for name in ACCOUNT_CERT_FIELDS if not fields.get(name.lower())]
+    return f"its token has no {', '.join(missing)}, which cloudflared needs" if missing else None
+
+
+def _account_cert_problem(text: str) -> str | None:
+    """Why the pinned cloudflared would not read `text` as an account certificate, or None when it would."""
     # cloudflared refuses a file with more than one token block or an unknown block (credentials/origin_cert.go).
     blocks = ACCOUNT_CERT.findall(text)
     types = [found.group("type") for found in PEM_BEGIN.finditer(text)]
-    token: object = None
-    if len(blocks) == 1 and types.count("ARGO TUNNEL TOKEN") == 1 and set(types) <= PEM_TYPES:
-        try:
-            token = json.loads(base64.b64decode("".join(blocks[0].split()), validate=True))
-        except (binascii.Error, ValueError):  # UnicodeDecodeError and JSONDecodeError are ValueErrors
-            token = None
-    fields = as_object(token)
-    mistyped = any(key.lower() in ACCOUNT_CERT_STRINGS and not isinstance(value, str | None) for key, value in fields.items())
-    if mistyped or not all(isinstance(fields.get(key), str) and fields.get(key) for key in ACCOUNT_CERT_FIELDS):
+    if not (len(blocks) == 1 and types.count("ARGO TUNNEL TOKEN") == 1 and set(types) <= PEM_TYPES):
+        return (
+            "it needs exactly one ARGO TUNNEL TOKEN block, each on its own lines, in base64 broken only by spaces, tabs "
+            "and line breaks, and no block of another kind"
+        )
+    token = _decode_token(blocks[0])
+    return token if isinstance(token, str) else _token_problem(token)
+
+
+def _require_account_cert(text: str, source: Path) -> None:
+    """`text` must be what `cloudflared tunnel login` writes, or a usage error: a published certificate means "logged in"."""
+    problem = _account_cert_problem(text)
+    if problem is not None:
         raise UsageError(
             what=f"{source} is not a Cloudflare account certificate",
-            why="it needs exactly one ARGO TUNNEL TOKEN block, each on its own lines, with the zone, account and API token "
-            "cloudflared needs, and no block of another kind",
+            why=problem,
             fix="pass the cert.pem that `cloudflared tunnel login` wrote (e.g. ~/.cloudflared/cert.pem on another machine)",
         )
 

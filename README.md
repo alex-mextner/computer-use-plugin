@@ -218,7 +218,10 @@ The process substitution (bash, zsh) streams the certificate straight from the o
 the exit code.
 
 The certificate is copied mode 600 into this target's cloudflared directory (a different certificate already there is refused, not
-replaced). It lets its holder create tunnels and DNS records in the account, so treat it like a password.
+replaced). It lets its holder create tunnels and DNS records in the account, so treat it like a password. A file the pinned
+cloudflared would not read is refused before anything is written: base64 broken by anything but spaces, tabs and line breaks, a
+token that is not UTF-8 JSON, or one that sets a field twice in any letter case (`apiToken` and `APITOKEN`: cloudflared matches
+names ignoring case and would read the last).
 
 ### How it runs
 
@@ -248,7 +251,7 @@ replaced). It lets its holder create tunnels and DNS records in the account, so 
 | `doctor` | diagnose the chain end to end and say how to fix it, never restarts (tunnel mode: its own chain, nothing public). Flags: `--local`, `--json` |
 | `connect` | ChatGPT dialog fields, clipboard, live checklist. Flags: `--name` (default: the machine name), `--no-open`, `--no-copy`, `--no-wait`, `--timeout` |
 | `run` | run the stack in the foreground without systemd (development, proofs on scratch ports); `--no-tunnel` (public mode) |
-| `uninstall` | remove the unit files; `--purge` also deletes config, password, tunnel key, OAuth state, logs, binaries and the default cloudflared directory. The shared Desktop Commander, the Cloudflare tunnel and its DNS record are kept (it says so) |
+| `uninstall` | remove the unit files; `--purge` also deletes config, password, tunnel key, OAuth state, logs, binaries and the default cloudflared directory. Without a config, `--purge` also stops and removes the unit files this tool wrote under another `--unit-prefix` (found by their marker line). The shared Desktop Commander, the Cloudflare tunnel and its DNS record are kept (it says so) |
 | `shim`, `quiet` | internal: what the units run. `shim` takes `--external-url`, `--listen-port`, `--upstream-port`, `--log-file` |
 
 As full command lines: `computer chatgpt install`, `computer chatgpt init`, `computer chatgpt login`, `computer chatgpt start`,
