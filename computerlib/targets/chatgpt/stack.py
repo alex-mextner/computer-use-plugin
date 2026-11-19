@@ -103,6 +103,8 @@ def shim(settings: Settings, layout: Layout, launcher: Launcher) -> Process:
             str(settings.proxy_port),
             "--log-file",
             str(layout.access_log),
+            "--oauth-db",
+            str(layout.data_dir / "db"),
         ),
         after="bridge",
         restart_seconds=2,

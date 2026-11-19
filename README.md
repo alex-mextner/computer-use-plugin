@@ -252,7 +252,7 @@ names ignoring case and would read the last).
 | `connect` | ChatGPT dialog fields, clipboard, live checklist. Flags: `--name` (default: the machine name), `--no-open`, `--no-copy`, `--no-wait`, `--timeout` |
 | `run` | run the stack in the foreground without systemd (development, proofs on scratch ports); `--no-tunnel` (public mode) |
 | `uninstall` | remove the unit files; `--purge` also deletes config, password, tunnel key, OAuth state, logs, binaries and the default cloudflared directory. Without a config, `--purge` also stops and removes the unit files this tool wrote under another `--unit-prefix` (found by their marker line). The shared Desktop Commander, the Cloudflare tunnel and its DNS record are kept (it says so) |
-| `shim`, `quiet` | internal: what the units run. `shim` takes `--external-url`, `--listen-port`, `--upstream-port`, `--log-file` |
+| `shim`, `quiet` | internal: what the units run. `shim` takes `--external-url`, `--listen-port`, `--upstream-port`, `--log-file`, `--oauth-db` (the proxy's OAuth store, read only) |
 
 As full command lines: `computer chatgpt install`, `computer chatgpt init`, `computer chatgpt login`, `computer chatgpt start`,
 `computer chatgpt stop`, `computer chatgpt restart`, `computer chatgpt end`, `computer chatgpt status`, `computer chatgpt logs`,
@@ -318,7 +318,9 @@ machine above follows it. **Not proven**: a real ChatGPT tool call through OpenA
 Never written: query strings, bodies, tool arguments, Authorization headers, cookies, passwords, tokens or the full User-Agent.
 `client=` is the User-Agent kind (for example `openai-mcp`) only when a second signal agrees: the call carries a token the proxy
 accepted and that token belongs to an OAuth client registered with `https://chatgpt.com/...` redirect URIs. Anything else is
-`client=unverified`.
+`client=unverified`. The shim learns which client a token belongs to from the token exchange it forwards; for a token it never saw
+issued (one ChatGPT already held before a restart, a reinstall or a lost state directory) it reads the client from mcp-auth-proxy's
+own OAuth store, read only, so a valid ChatGPT token keeps its label.
 
 ### Security
 

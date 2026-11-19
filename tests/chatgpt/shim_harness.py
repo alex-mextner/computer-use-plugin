@@ -123,13 +123,13 @@ class Running:
 
 
 @contextmanager
-def running_shim(tmp: Path, log_file: Path | None = None) -> Generator[Running]:
+def running_shim(tmp: Path, log_file: Path | None = None, oauth_db: Path | None = None) -> Generator[Running]:
     upstream = Upstream()
     stub = ThreadingHTTPServer(("127.0.0.1", 0), _handler(upstream))
     stub.daemon_threads = True
     threading.Thread(target=stub.serve_forever, daemon=True).start()
     target = log_file or tmp / "state" / "access.log"
-    shim = build_server(EXTERNAL, 0, stub.server_address[1], target)
+    shim = build_server(EXTERNAL, 0, stub.server_address[1], target, oauth_db=oauth_db)
     threading.Thread(target=shim.serve_forever, daemon=True).start()
     try:
         yield Running(upstream, shim.server_address[1], stub.server_address[1], target)
@@ -140,8 +140,8 @@ def running_shim(tmp: Path, log_file: Path | None = None) -> Generator[Running]:
         stub.server_close()
 
 
-def jwt(jti: str) -> str:
+def jwt(jti: str, signature: str = "sig") -> str:
     def part(data: dict[str, object]) -> str:
         return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
 
-    return f"{part({'alg': 'none'})}.{part({'jti': jti, 'aud': EXTERNAL})}.sig"
+    return f"{part({'alg': 'none'})}.{part({'jti': jti, 'aud': EXTERNAL})}.{signature}"

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.13
+
+- A ChatGPT token the shim never saw issued keeps its verified label: after a restart, a reinstall or a lost state directory,
+  every ChatGPT call read `client=unverified` until ChatGPT's next token exchange, and a client registered before the shim's table
+  existed was never verified at all. The shim now reads the client of an accepted token that its table cannot place from
+  mcp-auth-proxy's own OAuth store (read only, without its lock, only the pages on the way to the token's keys; a rejected token
+  never triggers a read). The shim unit gains `--oauth-db <data dir>/db`, so `computer chatgpt init` rewrites it (#37).
+
 ## 0.3.12
 
 - `--cloudflare-cert` refuses, with exit 2 and before `cert.pem` is written, a certificate the pinned cloudflared would decode
