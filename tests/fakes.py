@@ -40,18 +40,21 @@ def fake_node(
 def fake_npm(
     directory: Path, *, mode: Literal["ok", "fail", "no_files", "hang"] = "ok", fail_with: str = "", side_effect: str = ""
 ) -> Path:
-    """An `npm` that answers `npm config get` with `$FAKE_NPM_CONFIG` (default `null`, npm's unset) after logging its directory
-    and argv to `npm-config.log`, and otherwise, like `npm ci`, first deletes the prefix's node_modules, then logs its argv, keeps
-    the package-lock.json it found in the prefix as `npm-lock.json` next to itself, and lays out the package files
-    `npm ci --prefix <dir>` would.
+    """An `npm` that answers `npm config get` with `$FAKE_NPM_CONFIG`, else with the `node-options=` line of the file
+    `$NPM_CONFIG_USERCONFIG` names (a relative path resolves against its working directory, as npm's does), else `null` (npm's
+    unset), after logging its directory and argv to `npm-config.log`, and otherwise, like `npm ci`, first deletes the prefix's
+    node_modules, then logs its argv, keeps the package-lock.json it found in the prefix as `npm-lock.json` next to itself, and
+    lays out the package files `npm ci --prefix <dir>` would.
 
     `fail` prints `fail_with` on stderr and exits 1; `no_files` exits 0 without installing; `hang` never returns. `side_effect` is
     a shell snippet run before npm ci touches anything (something else touching the machine while npm is busy); `$prefix` is set.
     """
     start = (
         "#!/bin/sh\n"
-        f'if [ "$1 $2" = "config get" ]; then echo "$PWD $@" >> "{directory}/npm-config.log"; '
-        'echo "${FAKE_NPM_CONFIG:-null}"; exit 0; fi\n'
+        f'if [ "$1 $2" = "config get" ]; then echo "$PWD $@" >> "{directory}/npm-config.log"\n'
+        '  if [ -z "$FAKE_NPM_CONFIG" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then\n'
+        "    sed -n 's/^node-options=//p' \"$NPM_CONFIG_USERCONFIG\"; exit 0; fi\n"
+        '  echo "${FAKE_NPM_CONFIG:-null}"; exit 0; fi\n'
         'os="${npm_config_os:-linux}"; cpu="${npm_config_cpu:-x64}"\n'
         'for arg in "$@"; do if [ "$take" = 1 ]; then prefix="$arg"; fi; take=0; [ "$arg" = "--prefix" ] && take=1\n'
         '  case "$arg" in --os=*) os="${arg#--os=}";; --cpu=*) cpu="${arg#--cpu=}";; esac; done\n'

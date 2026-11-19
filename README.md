@@ -76,8 +76,13 @@ confinement); the downloaded build has none. The shell and file tools are not af
 
 `computer mcp install` (and so `computer claude install` and `computer chatgpt install`) prints a `warning:` when the restriction
 is on and no profile in `/etc/apparmor.d` covers the Chrome write_pdf will launch; `computer chatgpt doctor` shows it as a `[warn]`
-check and `computer claude status` as a `[warn] pdf:` line. Neither changes their exit code, and nothing here changes system
-settings: both fixes need root, following
+check and `computer claude status` as a `[warn] pdf:` line. When several profiles match that Chrome, the most specific one
+decides, as in the kernel: the one that matches more of the path before its first `*` (an exact path matches all of it), and a
+tie applies none. A profile on disk counts only once the kernel lists a profile of that name as loaded, in
+`/sys/kernel/security/apparmor/profiles` (readable by root) or `/sys/kernel/security/apparmor/policy/profiles` (readable by any
+user); when neither can be read or the kernel does not list it, the warning says the coverage is unverified and names the
+`apparmor_parser -r` command that loads it. A profile edited after it was loaded is judged by its file, so reload it after an
+edit. Neither changes their exit code, and nothing here changes system settings: both fixes need root, following
 [Chromium's guide](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md).
 
 1. Recommended: an AppArmor profile for the downloaded build only. Save this as `/etc/apparmor.d/desktop-commander-chrome` and
@@ -107,7 +112,11 @@ Installing a packaged Google Chrome or Chromium does not help while the cache ho
 `node-options` setting as `NODE_OPTIONS`, as it would under npm: when an npmrc sets it (for example `node-options=--use-system-ca`
 behind a TLS-intercepting proxy), it replaces your own `NODE_OPTIONS` for the download instead of being appended, because two
 option sets can conflict (`--use-openssl-ca` with `--use-bundled-ca`) and node then does not start. With no npm setting, your
-`NODE_OPTIONS` is kept.
+`NODE_OPTIONS` is kept. The setting is read as the install's own `npm ci --prefix <tree>` reads its config: run from your
+directory, so a relative `NPM_CONFIG_USERCONFIG` or `NPM_CONFIG_GLOBALCONFIG` resolves there. `--prefix` also moves npm's default
+global npmrc (`etc/npmrc` under node's install prefix) into the tree, so a `node-options` there is not seen: put it in your user
+npmrc, or point `NPM_CONFIG_GLOBALCONFIG` at that file. A global npmrc your npm package names itself (its built-in `globalconfig`)
+is still read.
 
 ## Claude Desktop: `computer claude`
 
@@ -115,12 +124,16 @@ option sets can conflict (`--use-openssl-ca` with `--use-bundled-ca`) and node t
   to the absolute path of this `computer` executable with `mcp serve`, runs `computer mcp install`, and makes sure
   `~/.config/autostart/claude-desktop.desktop` exists, is enabled and starts a program that exists. Every other key of the config
   is preserved, the write is atomic, a timestamped backup is made first, and invalid JSON is refused (exit 2) without touching the
-  file. An autostart entry that is fine is never rewritten (it may carry your own Exec); a disabled one is re-enabled, one whose
-  Exec is missing or names a program that does not exist gets only its Exec line replaced, and an empty file or one without a
-  `[Desktop Entry]` section is replaced; each after a backup. Exec is written with the Desktop Entry spec's quoting and escaping.
-  Claude Desktop is never restarted by this tool: restart it yourself to pick the change up.
+  file. An autostart entry that is fine is never rewritten (it may carry your own Exec; the entry is read and judged right
+  before a repair, so one fixed in the meantime is kept); a disabled one is re-enabled, one whose Exec is missing, cannot
+  be parsed (an unterminated quote) or names a program that does not exist or is not executable gets only its Exec line
+  replaced, and an empty file or one without a `[Desktop Entry]` section is replaced; each after a backup. The Exec written names
+  `/usr/lib/claude-desktop/claude-desktop` when it is executable, else `claude-desktop` found in an absolute PATH entry,
+  quoted and escaped per the Desktop Entry spec. Claude Desktop is never restarted by this tool: restart it yourself to pick the
+  change up.
 - `computer claude status` checks the config entry, the executable, the autostart entry (present, has a `[Desktop Entry]`
-  section, enabled, Exec program exists), and performs a real MCP handshake
+  section, enabled, Exec parses the way GIO parses it when GNOME starts it at login and names an executable program), and
+  performs a real MCP handshake
   (`initialize`, `tools/list`) against the configured command under a minimal environment. Exit 0 healthy, 3 unhealthy.
 - `computer claude uninstall` removes only the `desktop-commander` entry (after a backup); the managed install and the autostart
   entry stay.
@@ -250,6 +263,9 @@ names ignoring case and would read the last).
   401 outside the login pages, the path-suffix form of `/.well-known/oauth-protected-resource`, and an SSE comment on an idle event
   stream so Cloudflare releases the headers. It also writes the access log. It passes request bodies on as they arrive (never
   holding one whole before the proxy has checked the login) and serves at most 128 connections at once, answering more with 503.
+  The proxy does not answer a request (not even with its 401) until it has read a body under 256 KiB, or the first 256 KiB of a
+  chunked one, so that much must arrive within 10 seconds of the headers (408): a paused or trickling client cannot hold a
+  connection slot for the 65-second idle timeout. A body to any path but `/mcp` (OAuth, login) may be at most 64 KiB (413).
 - **cloudflared** runs the named tunnel with `--config`, `--origincert` and `--credentials-file` from this target's directory.
 - Units `computer-chatgpt-{bridge,shim,tunnel}.service` (`--unit-prefix` to rename) run with `Restart=always` and
   `StartLimitIntervalSec=0`: a crash loop or a network that is down at boot never leaves a unit dead for good.

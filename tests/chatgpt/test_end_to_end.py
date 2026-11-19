@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from computerlib.pins import binary_pin
 from computerlib.targets.chatgpt.install import sha256_file
 from computerlib.targets.chatgpt.password import ensure_password, read_password
 from computerlib.targets.chatgpt.settings import Layout, Settings, save_settings
+from computerlib.targets.chatgpt.shim.rules import BODY_SECONDS
 from tests.chatgpt.cli_helpers import free_ports, install_core_stand_in
 from tests.chatgpt.oauth_driver import FORM, OPENAI_UA, Driver
 
@@ -217,3 +219,17 @@ def test_a_wrong_password_is_refused_without_a_bearer_challenge(stack: Stack) ->
     assert b"Invalid password" in reply.body
     assert "www-authenticate" not in reply.headers
     _assert_the_journal_holds_no_request(stack)  # a refused login is no reason to keep its query string
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/.idp/token"])
+def test_a_paused_small_body_is_answered_by_the_body_deadline(stack: Stack, path: str) -> None:
+    """The pinned proxy holds even its 401 to an unauthenticated /mcp until it has read a small body (Go's net/http drains up to
+    256 KiB first), and its token endpoint reads the form whole: without the shim's deadline a client that sends one byte and
+    pauses gets nothing for the 65 s idle timeout, holding a connection slot (#69)."""
+    head = f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n{{"
+    with socket.create_connection(("127.0.0.1", stack.shim_port), timeout=BODY_SECONDS + 5) as sock:
+        sock.sendall(head.encode())
+        started = time.monotonic()
+        answer = sock.recv(4096)
+    assert answer.startswith(b"HTTP/1.1 408 "), answer
+    assert time.monotonic() - started < BODY_SECONDS + 3

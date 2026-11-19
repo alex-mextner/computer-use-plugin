@@ -11,6 +11,13 @@ A. what ChatGPT's connector setup needs and mcp-auth-proxy lacks (RFC 9728 prote
       serves.
    3. Cloudflare's edge holds an event stream's response headers until the first body byte, so the idle standalone stream (GET
       /mcp) gets an SSE comment `: open` after OPEN_COMMENT_SECONDS of upstream silence (the engine asks `wants_open_comment`).
+   4. mcp-auth-proxy (Go net/http) holds every answer to a body it has not read whole: the OAuth endpoints read theirs, and for
+      any other handler that answers first (the 401 to an unauthenticated call) the server reads up to UPSTREAM_DRAIN_BYTES of
+      the rest before it sends the answer. A client that pauses inside such a body would hold a handler slot for the idle
+      timeout (#69), so the engine (asking `body_limit`) wants the first UPSTREAM_DRAIN_BYTES of every body within
+      BODY_SECONDS of the headers (408); a body declared longer is answered at once and is not timed. A body to any path but
+      /mcp, the only one that takes more than a form or a few hundred bytes of JSON, may be at most SMALL_BODY_MAX_BYTES (413):
+      also a percent-encoded /.idp/ path, which the proxy routes decoded, gets that cap.
 B. the access log (see accesslog.py), including the verified client label (see clients.py).
 Which requests are logged: every OAuth step (/.idp/*, /.auth/*), every /mcp call that carries an Authorization header, every 5xx.
 Everything else (discovery polling, scanners, unauthenticated calls) is collapsed to one line per method+path+status per minute
@@ -36,8 +43,20 @@ TOKEN_PATH = "/.idp/token"
 PEEK_MAX_BYTES = 64 * 1024
 CAPTURE_MAX_BYTES = 16 * 1024
 OPEN_COMMENT_SECONDS = 0.25
+BODY_SECONDS = 10.0  # for a timed body from the end of the headers; a client sends it with them
+UPSTREAM_DRAIN_BYTES = 256 * 1024  # Go's maxPostHandlerReadBytes: what net/http reads of an unread body before it answers
+SMALL_BODY_MAX_BYTES = 64 * 1024  # an OAuth registration, token request or login form is a few hundred bytes
 SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_./:-]{1,64}$")
 KNOWN_PATHS = {"/mcp", PRM, "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"}
+
+
+def declared_length(value: str) -> int | None:
+    """A Content-Length value as a number, or None when it is not one. HTTP allows ASCII digits only: str.isdigit() also accepts
+    `²`, which int() refuses, and int() refuses more than 4300 digits, so a longer run reads as a length too big for any cap."""
+    if not (value.isascii() and value.isdigit()):
+        return None
+    digits = value.lstrip("0") or "0"
+    return int(digits) if len(digits) <= 20 else 1 << 64
 
 
 def _token(value: object) -> str:
@@ -84,6 +103,16 @@ class Exchange:
     response_body: bytes | None = None
 
 
+@dataclass(frozen=True)
+class BodyLimit:
+    """What the engine allows a request body: at most `max_bytes` (None: the engine's own cap), and more than `timed_bytes` of
+    it (or all of it) within `seconds` of the end of the headers; a body declared at least `timed_bytes` long is not timed."""
+
+    max_bytes: int | None
+    seconds: float
+    timed_bytes: int
+
+
 class ShimRules:
     def __init__(self, external_url: str, log: RotatingLog | None, clients: ClientTable) -> None:
         self.external_url = external_url.rstrip("/")
@@ -110,6 +139,10 @@ class ShimRules:
         content_type = lowered.get("content-type", "").split(";")[0].strip().lower()
         return content_type == "text/event-stream" and "content-length" not in lowered and "content-encoding" not in lowered
 
+    def body_limit(self, path: str) -> BodyLimit:
+        """The limit for a request body to `path` (the raw request path), see A.4."""
+        return BodyLimit(None if path == "/mcp" else SMALL_BODY_MAX_BYTES, BODY_SECONDS, UPSTREAM_DRAIN_BYTES)
+
     def peek_kind(self, method: str, path: str, request_headers: Mapping[str, str]) -> str:
         """What the engine must copy for `record`: `mcp` (small request body), `learn` (both bodies, capped) or empty."""
         if method != "POST":
@@ -122,8 +155,8 @@ class ShimRules:
 
     @staticmethod
     def _declared_small(headers: Mapping[str, str]) -> bool:
-        length = headers.get("content-length", "")
-        return length.isdigit() and int(length) <= PEEK_MAX_BYTES
+        length = declared_length(headers.get("content-length", ""))
+        return length is not None and length <= PEEK_MAX_BYTES
 
     def record(self, exchange: Exchange) -> None:
         """Log one finished request (or not) and teach the client table from register/token exchanges."""

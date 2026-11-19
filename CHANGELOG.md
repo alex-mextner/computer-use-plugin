@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.7
+
+- `computer claude status` now fails an autostart entry whose Exec has an unterminated quote or ends in a backslash
+  (`Exec="/bin/sh`): it reads Exec with GLib's shell quoting, as GIO does when GNOME starts the entry at login, and GIO refuses
+  such a line, so the entry never started though status called it healthy. `computer claude install` reads the entry right
+  before a repair, after the launcher lookup, and decides on that content, so an Exec fixed in the meantime is kept instead of
+  replaced, and it only writes a packaged launcher into Exec when the launcher is executable (else `claude-desktop` from an
+  absolute PATH entry), so a launcher without its execute bit no longer makes every install repeat the repair with a new
+  backup; with no other launcher, install now says the packaged one lacks its execute bit instead of "not found" (#55).
+- The write_pdf AppArmor warning of `computer mcp install`, `computer chatgpt doctor` and `computer claude status` no longer
+  calls Chrome covered when it is not. A profile on disk counts only once the kernel lists a profile of that name as loaded,
+  read from its per-profile policy directories (any user) or its root-only list; when neither list can be read or the kernel
+  does not list it, the warning says the coverage is unverified and names the `apparmor_parser -r` command that loads the
+  profile. Of several profiles matching Chrome the most specific one decides, as in the kernel, so a generic grant no longer
+  hides an exact profile that denies `userns`, and copies of one profile in several files are one profile: they are no longer
+  read as a conflict, and when one copy does not grant `userns` or attaches nowhere, Chrome is no longer called covered. A
+  comma inside a path glob (`/srv/{a,userns,b} r,`) no longer reads as a `userns` rule, and a literal brace in a path (`[{]`,
+  `\{`) or a header brace right after its flags (`flags=(complain){`) no longer hides the profiles after it or breaks the match.
+  The scan also got faster: a profile's includes are followed only when it attaches to Chrome (#64).
+- A request whose client sends part of a small body and pauses now holds one of the ChatGPT shim's 128 connection slots for
+  at most 10 seconds instead of the 65-second idle timeout. mcp-auth-proxy does not answer until it has read a body under
+  256 KiB, or the first 256 KiB of a chunked one: the OAuth endpoints read theirs whole, and Go's HTTP server reads it before
+  sending even the 401 to an unauthenticated `POST /mcp`. That part of a body must now arrive within 10 seconds of the headers
+  (408), also when it trickles in a byte at a time; a bigger upload to `/mcp` is not timed. A body to any other path (OAuth,
+  login) may be at most 64 KiB (413), also under a percent-encoded path. A stranger who wants to keep every slot busy so the
+  owner's connector gets 503 now has to open about 13 such requests a second instead of 2. A Content-Length made of non-ASCII
+  digits such as `²` is now answered 400 and one of more than 4300 digits 413; both crashed the request handler (#69).
+- A stopped `computer mcp install` no longer leaves npm or the browser download running when the stop lands at an unlucky
+  moment: a SIGTERM, SIGHUP or Ctrl-C while it cleans up after a timeout, or a Ctrl-C the moment npm starts. Those signals are
+  now held while npm or the download runs and acted on where the session is in hand, so its whole session is stopped and reaped
+  before the install exits, instead of writing on into a directory the install then deletes. An install stopped by SIGTERM or
+  SIGHUP still dies of it when a Ctrl-C follows. A cleanup that cannot finish (a child that left the session keeps npm's output
+  open) ends at the next Ctrl-C, or at most 5 seconds after the kill, instead of holding the install lock for good (#48).
+- npm's `node-options` setting for the PDF browser download is now read as the install's own `npm ci --prefix <tree>` reads its
+  config: from your directory, so a relative `NPM_CONFIG_USERCONFIG` or `NPM_CONFIG_GLOBALCONFIG` path is honoured and
+  `--use-system-ca` behind a TLS proxy reaches the download. Like `npm ci`, it no longer sees npm's default global npmrc, which
+  `--prefix` moves into the tree; the README says where to put the setting instead (#48).
+
 ## 0.4.6
 
 - The ChatGPT bridge no longer writes a journal line per request with the OAuth login's query strings (client_id,

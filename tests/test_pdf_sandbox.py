@@ -22,8 +22,10 @@ CACHE = ".claude-server-commander/puppeteer-cache/chrome"
 
 @pytest.fixture
 def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A restricted host (the conftest already points the module at scratch paths) with no packaged browser."""
+    """A restricted host (the conftest already points the module at scratch paths) with no packaged browser, whose list of loaded
+    profiles this user can read."""
     pdf_sandbox.RESTRICTION_FILE.write_text("1\n")
+    pdf_sandbox.LOADED_PROFILES.write_text("")
     (pdf_sandbox.PROFILE_DIR / "tunables").mkdir(parents=True)
     (pdf_sandbox.PROFILE_DIR / "tunables" / "home").write_text(UBUNTU_TUNABLES_HOME)
     monkeypatch.setattr(pdf_sandbox, "SYSTEM_CHROMES", (str(tmp_path / "usr/bin/google-chrome"),))
@@ -42,8 +44,14 @@ def cached_chrome(home: Path, build: str = "linux-157.0.8103.78") -> Path:
     return chrome
 
 
-def profile(name: str, text: str) -> None:
+def profile(name: str, text: str, loaded: bool = True) -> None:
+    """Writes the profile file and, unless `loaded` is False, lists its top-level profiles the way the kernel lists loaded ones:
+    `profile NAME ...` under NAME, a profile named by its path under that path."""
     (pdf_sandbox.PROFILE_DIR / name).write_text(text)
+    if loaded:
+        names = re.findall(r'^profile\s+"?([^"\s]+)|^(/\S+)\s.*\{$', text, re.MULTILINE)
+        with pdf_sandbox.LOADED_PROFILES.open("a") as listing:
+            listing.writelines(f"{named or path} (enforce)\n" for named, path in names)
 
 
 def readme_profile() -> str:
@@ -86,13 +94,17 @@ def test_the_readme_profile_covers_a_real_cached_build(host: Path) -> None:
     assert pdf_sandbox.problem(home) is None
 
 
-def test_a_profile_without_userns_or_with_it_only_in_a_child_profile_does_not_cover(host: Path) -> None:
+@pytest.mark.parametrize(
+    "body",
+    ["  @{exec_path} mr,\n", "  profile inner /usr/bin/x {\n    userns,\n  }\n"],
+    ids=["no-userns", "userns-only-in-a-child"],
+)
+def test_a_profile_without_userns_or_with_it_only_in_a_child_profile_does_not_cover(host: Path, body: str) -> None:
     home = host / "home"
     cached_chrome(home)
-    path = f"{home}/{CACHE}/*/chrome-linux64/chrome"
-    profile("no-userns", f"profile a {path} flags=(unconfined) {{\n  @{{exec_path}} mr,\n}}\n")
-    profile("child", f"profile b {path} {{\n  profile inner /usr/bin/x {{\n    userns,\n  }}\n}}\n")
-    assert pdf_sandbox.problem(home) is not None
+    profile("one", f"profile a {home}/{CACHE}/*/chrome-linux64/chrome flags=(unconfined) {{\n{body}}}\n")
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "profile a in" in found.detail and "does not allow `userns,`" in found.detail
 
 
 def test_a_disabled_profile_does_not_cover(host: Path) -> None:
@@ -207,6 +219,151 @@ def test_a_packaged_browser_is_trusted_but_only_when_the_cache_is_empty(host: Pa
     chrome = cached_chrome(home)
     found = pdf_sandbox.problem(home)
     assert found is not None and str(chrome) in found.detail
+
+
+def test_a_profile_on_disk_the_kernel_does_not_list_is_unverified_coverage(host: Path) -> None:
+    home = home_under_home_dirs(host)
+    profile("desktop-commander-chrome", readme_profile(), loaded=False)
+    found = pdf_sandbox.problem(home)
+    assert found is not None
+    assert found.detail.startswith("write_pdf's Chrome (the Chrome for Testing it downloads into ")
+    assert ") is covered only on disk (unverified): AppArmor restricts unprivileged user namespaces" in found.detail
+    assert f"desktop-commander-chrome in {pdf_sandbox.PROFILE_DIR / 'desktop-commander-chrome'} allows `userns,`" in found.detail
+    assert "but the kernel's loaded profiles do not include it; unless it is loaded, Chrome stops with" in found.detail
+    assert f"as root, load it with `apparmor_parser -r {pdf_sandbox.PROFILE_DIR / 'desktop-commander-chrome'}`" in found.fix
+    pdf_sandbox.LOADED_PROFILES.write_text("snap.firefox.firefox (enforce)\ndesktop-commander-chrome (unconfined)\n")
+    assert pdf_sandbox.problem(home) is None
+
+
+def test_a_profile_whose_loading_cannot_be_confirmed_is_unverified_coverage(host: Path) -> None:
+    # Neither of the kernel's lists can be read: the profile on disk proves nothing about what the kernel enforces.
+    home = home_under_home_dirs(host)
+    profile("desktop-commander-chrome", readme_profile())
+    pdf_sandbox.LOADED_PROFILES.unlink()
+    found = pdf_sandbox.problem(home)
+    assert found is not None
+    assert ") is covered only on disk (unverified): AppArmor restricts unprivileged user namespaces" in found.detail
+    loaded, policy = pdf_sandbox.LOADED_PROFILES, pdf_sandbox.POLICY_PROFILES
+    assert f"whether the kernel loaded it cannot be confirmed (neither {policy} nor {loaded} is readable)" in found.detail
+    assert '"No usable sandbox!"' in found.detail
+
+
+def test_without_root_the_per_profile_policy_directories_confirm_a_loaded_profile(host: Path) -> None:
+    # As a normal user the kernel's list is EACCES; its per-profile directories (one `name` file each) stay readable.
+    home = home_under_home_dirs(host)
+    profile("desktop-commander-chrome", readme_profile())
+    pdf_sandbox.LOADED_PROFILES.unlink()
+    for name, entry in (("firefox", "firefox.3"), ("desktop-commander-chrome", "desktop-commander-chrome.41")):
+        (pdf_sandbox.POLICY_PROFILES / entry).mkdir(parents=True)
+        (pdf_sandbox.POLICY_PROFILES / entry / "name").write_text(f"{name}\n")
+    assert pdf_sandbox.problem(home) is None
+    (pdf_sandbox.POLICY_PROFILES / "desktop-commander-chrome.41" / "name").unlink()
+    (pdf_sandbox.POLICY_PROFILES / "desktop-commander-chrome.41").rmdir()
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "but the kernel's loaded profiles do not include it" in found.detail
+
+
+@pytest.mark.parametrize(
+    ("generic", "exact", "covered"),
+    [("userns,", "deny userns,", False), ("userns,", "capability sys_admin,", False), ("deny userns,", "userns,", True)],
+)
+def test_the_exact_attachment_decides_over_a_generic_one(host: Path, generic: str, exact: str, covered: bool) -> None:
+    home = host / "home"
+    chrome = cached_chrome(home)
+    profile("generic", f"profile generic {home}/** {{\n  {generic}\n}}\n")
+    profile("exact", f"profile exact {chrome} {{\n  {exact}\n}}\n")
+    found = pdf_sandbox.problem(home)
+    assert (found is None) is covered
+    if found is not None:
+        assert f"exact in {pdf_sandbox.PROFILE_DIR / 'exact'}, the most specific profile attaching to it" in found.detail
+
+
+def test_one_profile_in_two_files_is_one_profile_not_a_conflict(host: Path) -> None:
+    # apparmor_parser loads a `.bak` copy too; the later file replaces the profile of the same name, it does not tie with it.
+    home = home_under_home_dirs(host)
+    profile("desktop-commander-chrome", readme_profile())
+    profile("desktop-commander-chrome.bak", readme_profile())
+    assert pdf_sandbox.problem(home) is None
+    # Which copy the kernel holds cannot be told, so one that does not grant `userns`, or attaches elsewhere, decides.
+    profile("desktop-commander-chrome.bak", readme_profile().replace("  userns,\n", ""))
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "is defined differently in" in found.detail
+    profile("desktop-commander-chrome.bak", readme_profile().replace("puppeteer-cache/chrome/*/", "old-cache/*/"))
+    assert pdf_sandbox.problem(home) is not None
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["profile desktop-commander-chrome flags=(unconfined) {", "profile desktop-commander-chrome @{UNSET}/chrome {"],
+    ids=["no-attachment", "attachment-expands-to-nothing"],
+)
+def test_a_same_named_copy_that_attaches_nowhere_makes_the_coverage_doubtful(host: Path, header: str) -> None:
+    # If the kernel holds that copy, nothing attaches to Chrome.
+    home = home_under_home_dirs(host)
+    profile("desktop-commander-chrome", readme_profile())
+    profile("desktop-commander-chrome.bak", f"{header}\n  userns,\n}}\n")
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "is defined differently in" in found.detail
+
+
+def test_a_profile_named_by_a_path_with_variables_is_confirmed_under_its_kernel_name(host: Path) -> None:
+    # apparmor_parser names it with a multi-valued variable written as an alternation and keeps the doubled slash.
+    home = home_under_home_dirs(host)
+    header = f"@{{HOME}}/{CACHE}/*/chrome-linux64/chrome flags=(unconfined) {{\n  userns,\n}}\n"
+    profile("desktop-commander-chrome", header, loaded=False)
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "the kernel's loaded profiles do not include it" in found.detail
+    pdf_sandbox.LOADED_PROFILES.write_text(f"{{/home//*/,/root/}}/{CACHE}/*/chrome-linux64/chrome (unconfined)\n")
+    assert pdf_sandbox.problem(home) is None
+
+
+def test_among_globs_the_longest_literal_prefix_decides_and_a_tie_attaches_neither(host: Path) -> None:
+    home = host / "home"
+    cached_chrome(home)
+    profile("broad", f"profile broad {home}/** {{\n  userns,\n}}\n")
+    profile("narrow", f"profile narrow {home}/{CACHE}/*/chrome-linux64/chrome {{\n}}\n")
+    assert pdf_sandbox.problem(home) is not None
+    profile("narrow", f"profile narrow {home}/{CACHE}/*/chrome-linux64/chrome {{\n  userns,\n}}\n")
+    assert pdf_sandbox.problem(home) is None
+    # The kernel refuses two profiles that match equally specifically ("conflicting profile attachments").
+    profile("twin", f"profile twin {home}/{CACHE}/*/chrome-linux64/chrom? {{\n  userns,\n}}\n")
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "attach to it equally specifically" in found.detail
+
+
+def test_a_comma_inside_a_path_glob_does_not_end_the_rule(host: Path) -> None:
+    home = host / "home"
+    cached_chrome(home)
+    chrome = f"{home}/{CACHE}/*/chrome-linux64/chrome"
+    profile("globs", f"profile g {chrome} {{\n  /srv/{{a,userns,b}} r,\n}}\n")
+    assert pdf_sandbox.problem(home) is not None  # `userns` is one alternative of a file path, not a rule
+    builds = f"{home}/{CACHE}/{{linux-1,linux-157.0.8103.78}}/chrome-linux64/chrome"
+    profile("globs", f"profile g {builds} flags=(attach_disconnected, mediate_deleted) {{\n  /srv/{{a,b}} r, userns,\n}}\n")
+    assert pdf_sandbox.problem(home) is None
+
+
+@pytest.mark.parametrize("brace", ["[{]", "\\{"])
+def test_a_literal_brace_in_an_attachment_path_neither_hides_a_profile_nor_breaks_the_match(host: Path, brace: str) -> None:
+    home = host / "ho{me"
+    cached_chrome(home)
+    written_home = str(home).replace("{", brace)
+    profile(
+        "braces",
+        f"profile other /opt/odd{brace}dir/tool {{\n}}\n"
+        f"profile chrome {written_home}/{CACHE}/*/chrome-linux64/chrome {{\n  userns,\n}}\n",
+    )
+    assert pdf_sandbox.problem(home) is None
+
+
+def test_a_block_brace_right_after_the_flags_list_still_opens_the_profile(host: Path) -> None:
+    home = host / "home"
+    cached_chrome(home)
+    chrome = f"{home}/{CACHE}/*/chrome-linux64/chrome"
+    profile(
+        "glued",
+        f"profile other /usr/bin/other flags=(complain){{\n}}\nprofile chrome {chrome} flags=(unconfined){{\n  userns,\n}}\n",
+    )
+    assert pdf_sandbox.problem(home) is None
 
 
 def test_mcp_install_warns_with_the_fix(host: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
