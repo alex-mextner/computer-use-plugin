@@ -560,7 +560,7 @@ def test_serve_with_stale_pin_exits_5(toolchain: Path, tmp_path: Path, capsys: p
     assert "computer mcp install" in capsys.readouterr().err
 
 
-def test_serve_execs_recorded_node_under_a_minimal_environment(toolchain: Path, tmp_path: Path) -> None:
+def test_serve_runs_recorded_node_under_a_minimal_environment(toolchain: Path, tmp_path: Path) -> None:
     assert main(["mcp", "install"]) == 0
     home = tmp_path / "home"
     # env -i style: no PATH entry for node, so only the recorded absolute path can work.

@@ -145,7 +145,8 @@ def read_log(path: Path) -> list[str]:
 
 def install_core_stand_in(node_dir: Path) -> Path:
     """A managed Desktop Commander install as `computer mcp install` leaves it, whose recorded `node` is the stub MCP server.
-    `computer mcp serve` then execs the stub, so the chain runs the real core launcher end to end. Returns the stand-in node."""
+    `computer mcp serve` then runs the stub behind its relay, so the chain runs the real core launcher end to end. Returns the
+    stand-in node."""
     root = desktop_commander.install_dir()
     entry = root / "node_modules" / DESKTOP_COMMANDER_PACKAGE / "dist" / "index.js"
     entry.parent.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,8 @@ computerlib/            import package; dist name `hyper-computer`, command `com
   desktop_commander.py  managed pinned install (npm ci --ignore-scripts from the lock in data/desktop-commander, install.json,
                         flock) and launch_spec; pins.py is the one pin table (Desktop Commander and the sha256-pinned release
                         binaries of the chatgpt target)
+  childexit.py          exit_like: a wrapper (`chatgpt quiet`, the `mcp serve` relay) ends the way its child ended
+  dc_relay.py           the stdio relay `mcp serve` runs Desktop Commander behind: withholds its feedback tool and survey text
   mcp_probe.py          real MCP handshake used by every adapter's status
   targets/<name>/       one package per target, exposes TARGET (self-registered, no registry to edit)
     <name>/commands/    one module per command exposing COMMAND (mcp: install, serve; claude: install, status, uninstall;

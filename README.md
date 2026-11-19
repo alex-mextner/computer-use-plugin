@@ -50,10 +50,19 @@ login in front of Desktop Commander, and a small shim that adds what ChatGPT's c
   install. It goes into `${XDG_DATA_HOME:-~/.local/share}/computer/desktop-commander` and records the absolute `node` path.
   Idempotent (npm runs again only when the pinned version or the bundled lock changed). Needs `node` and `npm` (exit 127 without
   them, 7 on a network failure).
-- `computer mcp serve` is what a client launches: it replaces itself with the pinned Desktop Commander over stdio, needs
-  no `PATH`, and prints only MCP protocol on stdout. Exit 5 with a fix message if `computer mcp install` has not been run.
-  Desktop Commander runs with `--no-onboarding`: until its welcome page has been opened once in a HOME it may otherwise answer
-  `initialize` only after opening that page with `xdg-open`, which never returns while a newly started browser stays open.
+- `computer mcp serve` is what a client launches: it runs the pinned Desktop Commander over stdio, needs no `PATH`, prints only
+  MCP protocol on stdout and ends the way Desktop Commander ended (its exit status, or the same signal; a signal that would dump
+  core becomes exit 128+N instead), and Desktop Commander never outlives it. Exit 5 with a fix message if `computer mcp install` has
+  not been run. Desktop Commander runs with `--no-onboarding`: until its welcome page has been opened once in a HOME it may
+  otherwise answer `initialize` only after opening that page with `xdg-open`, which never returns while a newly started browser
+  stays open.
+- No client is offered Desktop Commander's feedback channel: `give_feedback_to_desktop_commander` is left out of the tool list
+  and a call to it is answered with an error without starting anything (Desktop Commander's own handler opens the feedback form
+  with `xdg-open` on this computer and waits for it), and the survey request Desktop Commander adds to a tool result when its
+  remote `user_surveys` flag is on is removed before the client sees it. Desktop Commander 0.3.2 has no setting that hides the
+  tool, and its survey opt-out (`feedbackGiven` in its config) is one the model can set back, so `computer mcp serve` relays
+  Desktop Commander's stdio and leaves out exactly these; everything else passes through unchanged.
+  To give the Desktop Commander team feedback, open https://tally.so/r/mKqoKg yourself.
 
 ### PDF output on Ubuntu 23.10+ (AppArmor)
 
