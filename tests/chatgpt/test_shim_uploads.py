@@ -636,3 +636,21 @@ def test_mcp_bodies_keep_the_general_cap(tmp_path: Path) -> None:
         shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
         assert shim.request("POST", "/mcp", body=body)[0] == 200
     assert [seen.body for seen in shim.upstream.seen] == [body]
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/.idp/token"])
+@pytest.mark.parametrize(
+    ("declared", "status"), [(b"\xb2", b"400"), (b"1" + b"0" * 5000, b"413")], ids=["superscript", "5001-digits"]
+)
+def test_a_content_length_int_cannot_read_gets_a_4xx_and_never_reaches_the_upstream(
+    tmp_path: Path, path: str, declared: bytes, status: bytes
+) -> None:
+    """`²` (latin-1 0xB2, as the header arrives) is a digit to str.isdigit() but not to int(), and int() refuses more than 4300
+    digits: both crashed the handler. A run of ASCII digits that long is a length too big for any cap."""
+    with running_shim(tmp_path) as shim:
+        with socket.create_connection(("127.0.0.1", shim.port), timeout=5) as sock:
+            sock.sendall(f"POST {path} HTTP/1.1\r\nHost: x\r\n".encode() + b"Content-Length: " + declared + b"\r\n\r\n")
+            head = _read_head(sock)
+        time.sleep(0.2)
+    assert head.startswith(b"HTTP/1.1 " + status + b" "), head
+    assert shim.upstream.seen == []

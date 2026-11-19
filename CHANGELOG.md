@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.7
 
 - `computer claude status` now fails an autostart entry whose Exec has an unterminated quote or ends in a backslash
   (`Exec="/bin/sh`): it reads Exec with GLib's shell quoting, as GIO does when GNOME starts the entry at login, and GIO refuses
@@ -14,17 +14,19 @@
   read from its per-profile policy directories (any user) or its root-only list; when neither list can be read or the kernel
   does not list it, the warning says the coverage is unverified and names the `apparmor_parser -r` command that loads the
   profile. Of several profiles matching Chrome the most specific one decides, as in the kernel, so a generic grant no longer
-  hides an exact profile that denies `userns`, and two copies of one profile are no longer read as a conflict. A comma inside a
-  path glob (`/srv/{a,userns,b} r,`) no longer reads as a `userns` rule, and a literal brace in a path (`[{]`, `\{`) or a
-  header brace right after its flags (`flags=(complain){`) no longer hides the profiles after it or breaks the match. The scan
-  also got faster: a profile's includes are followed only when it attaches to Chrome (#64).
+  hides an exact profile that denies `userns`, and copies of one profile in several files are one profile: they are no longer
+  read as a conflict, and when one copy does not grant `userns` or attaches nowhere, Chrome is no longer called covered. A
+  comma inside a path glob (`/srv/{a,userns,b} r,`) no longer reads as a `userns` rule, and a literal brace in a path (`[{]`,
+  `\{`) or a header brace right after its flags (`flags=(complain){`) no longer hides the profiles after it or breaks the match.
+  The scan also got faster: a profile's includes are followed only when it attaches to Chrome (#64).
 - A request whose client sends part of a small body and pauses now holds one of the ChatGPT shim's 128 connection slots for
   at most 10 seconds instead of the 65-second idle timeout. mcp-auth-proxy does not answer until it has read a body under
   256 KiB, or the first 256 KiB of a chunked one: the OAuth endpoints read theirs whole, and Go's HTTP server reads it before
   sending even the 401 to an unauthenticated `POST /mcp`. That part of a body must now arrive within 10 seconds of the headers
   (408), also when it trickles in a byte at a time; a bigger upload to `/mcp` is not timed. A body to any other path (OAuth,
   login) may be at most 64 KiB (413), also under a percent-encoded path. A stranger who wants to keep every slot busy so the
-  owner's connector gets 503 now has to open about 13 such requests a second instead of 2 (#69).
+  owner's connector gets 503 now has to open about 13 such requests a second instead of 2. A Content-Length made of non-ASCII
+  digits such as `²` is now answered 400 and one of more than 4300 digits 413; both crashed the request handler (#69).
 - A stopped `computer mcp install` no longer leaves npm or the browser download running when the stop lands at an unlucky
   moment: a SIGTERM, SIGHUP or Ctrl-C while it cleans up after a timeout, or a Ctrl-C the moment npm starts. Those signals are
   now held while npm or the download runs and acted on where the session is in hand, so its whole session is stopped and reaped

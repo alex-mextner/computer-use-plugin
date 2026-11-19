@@ -391,15 +391,20 @@ def _enabled_profiles(profiles: Path) -> list[Path]:
     return [path for path in files if not (profiles / "disable" / path.name).exists()]
 
 
+_ATTACHES_NOWHERE = re.compile(r"(?!)")
+
+
 def _file_attachments(path: Path, tunables: dict[str, list[str]]) -> list[_Attachment]:
-    """Every glob a top-level profile of one profile file attaches to."""
+    """Every glob a top-level profile of one profile file attaches to. A profile that attaches to nothing (no attachment, or one
+    whose variables expand to nothing) still gets one entry that never matches: as a copy of a same-named profile elsewhere it is
+    a copy that does not attach to Chrome, which `_ambiguous` must see."""
     lines = _lines(path)
     variables = _variables(lines, {name: list(values) for name, values in tunables.items()})
     found: list[_Attachment] = []
     for name, attachment, body in _top_level_profiles(lines):
         names = frozenset(listed for listed in (name, _kernel_name(name, variables)) if listed is not None)
-        globs = _expand(attachment, variables) if attachment is not None else []
-        found += [_Attachment(name, names, path, _glob_regex(glob), tuple(body)) for glob in globs]
+        patterns = [_glob_regex(glob) for glob in _expand(attachment, variables)] if attachment is not None else []
+        found += [_Attachment(name, names, path, pattern, tuple(body)) for pattern in patterns or [_ATTACHES_NOWHERE]]
     return found
 
 

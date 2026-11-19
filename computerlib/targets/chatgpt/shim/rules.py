@@ -50,6 +50,15 @@ SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_./:-]{1,64}$")
 KNOWN_PATHS = {"/mcp", PRM, "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"}
 
 
+def declared_length(value: str) -> int | None:
+    """A Content-Length value as a number, or None when it is not one. HTTP allows ASCII digits only: str.isdigit() also accepts
+    `²`, which int() refuses, and int() refuses more than 4300 digits, so a longer run reads as a length too big for any cap."""
+    if not (value.isascii() and value.isdigit()):
+        return None
+    digits = value.lstrip("0") or "0"
+    return int(digits) if len(digits) <= 20 else 1 << 64
+
+
 def _token(value: object) -> str:
     return value if isinstance(value, str) and SAFE_TOKEN.match(value) else "?"
 
@@ -146,8 +155,8 @@ class ShimRules:
 
     @staticmethod
     def _declared_small(headers: Mapping[str, str]) -> bool:
-        length = headers.get("content-length", "")
-        return length.isdigit() and int(length) <= PEEK_MAX_BYTES
+        length = declared_length(headers.get("content-length", ""))
+        return length is not None and length <= PEEK_MAX_BYTES
 
     def record(self, exchange: Exchange) -> None:
         """Log one finished request (or not) and teach the client table from register/token exchanges."""

@@ -292,6 +292,20 @@ def test_one_profile_in_two_files_is_one_profile_not_a_conflict(host: Path) -> N
     assert pdf_sandbox.problem(home) is not None
 
 
+@pytest.mark.parametrize(
+    "header",
+    ["profile desktop-commander-chrome flags=(unconfined) {", "profile desktop-commander-chrome @{UNSET}/chrome {"],
+    ids=["no-attachment", "attachment-expands-to-nothing"],
+)
+def test_a_same_named_copy_that_attaches_nowhere_makes_the_coverage_doubtful(host: Path, header: str) -> None:
+    # If the kernel holds that copy, nothing attaches to Chrome.
+    home = home_under_home_dirs(host)
+    profile("desktop-commander-chrome", readme_profile())
+    profile("desktop-commander-chrome.bak", f"{header}\n  userns,\n}}\n")
+    found = pdf_sandbox.problem(home)
+    assert found is not None and "is defined differently in" in found.detail
+
+
 def test_a_profile_named_by_a_path_with_variables_is_confirmed_under_its_kernel_name(host: Path) -> None:
     # apparmor_parser names it with a multi-valued variable written as an alternation and keeps the doubled slash.
     home = home_under_home_dirs(host)

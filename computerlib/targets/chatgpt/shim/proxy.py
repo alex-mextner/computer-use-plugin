@@ -41,6 +41,7 @@ from computerlib.targets.chatgpt.shim.rules import (
     BodyLimit,
     Exchange,
     ShimRules,
+    declared_length,
 )
 
 HOP_BY_HOP = frozenset(
@@ -364,17 +365,14 @@ class _Handler(BaseHTTPRequestHandler):
     def _request_body(self, limit: BodyLimit, keep: int) -> _RequestBody | None:
         """The request body to stream upstream; None after answering 4xx for one whose framing is unusable or declared too big."""
         max_bytes = MAX_REQUEST_BYTES if limit.max_bytes is None else limit.max_bytes
-        declared = self.headers.get("Content-Length", "")
-        length: int | None
-        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            length = None
-        elif not declared:
-            length = 0
-        elif not declared.isdigit() or int(declared) > max_bytes:
-            self._reply_error(400 if not declared.isdigit() else 413)
+        chunked = "chunked" in self.headers.get("Transfer-Encoding", "").lower()
+        length = None if chunked else declared_length(self.headers.get("Content-Length", "") or "0")
+        if not chunked and length is None:
+            self._reply_error(400)
             return None
-        else:
-            length = int(declared)
+        if length is not None and length > max_bytes:
+            self._reply_error(413)
+            return None
         timed = length is None or length < limit.timed_bytes
         deadline = time.monotonic() + limit.seconds if timed else None
         return _RequestBody(self.rfile, self.connection, length, keep, max_bytes, deadline, limit.timed_bytes)
