@@ -16,6 +16,7 @@ import argparse
 import getpass
 import json
 import os
+import shlex
 import stat
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -55,7 +56,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 def _not_executable(name: str, path: Path) -> Check:
     # The digest survives a backup restore that drops the exec bit, but systemd then cannot start the unit.
-    return Check(name, False, f"{path} is not executable", f"run `computer chatgpt init` (or chmod 755 {path})")
+    return Check(name, False, f"{path} is not executable", f"run `computer chatgpt init` (or chmod 755 {shlex.quote(str(path))})")
 
 
 def _binary(ctx: Context, name: str) -> Check:
@@ -105,7 +106,9 @@ def _runtime_key(ctx: Context) -> Check:
         return Check("tunnel runtime key", False, f"nothing stored in {path}", "run `computer chatgpt login --key-stdin`")
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
-        return Check("tunnel runtime key", False, f"{path} is mode {mode:o}, readable by others", f"chmod 600 {path}")
+        return Check(
+            "tunnel runtime key", False, f"{path} is mode {mode:o}, readable by others", f"chmod 600 {shlex.quote(str(path))}"
+        )
     return Check("tunnel runtime key", True, f"present in {path}, mode 600")
 
 
@@ -164,7 +167,9 @@ def _password(ctx: Context) -> Check:
         return Check("login password", False, f"no PASSWORD in {path}", "run `computer chatgpt init`")
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
-        return Check("login password", False, f"{path} is mode {mode:o}, readable by others", f"chmod 600 {path}")
+        return Check(
+            "login password", False, f"{path} is mode {mode:o}, readable by others", f"chmod 600 {shlex.quote(str(path))}"
+        )
     return Check("login password", True, f"present in {path}, mode 600")
 
 

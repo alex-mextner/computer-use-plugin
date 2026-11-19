@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.15
+
+- `computer chatgpt doctor` prints its `chmod 600` and `chmod 755` fix hints with the path shell-quoted, so a hint for a data or
+  config directory with a space or shell syntax such as `$(...)` in its path does what it says when pasted, and runs nothing
+  else (#38).
+
 ## 0.3.14
 
 - The write_pdf AppArmor check no longer crashes `computer mcp install`, `computer claude status` or `computer chatgpt doctor`

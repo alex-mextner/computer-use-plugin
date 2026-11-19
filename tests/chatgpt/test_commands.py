@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -216,6 +218,28 @@ def test_doctor_fails_a_checksum_correct_binary_without_the_exec_bit_and_init_re
     run_cli(capsys, *init_args())
     assert stat.S_IMODE(binary.stat().st_mode) == 0o755
     assert "[ok] mcp-auth-proxy installed" in run_cli(capsys, "doctor", "--local").out
+
+
+def test_doctors_chmod_hints_paste_safely_for_a_path_with_a_space_and_shell_syntax(
+    capsys: pytest.CaptureFixture[str], machine: FakeMachine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    odd = tmp_path / "my home $(touch pwned)"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(odd / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(odd / "data"))
+    _init(capsys, monkeypatch)
+    password, binary = layout().password_file, layout().bin_dir / "mcp-auth-proxy"
+    password.chmod(0o644)
+    binary.chmod(0o644)
+    out = run_cli(capsys, "doctor", "--local").out
+    hints = [
+        "chmod 600 " + out.split("chmod 600 ", 1)[1].splitlines()[0],
+        "chmod 755 " + out.split("chmod 755 ", 1)[1].splitlines()[0].removesuffix(")"),
+    ]
+    for hint in hints:  # pasted into a shell as printed
+        subprocess.run(["sh", "-c", hint], cwd=tmp_path, check=True)
+    assert stat.S_IMODE(password.stat().st_mode) == 0o600
+    assert stat.S_IMODE(binary.stat().st_mode) == 0o755
+    assert not (tmp_path / "pwned").exists()
 
 
 def test_doctor_points_each_local_probe_at_the_unit_that_runs_it(
