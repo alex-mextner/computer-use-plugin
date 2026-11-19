@@ -254,9 +254,8 @@ class _RejectingOnceDrained(_Rejecting):
     drained = threading.Event()
 
     def do_POST(self) -> None:
-        self.drained.wait(
-            timeout=5
-        )  # past the client's 3 s: a shim that never waits on its client fails the test, never hangs it
+        # past the client's 3 s: a shim that never waits on its client fails the test, never hangs it
+        self.drained.wait(timeout=5)
         self.drained.clear()
         super().do_POST()
 
@@ -316,21 +315,24 @@ def test_many_requests_on_one_keep_alive_connection_leave_no_threads_behind(tmp_
 
 def test_the_shim_turns_nagle_off_on_every_connection_it_accepts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Headers and body are two writes; with Nagle on, the body waited for the client's delayed ACK, about 40 ms each (#51).
-    Checked on the accepted socket, not by timing requests: a busy runner can be slower than that delay with the fix on (#66)."""
-    nodelay: list[int] = []
+    Checked on the accepted sockets, not by timing requests: a busy runner can be slower than that delay with the fix on (#66).
+    The server thread only records what it sees; a failed assert there would be swallowed by `handle_error`."""
+    accepted: list[int | None] = []  # TCP_NODELAY per accepted connection, None for a request that is no socket
     finish_request = ShimServer.finish_request
 
     def recording(server: ShimServer, request: Request, client_address: tuple[str, int]) -> None:
         finish_request(server, request, client_address)
-        assert isinstance(request, socket.socket)
-        nodelay.append(request.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+        option = request.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) if isinstance(request, socket.socket) else None
+        accepted.append(option)
 
     monkeypatch.setattr(ShimServer, "finish_request", recording)
+    connections = 3
     with running_shim(tmp_path) as shim:
         shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
-        assert shim.request("POST", "/mcp", body=b"{}")[0] == 200
-        assert _until(lambda: bool(nodelay), 5), "the shim never finished the connection"
-    assert nodelay[0], "TCP_NODELAY is off on the socket the shim accepted"
+        for _ in range(connections):
+            assert shim.request("POST", "/mcp", body=b"{}")[0] == 200  # each on a connection of its own
+        assert _until(lambda: len(accepted) == connections, 5), f"the shim finished {len(accepted)} of {connections}"
+    assert all(accepted), f"TCP_NODELAY per accepted socket: {accepted}"
 
 
 @pytest.mark.skipif(
@@ -413,6 +415,21 @@ def test_a_paused_upload_the_upstream_rejects_gets_its_401_at_once_and_frees_its
         _assert_a_paused_upload_gets_its_401_at_once_and_frees_its_slot(port, _upload_head(MAX_REQUEST_BYTES) + sent)
 
 
+def _signal_when_drained(monkeypatch: pytest.MonkeyPatch, drained: threading.Event) -> None:
+    """Set `drained` when the shim has read all the client sent so far and is about to wait for more, so a test can act at that
+    point (answer, or send the next piece) however the threads are scheduled."""
+    body_wait = proxy._RequestBody._wait  # pyright: ignore[reportPrivateUsage]
+
+    def waiting(body: proxy._RequestBody) -> None:  # pyright: ignore[reportPrivateUsage]
+        client = select.poll()  # not select(): the accepted socket's descriptor can be past FD_SETSIZE on a busy runner
+        client.register(body._client, select.POLLIN)  # pyright: ignore[reportPrivateUsage]
+        if body.upstream is not None and not body._buffered() and not client.poll(0):  # pyright: ignore[reportPrivateUsage]
+            drained.set()
+        body_wait(body)
+
+    monkeypatch.setattr(proxy._RequestBody, "_wait", waiting)  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.parametrize(
     "sent",
     [b"1", b"1;ext", b"1\r\nx\r", b"1\r\nx\r\n0\r\nX-Trailer: 1"],
@@ -426,19 +443,32 @@ def test_a_chunked_upload_paused_inside_a_framing_line_gets_its_401_at_once_and_
     monkeypatch.setattr(ShimServer, "max_handlers", 1)
     drained = threading.Event()
     monkeypatch.setattr(_RejectingOnceDrained, "drained", drained)
-    body_wait = proxy._RequestBody._wait  # pyright: ignore[reportPrivateUsage]
-
-    def waiting(body: proxy._RequestBody) -> None:  # pyright: ignore[reportPrivateUsage]
-        client = select.poll()  # not select(): the accepted socket's descriptor can be past FD_SETSIZE on a busy runner
-        client.register(body._client, select.POLLIN)  # pyright: ignore[reportPrivateUsage]
-        if body.upstream is not None and not body._buffered() and not client.poll(0):  # pyright: ignore[reportPrivateUsage]
-            drained.set()
-        body_wait(body)
-
-    monkeypatch.setattr(proxy._RequestBody, "_wait", waiting)  # pyright: ignore[reportPrivateUsage]
+    _signal_when_drained(monkeypatch, drained)
     head = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
     with rejecting_shim(tmp_path, _RejectingOnceDrained) as port:
         _assert_a_paused_upload_gets_its_401_at_once_and_frees_its_slot(port, head + sent)
+
+
+def test_a_chunked_upload_whose_framing_lines_arrive_in_pieces_reaches_the_upstream_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A framing line is read only as far as the client has sent it (#56): its pieces must still make one line. Each piece goes
+    out once the shim has read the one before, so the size line `10`, the chunk end and the trailer each come in two reads."""
+    drained = threading.Event()
+    _signal_when_drained(monkeypatch, drained)
+    data = b"0123456789abcdef"
+    pieces = [b"1", b"0\r\n" + data + b"\r", b"\n0\r\nX-Tr", b"ailer: 1\r\n\r\n"]
+    with running_shim(tmp_path) as shim:
+        shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
+        with socket.create_connection(("127.0.0.1", shim.port), timeout=5) as sock:
+            sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" + pieces[0])
+            for piece in pieces[1:]:
+                assert drained.wait(timeout=5), f"the shim never waited for more before {piece!r}"
+                drained.clear()
+                sock.sendall(piece)
+            head = _read_head(sock)
+    assert head.startswith(b"HTTP/1.1 200 "), head
+    assert [seen.body for seen in shim.upstream.seen] == [data]
 
 
 def test_a_chunked_upload_reaches_the_upstream_whole(tmp_path: Path) -> None:

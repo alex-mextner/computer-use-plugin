@@ -386,8 +386,10 @@ uv sync --group dev
 uv run --group dev ruff check . && uv run --group dev pyright && uv run --group dev pytest -q
 COMPUTER_INTEGRATION=1 COMPUTER_PROXY_BIN=/path/to/mcp-auth-proxy uv run --group dev pytest tests/chatgpt/test_end_to_end.py
 COMPUTER_INTEGRATION=1 COMPUTER_TUNNEL_BIN=/path/to/tunnel-client uv run --group dev pytest tests/chatgpt/test_tunnel_end_to_end.py
+COMPUTER_BENCHMARK=1 uv run --group dev pytest tests/chatgpt/test_shim_uploads.py -k benchmark
 ```
 
 Tests are hermetic (scratch HOME, no network, fake systemctl/cloudflared/npm). The integration tests start the real `mcp-auth-proxy`
 (with `computer mcp serve` as its child) or the real `tunnel-client` against a stand-in control plane, on scratch ports. Never develop
-against a running install: use a scratch `HOME` and other ports (see AGENTS.md).
+against a running install: use a scratch `HOME` and other ports (see AGENTS.md). Timing benchmarks (the shim's keep-alive latency)
+run only with `COMPUTER_BENCHMARK=1`: a loaded machine would fail them with nothing broken.

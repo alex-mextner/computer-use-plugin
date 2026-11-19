@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2
 
 - A stranger can no longer make a valid ChatGPT token read `client=unverified` after a shim restart: the shim refused any page
   of mcp-auth-proxy's OAuth store bigger than 1 MiB, so one open registration with a multi-MiB redirect URI list that landed next
