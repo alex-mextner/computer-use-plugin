@@ -1,8 +1,6 @@
 """`computer chatgpt quiet -- COMMAND [ARGS...]` (internal; the bridge unit runs it): run COMMAND with its stdout cut down to what
-is worth a journal line. stderr is untouched and the exit status is the command's own: when the command dies of a signal, quiet
-dies of the same signal, so systemd sees a stop by SIGTERM as clean (returned as a status, -15 became exit 241, a failed unit).
-A signal that writes a core (SIGSEGV, SIGABRT, ...) or that quiet cannot re-raise (libc-reserved, 32 and 33 on glibc) becomes the
-shell's exit status 128+N instead: re-raising a core signal would dump quiet's memory, which holds lines the journal must not see.
+is worth a journal line. stderr is untouched and quiet ends the way the command ended (`childexit.exit_like`: its status, or death
+by the same signal unless that signal writes a core, which would dump quiet's memory, holding lines the journal must not see).
 
 Why: mcp-auth-proxy writes one JSON access line per request to stdout and the supergateway it starts for the stdio backend writes
 a copy of EVERY JSON-RPC message (tool arguments and results included) plus chatter per request. The journal is no place for that
@@ -21,23 +19,10 @@ import sys
 
 from agenttools_errors import UsageError
 
+from computerlib.childexit import exit_like
 from computerlib.commandtree import Command
 
 TROUBLE_WORDS = ("error", "warn", "fail", "exception", "fatal", "panic", "refused", "timeout")
-CORE_SIGNALS = frozenset(
-    {
-        signal.SIGQUIT,
-        signal.SIGILL,
-        signal.SIGTRAP,
-        signal.SIGABRT,
-        signal.SIGBUS,
-        signal.SIGFPE,
-        signal.SIGSEGV,
-        signal.SIGXCPU,
-        signal.SIGXFSZ,
-        signal.SIGSYS,
-    }
-)
 
 
 def keep_line(line: str) -> bool:
@@ -53,23 +38,6 @@ def keep_line(line: str) -> bool:
 
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("argv", nargs=argparse.REMAINDER, help="the command to run, after --")
-
-
-def exit_like(code: int) -> int:
-    """End this process the way the child ended (`code` is a Popen returncode): its own status, or death by the same signal.
-    Returns the exit status when that signal is not re-raised (see the module docstring for which)."""
-    if code >= 0:
-        return code
-    signum = -code
-    if signum not in CORE_SIGNALS:
-        try:
-            if signum != signal.SIGKILL:  # SIGKILL's disposition is always the default; setting it raises OSError
-                signal.signal(signum, signal.SIG_DFL)
-        except OSError:  # libc-reserved: cannot be reset, so quiet cannot die the same way
-            pass
-        else:
-            signal.raise_signal(signum)  # returns only when an inherited signal mask blocks it
-    return 128 + signum
 
 
 def run(args: argparse.Namespace) -> int:

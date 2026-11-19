@@ -1,16 +1,17 @@
-"""`computer mcp serve`: replace this process with the pinned Desktop Commander over stdio.
+"""`computer mcp serve`: run the pinned Desktop Commander over stdio behind the relay that withholds its feedback channel.
 
-INVARIANTS: nothing is ever printed to stdout (it is the MCP protocol stream; errors go to stderr via `guard`); needs no PATH, the
-node binary recorded by `computer mcp install` is exec'd by absolute path; Desktop Commander always runs with `--no-onboarding`.
+INVARIANTS: nothing but MCP protocol is ever written to stdout (errors go to stderr via `guard`); needs no PATH, the node binary
+recorded by `computer mcp install` is started by absolute path; Desktop Commander always runs with `--no-onboarding`; every
+client reaches it through `dc_relay.relay`, which hides `give_feedback_to_desktop_commander` and DC's survey requests (#24).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 from computerlib.commandtree import Command
+from computerlib.dc_relay import relay
 from computerlib.desktop_commander import launch_spec
 
 # Until Desktop Commander has opened its welcome page once in a HOME (a fresh HOME has no ~/.claude-server-commander/config.json
@@ -26,7 +27,7 @@ NO_ONBOARDING = "--no-onboarding"
 def run(_args: argparse.Namespace) -> int:
     spec = launch_spec()
     sys.stdout.flush()
-    os.execv(spec.node, [str(spec.node), str(spec.entry), NO_ONBOARDING])
+    return relay(spec.node, [str(spec.entry), NO_ONBOARDING])
 
 
 COMMAND = Command(

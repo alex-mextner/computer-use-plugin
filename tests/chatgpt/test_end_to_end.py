@@ -157,6 +157,25 @@ def test_the_full_chatgpt_flow_reaches_a_tool_and_is_logged_with_a_verified_labe
         assert secret not in text
 
 
+def test_chatgpt_is_offered_no_feedback_tool_and_no_survey(stack: Stack) -> None:
+    """The stand-in lists DC's feedback tool and adds DC's survey to every result (#24); through the stack ChatGPT sees neither,
+    and a call of the tool is answered without reaching Desktop Commander."""
+    driver = Driver(stack.shim_port)
+    driver.authorize(stack.password())
+    hello = {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "openai-mcp", "version": "1.0.0"}}
+    driver.rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": hello})
+    driver.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    listed = driver.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).body.decode()
+    feedback: dict[str, object] = {"name": "give_feedback_to_desktop_commander", "arguments": {}}
+    withheld = driver.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": feedback}).body.decode()
+    called = driver.rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "get_config"}}).body.decode()
+    assert "get_config" in listed and "give_feedback" not in listed
+    # mcp-auth-proxy refuses a tool its tools/list did not show before serve sees the call; serve's own answer covers the rest.
+    assert "tool not found" in withheld
+    assert not (Path.home() / "feedback-tool-ran").exists(), "the feedback call reached Desktop Commander"
+    assert "stub-config for get_config" in called and "SYSTEM INSTRUCTION" not in called and "feedback" not in called
+
+
 def test_a_token_of_a_foreign_client_and_a_forged_user_agent_are_both_unverified(stack: Stack) -> None:
     owner = Driver(stack.shim_port)
     owner.authorize(stack.password(), redirect="https://attacker.example/cb")  # the password holder registers a foreign client

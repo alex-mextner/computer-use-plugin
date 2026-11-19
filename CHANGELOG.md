@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.5
+
+- A chat client can no longer open a browser on your computer through Desktop Commander's feedback tool, or hang a tool call
+  until that browser is closed: `computer mcp serve` (used by Claude and ChatGPT alike) leaves
+  `give_feedback_to_desktop_commander` out of the tool list and answers a call to it with an error without running `xdg-open`,
+  and removes the survey request Desktop Commander adds to a tool result when its remote `user_surveys` flag is on, so the model
+  is never asked to run that survey. Desktop Commander 0.3.2 has no setting that hides the tool, so serve now relays its stdio
+  instead of replacing itself with it; everything else passes through unchanged, serve still ends the way Desktop Commander
+  ended, and Desktop Commander stops when serve is killed. A request nested more than 256 levels deep is answered with an
+  invalid-request error instead of being passed on, the same on every Python version (#24).
+
 ## 0.4.4
 
 - `computer chatgpt doctor --heal` keeps the limits it promises when things are slow or go wrong: a local probe now gives up
