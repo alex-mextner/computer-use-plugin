@@ -4,7 +4,8 @@ The shim used to read every body whole (up to 32 MiB) before mcp-auth-proxy coul
 limit: 64 uploads that hold back their last bytes kept about 2 GiB. Bodies now stream to the upstream piece by piece and the
 number of connections served at once is capped (more get a 503). Review regressions: a 401 the proxy sends before the body is
 through must still reach the client at once (not a 502, and not only after a paused client sends more), and a refusal's journal
-line on a gone stderr must not stop the accept loop.
+line on a gone stderr must not stop the accept loop. The open OAuth endpoints read a body whole before answering, so theirs get a
+small size cap and a deadline for the whole body instead (#69).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from computerlib.targets.chatgpt.shim import build_server, proxy
+from computerlib.targets.chatgpt.shim import build_server, proxy, rules
 from computerlib.targets.chatgpt.shim.proxy import MAX_REQUEST_BYTES, Request, ShimServer
 from tests.chatgpt.shim_harness import EXTERNAL, running_shim
 
@@ -510,3 +511,128 @@ def test_an_upload_whose_client_leaves_midway_is_never_forwarded_as_complete(tmp
         sock.close()
         time.sleep(0.3)
         assert all(len(seen.body) < int(seen.headers["content-length"]) for seen in shim.upstream.seen)
+
+
+WAITED_FOR_PATHS = ["/.idp/token", "/.idp/register", "/.auth/login", "/mcp"]
+
+
+def _small_head(path: str, framing: str) -> bytes:
+    length = "Transfer-Encoding: chunked" if framing == "chunked" else "Content-Length: 100"
+    return f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{length}\r\n\r\n".encode()
+
+
+@pytest.mark.parametrize("framing", ["length", "chunked"])
+@pytest.mark.parametrize("path", WAITED_FOR_PATHS)
+def test_a_paused_body_the_upstream_waits_for_gets_a_408_and_frees_its_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, framing: str
+) -> None:
+    """The OAuth endpoints read a body whole before they answer, and for a small or chunked body Go's net/http reads it before
+    any answer (the 401 to an unauthenticated /mcp too): no early answer frees the slot, and a client that sent part of the body
+    and paused held it for the 65 s idle timeout (#69). The stand-in upstream reads the whole body before it answers."""
+    monkeypatch.setattr(ShimServer, "max_handlers", 1)
+    monkeypatch.setattr(rules, "BODY_SECONDS", 1.0)
+    partial = b"5\r\n{" if framing == "chunked" else b"{"
+    with running_shim(tmp_path) as shim:
+        shim.upstream.routes[path] = (200, {"Content-Type": "application/json"}, b"{}")
+        paused = socket.create_connection(("127.0.0.1", shim.port), timeout=4)  # far below the 65 s idle timeout
+        try:
+            paused.sendall(_small_head(path, framing) + partial)  # and then nothing more
+            started = time.monotonic()
+            head = _read_head(paused)
+            assert head.startswith(b"HTTP/1.1 408 "), head
+            assert time.monotonic() - started < 3, "the deadline answered late"
+
+            def served() -> bool:
+                try:
+                    return shim.request("POST", path, body=b"{}")[0] == 200
+                except OSError:
+                    return False
+
+            # the paused client is still connected: only the shim itself can have given the one slot back
+            assert _until(served, 3), "the paused body kept the only handler slot"
+        finally:
+            paused.close()
+
+
+@pytest.mark.parametrize("path", WAITED_FOR_PATHS)
+def test_a_body_that_trickles_in_is_cut_at_the_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """A byte every 0.2 s never trips an idle timeout; the deadline counts from the headers."""
+    monkeypatch.setattr(rules, "BODY_SECONDS", 1.0)
+    stop = threading.Event()
+    with running_shim(tmp_path) as shim, socket.create_connection(("127.0.0.1", shim.port), timeout=5) as sock:
+        sock.sendall(_small_head(path, "length"))
+
+        def trickle() -> None:
+            try:
+                while not stop.wait(0.2):
+                    sock.sendall(b" ")
+            except OSError:
+                pass  # the shim closes once it has answered
+
+        sender = threading.Thread(target=trickle, daemon=True)
+        sender.start()
+        try:
+            head = _read_head(sock)
+        finally:
+            stop.set()
+            sender.join(timeout=5)
+    assert head.startswith(b"HTTP/1.1 408 "), head
+
+
+@pytest.mark.parametrize(
+    ("framing", "size", "timed"),
+    [("length", 1023, True), ("length", 1024, False), ("chunked", 1024, True), ("chunked", 1025, False)],
+)
+def test_only_the_part_of_a_body_the_upstream_waits_for_is_timed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, framing: str, size: int, timed: bool
+) -> None:
+    """Go's net/http answers at once when at least maxPostHandlerReadBytes of a declared body are unread, and reads at most one
+    byte more than that of a chunked one: a big upload (a file a tool writes) that slows down past there must not be cut, and a
+    pause right at the boundary still holds the answer. UPSTREAM_DRAIN_BYTES stands for that limit, patched to 1024 here."""
+    monkeypatch.setattr(rules, "BODY_SECONDS", 0.5)
+    monkeypatch.setattr(rules, "UPSTREAM_DRAIN_BYTES", 1024)
+    body = b"x" * size
+    if framing == "chunked":
+        head = b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        first, rest = f"{size:x}\r\n".encode() + body + b"\r\n", b"0\r\n\r\n"
+    else:
+        head = f"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: {size}\r\n\r\n".encode()
+        first, rest = body[:1], body[1:]
+    with running_shim(tmp_path) as shim:
+        shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
+        with socket.create_connection(("127.0.0.1", shim.port), timeout=5) as sock:
+            sock.sendall(head + first)
+            time.sleep(1.0)  # twice the deadline
+            try:
+                sock.sendall(rest)
+            except OSError:
+                pass  # a timed body was answered and closed at the deadline
+            answer = _read_head(sock)
+    assert answer.startswith(b"HTTP/1.1 408 " if timed else b"HTTP/1.1 200 "), answer
+    assert [seen.body for seen in shim.upstream.seen if seen.body == body] == ([] if timed else [body])
+
+
+@pytest.mark.parametrize("path", ["/.idp/token", "/.idp/register", "/.auth/login", "/%2Eidp/token", "/elsewhere"])
+def test_a_body_to_any_path_but_mcp_over_the_cap_gets_a_413_and_never_reaches_the_upstream(tmp_path: Path, path: str) -> None:
+    """Only the head and the chunk-size line are sent: the shim must refuse on those, and an unread body would make its close a
+    reset that can drop the 413 before the client reads it. The percent-encoded path is the token endpoint to the proxy."""
+    too_big = rules.SMALL_BODY_MAX_BYTES + 1
+    declared = f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {too_big}\r\n\r\n".encode()
+    heads: list[bytes] = []
+    with running_shim(tmp_path) as shim:
+        for sent in (declared, _small_head(path, "chunked") + f"{too_big:x}\r\n".encode()):
+            with socket.create_connection(("127.0.0.1", shim.port), timeout=5) as sock:
+                sock.sendall(sent)
+                heads.append(_read_head(sock))
+        time.sleep(0.2)
+    assert all(head.startswith(b"HTTP/1.1 413 ") for head in heads), heads
+    assert shim.upstream.seen == []
+
+
+def test_mcp_bodies_keep_the_general_cap(tmp_path: Path) -> None:
+    """The small cap is for every other path: an MCP call may carry a file far bigger than a token request."""
+    body = b"x" * (rules.SMALL_BODY_MAX_BYTES * 4)
+    with running_shim(tmp_path) as shim:
+        shim.upstream.routes["/mcp"] = (200, {"Content-Type": "application/json"}, b"{}")
+        assert shim.request("POST", "/mcp", body=body)[0] == 200
+    assert [seen.body for seen in shim.upstream.seen] == [body]

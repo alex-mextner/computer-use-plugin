@@ -259,6 +259,9 @@ names ignoring case and would read the last).
   401 outside the login pages, the path-suffix form of `/.well-known/oauth-protected-resource`, and an SSE comment on an idle event
   stream so Cloudflare releases the headers. It also writes the access log. It passes request bodies on as they arrive (never
   holding one whole before the proxy has checked the login) and serves at most 128 connections at once, answering more with 503.
+  The proxy does not answer a request (not even with its 401) until it has read a body under 256 KiB, or the first 256 KiB of a
+  chunked one, so that much must arrive within 10 seconds of the headers (408): a paused or trickling client cannot hold a
+  connection slot for the 65-second idle timeout. A body to any path but `/mcp` (OAuth, login) may be at most 64 KiB (413).
 - **cloudflared** runs the named tunnel with `--config`, `--origincert` and `--credentials-file` from this target's directory.
 - Units `computer-chatgpt-{bridge,shim,tunnel}.service` (`--unit-prefix` to rename) run with `Restart=always` and
   `StartLimitIntervalSec=0`: a crash loop or a network that is down at boot never leaves a unit dead for good.

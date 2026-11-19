@@ -18,6 +18,13 @@
   path glob (`/srv/{a,userns,b} r,`) no longer reads as a `userns` rule, and a literal brace in a path (`[{]`, `\{`) or a
   header brace right after its flags (`flags=(complain){`) no longer hides the profiles after it or breaks the match. The scan
   also got faster: a profile's includes are followed only when it attaches to Chrome (#64).
+- A request whose client sends part of a small body and pauses now holds one of the ChatGPT shim's 128 connection slots for
+  at most 10 seconds instead of the 65-second idle timeout. mcp-auth-proxy does not answer until it has read a body under
+  256 KiB, or the first 256 KiB of a chunked one: the OAuth endpoints read theirs whole, and Go's HTTP server reads it before
+  sending even the 401 to an unauthenticated `POST /mcp`. That part of a body must now arrive within 10 seconds of the headers
+  (408), also when it trickles in a byte at a time; a bigger upload to `/mcp` is not timed. A body to any other path (OAuth,
+  login) may be at most 64 KiB (413), also under a percent-encoded path. A stranger who wants to keep every slot busy so the
+  owner's connector gets 503 now has to open about 13 such requests a second instead of 2 (#69).
 
 ## 0.4.6
 

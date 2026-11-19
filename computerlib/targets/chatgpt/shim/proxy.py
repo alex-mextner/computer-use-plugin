@@ -6,14 +6,16 @@ about.
 INVARIANTS: the shim is the public entry point and the proxy authenticates only once it has the request, so nothing a client sends
 before that may grow memory: a request body is passed on piece by piece (one STREAM_CHUNK at a time, plus the copy of at most
 PEEK_MAX_BYTES the rules ask for); an upstream answer that comes before the body is through is relayed at once, also while the
-client pauses; and at most MAX_HANDLERS connections are served at once, more are answered 503 from the accept loop without a
-thread. An unframed (streamed) response is relayed through a bounded buffer: a client that stops reading stalls the
-upstream instead of growing memory, and a client that goes away (also while the stream is idle) makes the shim shut the upstream
-connection and end the helper thread. Hop-by-hop headers (RFC 9110 7.6.1) are not forwarded in either direction; rules never
-delay or change what is forwarded except the three documented changes (challenge header, protected-resource path, idle SSE
-comment); a logging failure never touches a request; an upstream failure is a 502 and one journal line per minute, as is a
-refused connection. A request with more than one Authorization header is answered 400 and never forwarded, so the label can only
-name the credential the proxy checked.
+client pauses; a body the upstream holds its answer for is held to the rules' `body_limit` (a size cap, and a deadline for the
+part the upstream waits for, answered 408), so pausing inside one keeps a handler only until that deadline; and at most
+MAX_HANDLERS connections are served at once, more are answered 503 from the accept loop without a thread. An unframed (streamed)
+response is relayed through a bounded buffer: a client that stops reading stalls the upstream instead of growing memory, and a
+client that goes away (also while the stream is idle) makes the shim shut the upstream connection and end the helper thread.
+Hop-by-hop headers (RFC 9110 7.6.1) are not forwarded in either direction; rules never delay or change what is forwarded except
+the three documented changes (challenge header, protected-resource path, idle SSE comment), and refuse a body only by its size
+and how long it takes (the body limit); a logging failure never touches a request; an upstream failure is a 502 and one journal
+line per minute, as is a refused connection. A request with more than one Authorization header is answered 400 and never
+forwarded, so the label can only name the credential the proxy checked.
 NOTE: a generic engine belongs in agent-tools/lib (L2 work); this is the target-specific minimum until it ships, kept to the same
 hook points so the swap is local to this file.
 """
@@ -36,6 +38,7 @@ from computerlib.targets.chatgpt.shim.rules import (
     CAPTURE_MAX_BYTES,
     OPEN_COMMENT_SECONDS,
     PEEK_MAX_BYTES,
+    BodyLimit,
     Exchange,
     ShimRules,
 )
@@ -104,8 +107,8 @@ class _UpstreamAnswered(Exception):
 
 
 class _BodyError(Exception):
-    """The client's request body cannot be forwarded whole; `status` is what the shim answers (400 bad framing, 413 too big) or
-    499 (the client went away or stalled past the idle timeout)."""
+    """The client's request body cannot be forwarded whole; `status` is what the shim answers (400 bad framing, 408 not whole by
+    its deadline, 413 too big) or 499 (the client went away or stalled past the idle timeout)."""
 
     def __init__(self, status: int) -> None:
         super().__init__(status)
@@ -114,14 +117,28 @@ class _BodyError(Exception):
 
 class _RequestBody:
     """A request body read from the client as the upstream takes it, so the shim never holds it whole (#29). `length` is None for
-    a chunked body, which is passed on chunked. Keeps a copy only while the body is at most `keep` bytes, for the rules."""
+    a chunked body, which is passed on chunked. Keeps a copy only while the body is at most `keep` bytes, for the rules. A
+    chunked body may grow to `max_bytes`; with a `deadline` (time.monotonic), more than `timed_bytes` of it (or all of it) must
+    have come by then."""
 
-    def __init__(self, rfile: BufferedReader, client: socket.socket, length: int | None, keep: int) -> None:
+    def __init__(
+        self,
+        rfile: BufferedReader,
+        client: socket.socket,
+        length: int | None,
+        keep: int,
+        max_bytes: int,
+        deadline: float | None,
+        timed_bytes: int,
+    ) -> None:
         self.length = length
         self.upstream: socket.socket | None = None  # while set, an answer from it ends the body (see `_wait`)
         self._rfile = rfile
         self._client = client
         self._keep = keep
+        self._max_bytes = max_bytes
+        self._deadline = deadline
+        self._timed_bytes = timed_bytes
         self._kept: list[bytes] = []
         self._size = 0
 
@@ -141,19 +158,35 @@ class _RequestBody:
     def _wait(self) -> None:
         """Return when the next read of the client cannot block. A client that pauses must not keep an early upstream answer
         (the 401 to an unauthenticated upload) waiting until the idle timeout, holding a handler slot: the upstream is polled
-        together with the client, and its answer raises `_UpstreamAnswered`."""
+        together with the client, and its answer raises `_UpstreamAnswered`. Past the deadline, while the upstream still waits
+        for the timed part, it raises `_BodyError(408)`, also for a client that keeps trickling bytes, which an idle timeout
+        never catches (#69)."""
         if self.upstream is None:
             return
+        deadline = self._deadline if self._size <= self._timed_bytes else None
         buffered = self._buffered()
+        timeout, by_deadline = (0.0, False) if buffered else self._client_timeout(deadline)
         poller = select.poll()  # not select(): a busy shim may hold descriptors past FD_SETSIZE
         poller.register(self._client, select.POLLIN)
         poller.register(self.upstream, select.POLLIN)
-        timeout = self._client.gettimeout()
-        ready = {fd for fd, _ in poller.poll(0 if buffered else None if timeout is None else timeout * 1000)}
+        ready = {fd for fd, _ in poller.poll(None if timeout is None else timeout * 1000)}
         if self.upstream.fileno() in ready:
             raise _UpstreamAnswered
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _BodyError(408)
         if not buffered and not ready:
-            raise _BodyError(499)  # idle past the handler's timeout, as a blocking read would have timed out
+            # the deadline's timeout also when poll's millisecond rounding woke it just short of it; otherwise idle past the
+            # handler's timeout, as a blocking read would have timed out
+            raise _BodyError(408 if by_deadline else 499)
+
+    def _client_timeout(self, deadline: float | None) -> tuple[float | None, bool]:
+        """How long to wait for the client's next bytes: the handler's idle timeout, or what is left before `deadline` when that
+        is sooner (then True)."""
+        idle = self._client.gettimeout()
+        if deadline is None:
+            return idle, False
+        left = max(0.0, deadline - time.monotonic())
+        return (left, True) if idle is None or left <= idle else (idle, False)
 
     def _buffered(self) -> bool:
         """True when `rfile` already holds client bytes (the socket then says nothing about them). Peeks with the socket
@@ -212,7 +245,7 @@ class _RequestBody:
                 while self._readline(1024).strip():  # trailers
                     pass
                 return
-            if self._size + size > MAX_REQUEST_BYTES:
+            if self._size + size > self._max_bytes:
                 raise _BodyError(413)
             yield from self._read(size)
             self._readline(8)
@@ -312,7 +345,7 @@ class _Handler(BaseHTTPRequestHandler):
         request_headers = {name.lower(): value for name, value in self.headers.items()}
         kind = rules.peek_kind(self.command, path, request_headers)
         keep = PEEK_MAX_BYTES if kind == "mcp" else CAPTURE_MAX_BYTES if kind == "learn" else 0
-        body = self._request_body(keep)
+        body = self._request_body(rules.body_limit(path), keep)
         if body is None:
             return
         exchange = Exchange(self.command, path, 0, 0, request_headers)
@@ -328,18 +361,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 
-    def _request_body(self, keep: int) -> _RequestBody | None:
+    def _request_body(self, limit: BodyLimit, keep: int) -> _RequestBody | None:
         """The request body to stream upstream; None after answering 4xx for one whose framing is unusable or declared too big."""
-        encoding = self.headers.get("Transfer-Encoding", "").lower()
-        length = self.headers.get("Content-Length", "")
-        if "chunked" in encoding:
-            return _RequestBody(self.rfile, self.connection, None, keep)
-        if not length:
-            return _RequestBody(self.rfile, self.connection, 0, keep)
-        if not length.isdigit() or int(length) > MAX_REQUEST_BYTES:
-            self._reply_error(400 if not length.isdigit() else 413)
+        max_bytes = MAX_REQUEST_BYTES if limit.max_bytes is None else limit.max_bytes
+        declared = self.headers.get("Content-Length", "")
+        length: int | None
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            length = None
+        elif not declared:
+            length = 0
+        elif not declared.isdigit() or int(declared) > max_bytes:
+            self._reply_error(400 if not declared.isdigit() else 413)
             return None
-        return _RequestBody(self.rfile, self.connection, int(length), keep)
+        else:
+            length = int(declared)
+        timed = length is None or length < limit.timed_bytes
+        deadline = time.monotonic() + limit.seconds if timed else None
+        return _RequestBody(self.rfile, self.connection, length, keep, max_bytes, deadline, limit.timed_bytes)
 
     def _reply_error(self, status: int, text: bytes = b"") -> None:
         self.send_response_only(status)
