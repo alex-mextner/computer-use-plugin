@@ -52,6 +52,12 @@ class McpSession:
 
     def reply(self, request_id: int, method: str, timeout: float) -> dict[str, object]:
         """The `result` of the response to `request_id`, a request already sent (`method` names it in a failure)."""
+        message = self.answer(request_id, method, timeout)
+        assert is_object(message.get("result")), f"{method} failed: {message}"
+        return as_dict(message["result"])
+
+    def answer(self, request_id: object, method: str, timeout: float) -> dict[str, object]:
+        """The whole response (result or error) whose id is `request_id`; earlier lines with another id are skipped."""
         assert self.proc.stdout is not None
         fd = self.proc.stdout.fileno()
         deadline = time.monotonic() + timeout
@@ -61,9 +67,8 @@ class McpSession:
                 self._buffer[:] = rest
                 with suppress(ValueError):
                     message = as_dict(json.loads(raw))
-                    if message.get("id") == request_id and "method" not in message:
-                        assert is_object(message.get("result")), f"{method} failed: {message}"
-                        return as_dict(message["result"])
+                    if "id" in message and message["id"] == request_id and "method" not in message:
+                        return message
             remaining = deadline - time.monotonic()
             ready, _, _ = select.select([fd], [], [], max(remaining, 0))
             assert remaining > 0 and ready, f"no answer to {method} within {timeout} s"

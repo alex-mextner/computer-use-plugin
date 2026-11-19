@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.6
 
 - The ChatGPT bridge no longer writes a journal line per request with the OAuth login's query strings (client_id,
   redirect_uri, state): mcp-auth-proxy logs its access records to stderr, which `quiet` passed through untouched. `quiet` now
@@ -15,12 +15,17 @@
   so adopting it by `--tunnel-name` needs `--force-takeover` instead of passing as "no live connections". The hostname is now
   routed by the id of the tunnel that was checked, not by its name: cloudflared resolves a name through a `credentials-file`
   named in its config first, so with `--cloudflared-dir` at such a config the record could point at another tunnel; the
-  command `--skip-dns` prints to run by hand now names this target's binary, config and certificate and takes the id from
-  `$COMPUTER_TUNNEL_ID` (it does not run while that is unset). An old credentials file without a TunnelID (written by older
-  cloudflared releases) no longer ends in a dead end: as `<tunnel id>.json` it is taken and copied to `<tunnel name>.json`
-  with the TunnelID added, and an old `<tunnel name>.json` is refused with a fix that works (copy the original under the name
-  cloudflared gave it, `<tunnel id>.json`, next to it and re-run), since such tunnels may have no credentials to fetch again
-  (#46).
+  command `--skip-dns` prints to run by hand now names this target's binary, config and certificate, reads the id from the
+  TunnelID of the tunnel's `<name>.json` when it runs (it stops when that is no tunnel id, and an id left in the shell is never
+  used) and drops an exported `TUNNEL_FORCE_PROVISIONING_DNS`, which cloudflared reads as `--overwrite-dns`. An old
+  credentials file without a TunnelID (written by older cloudflared releases) no longer ends in a dead end: as
+  `<tunnel id>.json` it is taken and copied to `<tunnel name>.json` with the TunnelID added, and an old `<tunnel name>.json` is
+  refused with a fix that works (copy the original under the name cloudflared gave it, `<tunnel id>.json`, next to it and
+  re-run), since such tunnels may have no credentials to fetch again (#46).
+- `computer mcp serve` keeps answering after a request nested past its 256-level cap whose id is itself deeply nested: the
+  invalid-request answer echoed that id, which could fail to encode and end the thread reading the client, freezing the session.
+  An answer now echoes only an id JSON-RPC allows (a string, a finite number or null) and says null otherwise, and a request
+  too deep for this Python's JSON parser to read gets the invalid-request error code on every Python version (#73).
 
 ## 0.4.5
 

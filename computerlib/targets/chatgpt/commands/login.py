@@ -366,9 +366,8 @@ def setup_tunnel(
     tunnel_id = _ensure_tunnel(cloudflare, name, hostname, adopt=adopt, force_takeover=force_takeover, domain=settings.domain)
     if skip_dns:
         print(
-            f"dns: skipped; route it yourself: point {hostname} at tunnel {name} by its id, not its name: first set "
-            "COMPUTER_TUNNEL_ID to that id in your shell (Cloudflare dashboard, Zero Trust > Networks > Tunnels), then run: "
-            f"{cloudflare.manual_route_command(hostname)}"
+            f"dns: skipped; route it yourself: point {hostname} at tunnel {name} by its id, not its name (the command reads the "
+            f"id from {name}.json in {cloudflare.directory}), then run: {cloudflare.manual_route_command(name, hostname)}"
         )
         return True
     return _route(

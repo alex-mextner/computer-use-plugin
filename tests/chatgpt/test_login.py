@@ -149,16 +149,21 @@ def test_skip_dns_never_touches_the_zone(capsys: pytest.CaptureFixture[str], acc
     # would read ~/.cloudflared/config.yml, whose credentials-file may resolve the name to another tunnel.
     own = layout().cloudflared_dir
     hint = f"{layout().bin_dir / 'cloudflared'} tunnel --config {own / 'config.yml'} --origincert {own / 'cert.pem'} route dns"
-    assert f'{hint} "${{COMPUTER_TUNNEL_ID:?set COMPUTER_TUNNEL_ID to the tunnel id}}" {HOST}' in result.out
+    assert f'env -u TUNNEL_FORCE_PROVISIONING_DNS {hint} "$tunnel_id" {HOST}' in result.out
     assert "0000000000aa" not in result.out
+
+
+def _paste(command: str, variables: dict[str, str] | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, **(variables or {})}
+    return subprocess.run(["bash", "-c", command], cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
 
 
 def test_the_route_command_skip_dns_prints_never_reaches_a_tunnel_by_name(
     capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path
 ) -> None:
-    """Pasted without an id, the printed command must not run: cloudflared would take any non-UUID word for a name and resolve
-    it through the config's credentials-file (here another tunnel's); a leftover generic TUNNEL_ID does not count. With
-    COMPUTER_TUNNEL_ID set it routes to that id."""
+    """The printed command routes by the TunnelID of this tunnel's credentials file, read when it runs: a stale id in the
+    shell cannot redirect it, and a file without a UUID there stops it before cloudflared, which would take any other word for
+    a name and resolve it through the config's credentials-file (here another tunnel's)."""
     fake_cloudflared.recreated(account, "other", OTHER_ID)
     other_credentials = tmp_path / "other.json"
     other_credentials.write_text(json.dumps({**LEGACY, "TunnelID": OTHER_ID}))
@@ -168,21 +173,32 @@ def test_the_route_command_skip_dns_prints_never_reaches_a_tunnel_by_name(
     result = run_cli(capsys, "login", "--skip-dns")
     assert result.code == 0, result.err
     command = next(line for line in result.out.splitlines() if line.startswith("dns: skipped")).split(" then run: ", 1)[1]
-    env = {key: value for key, value in os.environ.items() if key not in ("COMPUTER_TUNNEL_ID", "TUNNEL_ID")}
-    for unset in (env, {**env, "COMPUTER_TUNNEL_ID": ""}, {**env, "TUNNEL_ID": OTHER_ID}):
-        pasted = subprocess.run(["bash", "-c", command], env=unset, capture_output=True, text=True, timeout=60, check=False)
-        assert pasted.returncode != 0 and "set COMPUTER_TUNNEL_ID to the tunnel id" in pasted.stderr
+    credentials = own / "my-tunnel.json"
+    bound = credentials.read_text()
+    credentials.chmod(0o600)  # written read-only
+    for unusable in (json.dumps({**LEGACY, "TunnelID": "other"}), json.dumps(LEGACY)):
+        credentials.write_text(unusable)
+        assert _paste(command).returncode != 0
+    credentials.unlink()
+    assert _paste(command).returncode != 0
     assert not any(" route " in call for call in _calls(account))
-    assert fake_cloudflared.routes(account) == {}
-    tunnel_id = _tunnel_id_in(own / "my-tunnel.json")
-    routed = subprocess.run(
-        ["bash", "-c", command],
-        env={**env, "COMPUTER_TUNNEL_ID": tunnel_id},
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    credentials.write_text(bound)
+    # A stale id in the shell is not read, an exported TUNNEL_FORCE_PROVISIONING_DNS cannot replace a record elsewhere, and a
+    # `uuid` planted where the command is pasted (or on PYTHONPATH) cannot hand it another tunnel's id.
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "uuid.py").write_text(f"def UUID(_):\n    return {OTHER_ID!r}\n")
+    stale = {
+        "COMPUTER_TUNNEL_ID": OTHER_ID,
+        "TUNNEL_ID": OTHER_ID,
+        "TUNNEL_FORCE_PROVISIONING_DNS": "true",
+        "PYTHONPATH": str(hostile),
+    }
+    fake_cloudflared.existing_record(account, HOST, "someone-elses-tunnel")
+    assert _paste(command, stale).returncode != 0
+    assert fake_cloudflared.routes(account) == {HOST: "someone-elses-tunnel"}
+    (account / "routes.json").write_text("{}")
+    routed = _paste(command, stale, cwd=hostile)
     assert routed.returncode == 0, routed.stderr
     assert fake_cloudflared.routes(account) == {HOST: "my-tunnel"}
 

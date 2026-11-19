@@ -166,9 +166,9 @@ domain); both are saved, so a re-run needs no flags.
    `--machine-name`, delete the stale tunnel, or adopt it by naming it with `--tunnel-name`. The hostname is routed by the id of
    the tunnel checked above, never by its name: cloudflared resolves a name through a `credentials-file` named in its config
    first, which may be another tunnel's (so the command `--skip-dns` prints to run by hand names this target's binary, config
-   and certificate and takes the id from `$COMPUTER_TUNNEL_ID`, refusing to run while it is unset or empty). A NEW DNS record
-   is created without a question; an EXISTING record that points elsewhere is replaced only after you confirm (`--yes` answers
-   yes; without consent install stops with exit 2).
+   and certificate, reads the id from the tunnel's `<name>.json` when it runs and stops when that holds no tunnel id, and drops
+   an exported `TUNNEL_FORCE_PROVISIONING_DNS`). A NEW DNS record is created without a question; an EXISTING record that points
+   elsewhere is replaced only after you confirm (`--yes` answers yes; without consent install stops with exit 2).
    cloudflared's certificate, tunnel credentials and `config.yml` live in this target's own directory
    (`~/.config/computer/chatgpt/cloudflared`, mode 700; `--cloudflared-dir` to choose). `~/.cloudflared` is never read or written unless
    you point `--cloudflared-dir` at it, so a tunnel that already runs on this machine is left alone.

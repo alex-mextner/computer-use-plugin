@@ -28,6 +28,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -318,14 +319,19 @@ class Cloudflare:
     def _tunnel(self, *rest: str) -> list[str]:
         return [str(self.binary), "tunnel", "--config", str(self.config), "--origincert", str(self.cert), *rest]
 
-    def manual_route_command(self, hostname: str) -> str:
+    def manual_route_command(self, name: str, hostname: str) -> str:
         """The `route dns` a user runs by hand (--skip-dns): this target's binary, config and certificate, and the tunnel by
         id, since a bare `cloudflared` reads ~/.cloudflared/config.yml, whose credentials-file may resolve a name to another
-        tunnel. No id is printed: the shell takes it from $COMPUTER_TUNNEL_ID (a name of this tool's, so no leftover generic
-        variable passes) and stops when it is unset or empty, because any word that is not a UUID (an unedited placeholder
-        too) is such a name to cloudflared."""
-        tunnel = '"${COMPUTER_TUNNEL_ID:?set COMPUTER_TUNNEL_ID to the tunnel id}"'
-        return f"{shlex.join(self._tunnel('route', 'dns'))} {tunnel} {shlex.quote(hostname)}"
+        tunnel. No id is printed: the command reads the TunnelID of `<name>.json` when it runs (the file setup bound to the
+        tunnel, so no stale shell variable can pick another one) and stops before cloudflared when that is not a UUID, since any
+        other word is a name to cloudflared. That Python runs isolated (-I): the directory the command is pasted in and
+        PYTHONPATH could otherwise supply a `json` or `uuid` that prints another tunnel's id. An exported
+        TUNNEL_FORCE_PROVISIONING_DNS is dropped: cloudflared reads it as --overwrite-dns, which would replace a record pointing
+        elsewhere."""
+        read_id = "import json, sys, uuid; print(uuid.UUID(json.load(open(sys.argv[1]))['TunnelID']))"
+        tunnel_id = shlex.join([sys.executable, "-I", "-c", read_id, str(self.credentials(name))])
+        route = shlex.join(["env", "-u", "TUNNEL_FORCE_PROVISIONING_DNS", *self._tunnel("route", "dns")])
+        return f'tunnel_id="$({tunnel_id})" && {route} "$tunnel_id" {shlex.quote(hostname)}'
 
     def logged_in(self) -> bool:
         return self.cert.is_file()
