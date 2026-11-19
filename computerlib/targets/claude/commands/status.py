@@ -81,6 +81,16 @@ def _check_server(report: list[tuple[bool, str]]) -> None:
         report.append((True, f"handshake: {summary}"))
 
 
+def _server_home() -> Path:
+    """The HOME Desktop Commander gets at login (the entry's env.HOME, else this user's); write_pdf's Chrome lives under it."""
+    try:
+        current = config.load()
+    except AgentToolError:
+        return Path.home()
+    spec = as_dict(config.entry(current)) if current is not None else {}
+    return Path(_autostart_environment(spec.get("env"))["HOME"])
+
+
 def run(_args: argparse.Namespace) -> int:
     report: list[tuple[bool, str]] = []
     _check_server(report)
@@ -91,7 +101,7 @@ def run(_args: argparse.Namespace) -> int:
     for ok, line in report:
         print(f"[{'ok' if ok else 'FAIL'}] {line}")
     print(f"[info] Claude Desktop running: {'yes' if claude_running() else 'no'}")
-    sandbox = pdf_sandbox.problem()
+    sandbox = pdf_sandbox.problem(_server_home())
     if sandbox is not None:
         print(f"[warn] pdf: {sandbox.detail}")
         print(f"       fix: {sandbox.fix}")

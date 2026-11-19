@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.14
+
+- The write_pdf AppArmor check no longer crashes `computer mcp install`, `computer claude status` or `computer chatgpt doctor`
+  when a profile includes a directory you cannot read: that include now gives no grant, so the check warns. It also reads a line
+  with several rules (`userns, deny userns,`) rule by rule, so the deny wins; it no longer counts a child profile nested in an
+  unrelated profile as covering Chrome; and `computer claude status` looks for Chrome under the HOME the Claude entry gives Desktop
+  Commander (its `env.HOME`), not only under yours (#57).
+
 ## 0.3.13
 
 - A ChatGPT token the shim never saw issued keeps its verified label: after a restart, a reinstall or a lost state directory,

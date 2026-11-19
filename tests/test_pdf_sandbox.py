@@ -136,6 +136,38 @@ def test_a_grant_or_deny_from_an_included_local_override_counts(host: Path) -> N
     assert pdf_sandbox.problem(home) is not None
 
 
+def test_an_unreadable_included_directory_is_no_grant_and_never_raises(host: Path) -> None:
+    home = host / "home"
+    cached_chrome(home)
+    site = pdf_sandbox.PROFILE_DIR / "site.d"
+    site.mkdir()
+    (site / "grant").write_text("userns,\n")
+    profile("via-dir", f"profile v {home}/{CACHE}/*/chrome-linux64/chrome {{\n  include <site.d>\n}}\n")
+    assert pdf_sandbox.problem(home) is None
+    site.chmod(0)
+    try:
+        assert pdf_sandbox.problem(home) is not None  # rules this user cannot read are not a grant
+    finally:
+        site.chmod(0o755)
+
+
+def test_a_deny_on_the_same_line_as_the_grant_wins(host: Path) -> None:
+    home = host / "home"
+    cached_chrome(home)
+    profile("one-line", f"profile l {home}/{CACHE}/*/chrome-linux64/chrome {{\n  userns, deny userns,\n}}\n")
+    assert pdf_sandbox.problem(home) is not None
+    profile("one-line", f"profile l {home}/{CACHE}/*/chrome-linux64/chrome {{\n  capability sys_admin, userns,\n}}\n")
+    assert pdf_sandbox.problem(home) is None
+
+
+def test_a_child_profile_is_not_a_global_attachment(host: Path) -> None:
+    home = host / "home"
+    cached_chrome(home)
+    chrome = f"{home}/{CACHE}/*/chrome-linux64/chrome"
+    profile("nested", f"profile other /usr/bin/other {{\n  profile chrome {chrome} {{\n    userns,\n  }}\n}}\n")
+    assert pdf_sandbox.problem(home) is not None
+
+
 def test_only_the_build_desktop_commander_launches_is_checked(host: Path) -> None:
     # It takes the highest build in numeric order (157 > 99), so a profile for that one alone is enough.
     home = host / "home"
