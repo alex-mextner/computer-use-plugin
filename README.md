@@ -155,10 +155,20 @@ domain); both are saved, so a re-run needs no flags.
    that already exists with credentials in this target's directory (`<tunnel name>.json`, or `<tunnel id>.json` as plain
    `cloudflared tunnel create` names it) is reused, but only when the file's TunnelID is the id Cloudflare lists for that name: a
    file of another id (the tunnel was deleted and created again, most likely by a machine of the same name) is refused with exit 2.
+   An old credentials file without a TunnelID (only AccountTag and TunnelSecret, as older cloudflared releases wrote it) is
+   bound to a tunnel only by its file name: `<tunnel id>.json` here is taken and copied to `<tunnel name>.json` with the TunnelID
+   added. An old `<tunnel name>.json` (for example copied from such a file by hand) is refused with exit 2, even with
+   `--force-takeover`, since nothing in it says which tunnel it is: copy the original here under the name cloudflared gave it
+   when it created the tunnel (`<tunnel id>.json`, for example from `~/.cloudflared`) and re-run, and the TunnelID is added to
+   `<tunnel name>.json`. Never name a copy after the id Cloudflare lists now: only the name cloudflared gave the file shows which
+   tunnel it is, and a stale file bound to a tunnel recreated by a same-name machine would point this machine at that tunnel.
    One that exists WITHOUT credentials here (another machine of the same name, or a lost install) is refused with exit 2: pass
-   `--machine-name`, delete the stale tunnel, or adopt it by naming it with `--tunnel-name`. A NEW DNS record is created without a
-   question; an EXISTING record that points elsewhere is replaced only after you confirm (`--yes` answers yes; without consent
-   install stops with exit 2).
+   `--machine-name`, delete the stale tunnel, or adopt it by naming it with `--tunnel-name`. The hostname is routed by the id of
+   the tunnel checked above, never by its name: cloudflared resolves a name through a `credentials-file` named in its config
+   first, which may be another tunnel's (so the command `--skip-dns` prints to run by hand names this target's binary, config
+   and certificate and takes the id from `$COMPUTER_TUNNEL_ID`, refusing to run while it is unset or empty). A NEW DNS record
+   is created without a question; an EXISTING record that points elsewhere is replaced only after you confirm (`--yes` answers
+   yes; without consent install stops with exit 2).
    cloudflared's certificate, tunnel credentials and `config.yml` live in this target's own directory
    (`~/.config/computer/chatgpt/cloudflared`, mode 700; `--cloudflared-dir` to choose). `~/.cloudflared` is never read or written unless
    you point `--cloudflared-dir` at it, so a tunnel that already runs on this machine is left alone.
@@ -166,11 +176,11 @@ domain); both are saved, so a re-run needs no flags.
    **Same-name machines.** Two machines with the same name must never serve one hostname: Cloudflare would split ChatGPT's
    traffic between them and the other machine's connector would fail with 401s. So adopting a tunnel with `--tunnel-name` is
    refused while Cloudflare reports live connections for it (`cloudflared tunnel info`: a cloudflared somewhere runs it; recently
-   closed connections do not count, and an answer without connection data is refused too), and the existing record of a
-   `--domain` hostname (`<machine>-mcp.<zone>`, which a same-name machine derives too) is never replaced by `--yes`: install
-   stops with exit 2 and names the record. `--force-takeover` passes both refusals; it is DANGEROUS, use it only when you are sure
-   no other machine serves the tunnel or the hostname (for example the record of this machine's own 0.2.x install). Your own
-   running tunnel, with its credentials here, needs no override.
+   closed connections do not count, and an answer without connection data, for the tunnel or for any one of its connectors, is
+   refused too), and the existing record of a `--domain` hostname (`<machine>-mcp.<zone>`, which a same-name machine derives
+   too) is never replaced by `--yes`: install stops with exit 2 and names the record. `--force-takeover` passes both refusals; it
+   is DANGEROUS, use it only when you are sure no other machine serves the tunnel or the hostname (for example the record of this
+   machine's own 0.2.x install). Your own running tunnel, with its credentials here, needs no override.
 4. **Starts**: writes the systemd user units (only now, so a run that stopped in step 3 leaves them as they were and the corrected
    re-run still restarts what changed), enables lingering (the stack starts at boot without a login), enables and starts the units
    (restarting only those whose file changed), and waits until the local chain answers.

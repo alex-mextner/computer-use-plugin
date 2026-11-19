@@ -10,6 +10,17 @@
 - `computer chatgpt run` stopped by one of its processes dying of a signal now ends the same way (killed by SIGTERM, 143 in a
   shell) instead of exiting 241, so a clean stop no longer looks like a crash. It stops the other processes first, and shares the
   rule with `quiet` (#28).
+- The same-name guards of `install` and `login` now fail closed in three more cases. A tunnel whose `cloudflared tunnel info`
+  shows no live connection but lists a connector without its own connection data (`conns` null or missing) counts as unknown,
+  so adopting it by `--tunnel-name` needs `--force-takeover` instead of passing as "no live connections". The hostname is now
+  routed by the id of the tunnel that was checked, not by its name: cloudflared resolves a name through a `credentials-file`
+  named in its config first, so with `--cloudflared-dir` at such a config the record could point at another tunnel; the
+  command `--skip-dns` prints to run by hand now names this target's binary, config and certificate and takes the id from
+  `$COMPUTER_TUNNEL_ID` (it does not run while that is unset). An old credentials file without a TunnelID (written by older
+  cloudflared releases) no longer ends in a dead end: as `<tunnel id>.json` it is taken and copied to `<tunnel name>.json`
+  with the TunnelID added, and an old `<tunnel name>.json` is refused with a fix that works (copy the original under the name
+  cloudflared gave it, `<tunnel id>.json`, next to it and re-run), since such tunnels may have no credentials to fetch again
+  (#46).
 
 ## 0.4.5
 
