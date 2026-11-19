@@ -12,7 +12,10 @@ and the certificate is then moved into place with mode 0600. `import_cert` inste
 read and checked once up front (`read_account_cert`), before the caller writes anything.
 INVARIANTS: only the pinned binary is run; nothing secret or identifying (certificate, credentials, tunnel id) is printed; a DNS
 record that points elsewhere is replaced only with the caller's consent (`route_dns(..., overwrite=True)`); a credentials file
-counts as a tunnel's only when its TunnelID is the id `tunnel list` shows (`credentials_tunnel_id`).
+counts as a tunnel's only when its TunnelID is the id `tunnel list` shows (`CredentialsFile.tunnel_id`), or, for an old file
+without TunnelID, when its file name is that id (`<tunnel id>.json`, as cloudflared named it); every call about an existing
+tunnel (`info`, `token`, `route dns`) names it by that id, never by name, since cloudflared resolves a name through the
+credentials-file of its config first.
 """
 
 from __future__ import annotations
@@ -22,8 +25,10 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -113,6 +118,53 @@ class Route(Enum):
 
 def _detail(result: subprocess.CompletedProcess[str]) -> str:
     return ((result.stderr or "") + (result.stdout or "")).strip()[-400:] or f"exit {result.returncode}"
+
+
+class Adoption(Enum):
+    COPIED = "copied"
+    MIGRATED = "migrated"  # an old file without TunnelID: its file name `<tunnel id>.json` gave the id, now written into it
+
+
+# What an old credentials file without TunnelID holds; the two must match for an old `<name>.json` to be a `<tunnel id>.json`.
+LEGACY_FIELDS = ("AccountTag", "TunnelSecret")
+
+
+@dataclass(frozen=True)
+class CredentialsFile:
+    """A tunnel credentials file read once: its text and JSON object (empty when missing, unreadable, not UTF-8 or not an
+    object), so every decision about it and whatever is copied from it are the same content."""
+
+    text: str
+    fields: dict[str, object]
+
+    @property
+    def tunnel_id(self) -> str | None:
+        """Its TunnelID (lowercase); None when it has none."""
+        value = self.fields.get("TunnelID")
+        return value.lower() if isinstance(value, str) and value else None
+
+    @property
+    def legacy(self) -> bool:
+        """An old file: AccountTag and TunnelSecret but no TunnelID (absent or null). Older cloudflared releases wrote these,
+        and cloudflared still runs them, taking the id from the tunnel it is asked to run."""
+        return self.fields.get("TunnelID") is None and all(
+            isinstance(value := self.fields.get(key), str) and value for key in LEGACY_FIELDS
+        )
+
+    def with_tunnel_id(self, tunnel_id: str) -> str:
+        # The id cloudflared would take from the tunnel it runs, written down: from now on the file is checked like a new one.
+        return json.dumps({**self.fields, "TunnelID": tunnel_id})
+
+
+def read_credentials(path: Path) -> CredentialsFile:
+    try:
+        text = path.read_text()
+    except (OSError, ValueError):  # ValueError: UnicodeDecodeError, a file that is no credentials file at all
+        return CredentialsFile("", {})
+    try:
+        return CredentialsFile(text, as_object(json.loads(text)))
+    except (ValueError, RecursionError):  # RecursionError: brackets nested deeper than Python's decoder goes
+        return CredentialsFile(text, {})
 
 
 @dataclass(frozen=True)
@@ -267,6 +319,20 @@ class Cloudflare:
     def _tunnel(self, *rest: str) -> list[str]:
         return [str(self.binary), "tunnel", "--config", str(self.config), "--origincert", str(self.cert), *rest]
 
+    def manual_route_command(self, name: str, hostname: str) -> str:
+        """The `route dns` a user runs by hand (--skip-dns): this target's binary, config and certificate, and the tunnel by
+        id, since a bare `cloudflared` reads ~/.cloudflared/config.yml, whose credentials-file may resolve a name to another
+        tunnel. No id is printed: the command reads the TunnelID of `<name>.json` when it runs (the file setup bound to the
+        tunnel, so no stale shell variable can pick another one) and stops before cloudflared when that is not a UUID, since any
+        other word is a name to cloudflared. That Python runs isolated (-I): the directory the command is pasted in and
+        PYTHONPATH could otherwise supply a `json` or `uuid` that prints another tunnel's id. An exported
+        TUNNEL_FORCE_PROVISIONING_DNS is dropped: cloudflared reads it as --overwrite-dns, which would replace a record pointing
+        elsewhere."""
+        read_id = "import json, sys, uuid; print(uuid.UUID(json.load(open(sys.argv[1]))['TunnelID']))"
+        tunnel_id = shlex.join([sys.executable, "-I", "-c", read_id, str(self.credentials(name))])
+        route = shlex.join(["env", "-u", "TUNNEL_FORCE_PROVISIONING_DNS", *self._tunnel("route", "dns")])
+        return f'tunnel_id="$({tunnel_id})" && {route} "$tunnel_id" {shlex.quote(hostname)}'
+
     def logged_in(self) -> bool:
         return self.cert.is_file()
 
@@ -381,7 +447,8 @@ class Cloudflare:
     def live_connections(self, tunnel_id: str) -> int | None:
         """How many edge connections the tunnel has open right now (a cloudflared somewhere runs it), from `tunnel info`, which
         reads Cloudflare's connections endpoint: since 2026-10-05 `tunnel list` carries no connections. Recently closed ones
-        (`is_pending_reconnect`) do not count, as in cloudflared's own listing. None when the answer cannot be read: unknown."""
+        (`is_pending_reconnect`) do not count, as in cloudflared's own listing. None when the answer cannot be read, or shows no
+        live connection while a connector reports none of its own: unknown."""
         result = self.runner(self._tunnel("info", "--output", "json", tunnel_id))
         if result.returncode != 0:
             raise NetworkError(
@@ -393,36 +460,78 @@ class Cloudflare:
             return None
         if not isinstance(info.get("conns"), list):
             return None
-        return sum(
+        connectors = [as_object(connector) for connector in as_list(info.get("conns"))]
+        live = sum(
             1
-            for connector in as_list(info.get("conns"))
-            for connection in as_list(as_object(connector).get("conns"))
+            for connector in connectors
+            for connection in as_list(connector.get("conns"))
             if not as_object(connection).get("is_pending_reconnect")
         )
-
-    def credentials_tunnel_id(self, path: Path) -> str | None:
-        """The TunnelID a credentials file belongs to (lowercase); None when it is missing, unreadable or not one."""
-        try:
-            value = as_object(json.loads(path.read_text())).get("TunnelID")
-        except (OSError, ValueError):
+        # A connector listed without its own connections (null, or no field) may be serving right now: with no live
+        # connection visible elsewhere that is unknown, never zero; beside live ones the visible count is the answer.
+        if live == 0 and any(not isinstance(connector.get("conns"), list) for connector in connectors):
             return None
-        return value.lower() if isinstance(value, str) and value else None
+        return live
 
-    def adopt_credentials_by_id(self, name: str, tunnel_id: str) -> bool:
-        """`<tunnel id>.json` (what plain `cloudflared tunnel create` writes) in this directory, when it belongs to `tunnel_id`,
-        is this machine's own credentials file: copied to `<name>.json` (mode 0600), the file the units name. False otherwise."""
-        by_id = self.directory / f"{tunnel_id}.json"
-        if self.credentials_tunnel_id(by_id) != tunnel_id:
+    def _credentials_named_by_id(self, tunnel_id: str) -> CredentialsFile | None:
+        """`<tunnel id>.json` (what plain `cloudflared tunnel create` writes) when it is `tunnel_id`'s: its TunnelID is that id,
+        or it is an old file without one, which only its file name binds to a tunnel. None otherwise."""
+        found = read_credentials(self.directory / f"{tunnel_id}.json")
+        return found if found.tunnel_id == tunnel_id or found.legacy else None
+
+    def adopt_credentials_by_id(self, name: str, tunnel_id: str) -> Adoption | None:
+        """`<tunnel id>.json` in this directory, when it is `tunnel_id`'s, is this machine's own credentials file: written to
+        `<name>.json` (mode 0600), the file the units name, as it is or, an old one, with the id added. None when there is no
+        such file."""
+        found = self._credentials_named_by_id(tunnel_id)
+        if found is None:
+            return None
+        if found.tunnel_id:
+            self._write_credentials(name, found.text)
+            return Adoption.COPIED
+        self._write_credentials(name, found.with_tunnel_id(tunnel_id))
+        return Adoption.MIGRATED
+
+    def migrate_legacy_credentials(self, name: str, tunnel_id: str, legacy: CredentialsFile) -> bool:
+        """`<name>.json` is `legacy`, an old file without TunnelID: nothing in it names a tunnel, so it is bound to `tunnel_id`
+        only when `<tunnel id>.json` here (old or new) holds the same account and secret; then the id is added. False
+        otherwise."""
+        found = self._credentials_named_by_id(tunnel_id)
+        if found is None or any(legacy.fields.get(key) != found.fields.get(key) for key in LEGACY_FIELDS):
             return False
-        atomic_write(self.credentials(name), by_id.read_text(), mode=0o600)
+        self._write_credentials(name, legacy.with_tunnel_id(tunnel_id))
         return True
 
-    def create_tunnel(self, name: str) -> None:
+    def _write_credentials(self, name: str, text: str) -> None:
+        own = self.credentials(name)
+        if own.is_symlink():
+            # atomic_write writes through a link (a dangling one too), and this one may lead into ~/.cloudflared, which is
+            # never written: the link is replaced by a file of its own (lost only if the write fails; `<tunnel id>.json` then
+            # adopts again). missing_ok: a concurrent run may have replaced it already.
+            own.unlink(missing_ok=True)
+        atomic_write(own, text, mode=0o600)
+
+    def create_tunnel(self, name: str) -> str:
+        """Create the tunnel `name`; its id (lowercase UUID), read from the credentials file it was created with: every later
+        step names the tunnel by that id, so it is the tunnel these credentials run."""
         result = self.runner(self._tunnel("create", "--credentials-file", str(self.credentials(name)), name))
         if result.returncode != 0 or not self.credentials(name).is_file():
             raise AgentToolError(
                 what=f"cannot create the tunnel {name!r}", why=_detail(result), fix="check the Cloudflare login and the network"
             )
+        tunnel_id = read_credentials(self.credentials(name)).tunnel_id
+        if tunnel_id is None or not TUNNEL_UUID.fullmatch(tunnel_id):
+            # Kept, the file would make the next run take it for a stale or old file of this tunnel and refuse wrongly.
+            self.credentials(name).unlink()
+            raise AgentToolError(
+                what=f"the credentials file cloudflared wrote for the new tunnel {name!r} names no valid tunnel id",
+                why="DNS is routed by that id, so without it the hostname could reach another tunnel; the file was removed",
+                fix=(
+                    f"the tunnel now exists on the account: re-run with --tunnel-name {name} to fetch its credentials by id, "
+                    "or delete it (Cloudflare dashboard, Zero Trust > Networks > Tunnels) and re-run"
+                ),
+            )
+        return tunnel_id
 
     def fetch_credentials(self, name: str, tunnel_id: str) -> None:
         """Credentials of a tunnel that exists on the account but not in this directory (created elsewhere, or files lost). By
@@ -435,7 +544,7 @@ class Cloudflare:
                 why=_detail(result),
                 fix="use another --tunnel-name (a tunnel created before cloudflared 2022.3 has no fetchable token)",
             )
-        if self.credentials_tunnel_id(credentials) != tunnel_id:
+        if read_credentials(credentials).tunnel_id != tunnel_id:
             credentials.unlink()
             raise AgentToolError(
                 what=f"the credentials fetched for the tunnel {name!r} belong to another tunnel",
@@ -443,10 +552,11 @@ class Cloudflare:
                 fix="re-run the command",
             )
 
-    def route_dns(self, name: str, hostname: str, *, overwrite: bool = False) -> Route:
-        """Point `hostname` at the tunnel. Without `overwrite` an existing record that points elsewhere is left alone
-        (CONFLICT)."""
-        result = self.runner(self._tunnel("route", "dns", *(["--overwrite-dns"] if overwrite else []), name, hostname))
+    def route_dns(self, name: str, hostname: str, *, tunnel_id: str, overwrite: bool = False) -> Route:
+        """Point `hostname` at the tunnel `name` (only named in an error), given by `tunnel_id`, keyword-only so it cannot be
+        swapped with the name: cloudflared resolves a name through the credentials-file of its config first, which may be
+        another tunnel's. Without `overwrite` an existing record that points elsewhere is left alone (CONFLICT)."""
+        result = self.runner(self._tunnel("route", "dns", *(["--overwrite-dns"] if overwrite else []), tunnel_id, hostname))
         text = (result.stderr or "") + (result.stdout or "")
         if result.returncode == 0:
             return Route.UNCHANGED if "already configured to route" in text else Route.CREATED

@@ -20,6 +20,7 @@ process acts on (one it was started ignoring stays ignored and is not passed on)
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import signal
@@ -41,11 +42,12 @@ _FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 _PR_SET_PDEATHSIG = 1
 # Python refuses longer integer literals (sys.get_int_max_str_digits, 4300 by default); V8 reads them as a double.
 _INT_DIGITS = 4000
-# A client line nested deeper is refused outright. How deep Python's json can go depends on the interpreter (3.13 stops near its
-# recursion limit of 1000, 3.14 went past 100 000), so without a fixed cap the same request would be inspected on one machine
-# and refused on another. No MCP request nests anywhere near this. DC's own lines are not capped: refusing one there would pass
-# it on uncleaned.
+# A client line nested deeper is refused outright. How deep Python's json can go depends on the interpreter (3.13 stops near
+# 10 000 levels, 3.14 went past 100 000), so without a fixed cap the same request would be inspected on one machine and refused
+# on another. No MCP request nests anywhere near this. DC's own lines are not capped: refusing one there would pass it on
+# uncleaned.
 _MAX_DEPTH = 256
+_TOO_DEEP = f"Invalid request: nested deeper than {_MAX_DEPTH} levels"
 # Every survey variant of DC 0.3.2 has this shape: one instruction line, the quoted request ending in DC's own turn-off line and a
 # rule, then one closing sentence, appended at the end of the text (only DC's Docker notice may follow it). Matching the whole
 # shape, never across another instruction header and only where DC puts it, keeps DC's other notices and any file content that
@@ -110,6 +112,42 @@ def _error(request_id: object, code: int, message: str) -> bytes:
     return _encode({"jsonrpc": "2.0", "id": request_id, "error": error})
 
 
+def _reply_id(message: dict[str, object]) -> object:
+    """The id an answer echoes: JSON-RPC ids are a string, a number or null, so anything else (a nested array or object could be
+    too deep to encode, ending the relay) is answered with id null. bool is excluded (an int to Python, not to JSON), and so is
+    a float that is not finite (1e400 reads as inf), which json.dumps would write as the non-JSON `Infinity` or `NaN`."""
+    request_id = message.get("id")
+    if isinstance(request_id, float):
+        return request_id if math.isfinite(request_id) else None
+    if request_id is None or (isinstance(request_id, (str, int)) and not isinstance(request_id, bool)):
+        return request_id
+    return None
+
+
+def _nests_deeper_than(line: bytes | bytearray, limit: int) -> bool:
+    """Whether the brackets of `line` outside its strings nest deeper than `limit`: the cap read off the bytes, for a line too
+    deep for this Python's json to parse (3.13 gives up near 10 000 levels, 3.14 does not), so both refuse it the same way."""
+    depth = 0
+    in_string = escaped = False
+    for byte in line:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # quote
+                in_string = False
+        elif byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):  # [ {
+            depth += 1
+            if depth > limit:
+                return True
+        elif byte in (0x5D, 0x7D):  # ] }
+            depth -= 1
+    return False
+
+
 def local_answer(line: bytes | bytearray) -> bytes | None:
     """What the client gets instead of DC seeing `line`, or None to forward it: the answer to a feedback call (nothing for one
     sent as a notification), or an error for a line that cannot be shown to be no feedback call: one Python cannot read, or
@@ -117,20 +155,23 @@ def local_answer(line: bytes | bytearray) -> bytes | None:
     escapes."""
     if not line.strip():
         return None
+    # Only a line with more brackets than the cap can nest past it; the walks are skipped for every other line.
+    may_nest_too_deep = line.count(b"[") + line.count(b"{") > _MAX_DEPTH
     try:
         loaded = _load(line)
     except _Unreadable:
+        if may_nest_too_deep and _nests_deeper_than(line, _MAX_DEPTH):
+            return _error(None, -32600, _TOO_DEEP)
         return _error(None, -32700, "Parse error: the request cannot be read")
     message = as_dict(loaded)
-    # Only a line with more brackets than the cap can nest past it; the walk is skipped for every other line.
-    if line.count(b"[") + line.count(b"{") > _MAX_DEPTH and _deeper_than(loaded, _MAX_DEPTH):
-        return _error(message.get("id"), -32600, f"Invalid request: nested deeper than {_MAX_DEPTH} levels")
+    if may_nest_too_deep and _deeper_than(loaded, _MAX_DEPTH):
+        return _error(_reply_id(message), -32600, _TOO_DEEP)
     if message.get("method") != "tools/call" or as_dict(message.get("params")).get("name") != FEEDBACK_TOOL:
         return None
     if "id" not in message:
         return b""
     result: dict[str, object] = {"content": [{"type": "text", "text": WITHHELD_ANSWER}], "isError": True}
-    return _encode({"jsonrpc": "2.0", "id": message["id"], "result": result})
+    return _encode({"jsonrpc": "2.0", "id": _reply_id(message), "result": result})
 
 
 def _without_feedback_tool(result: dict[str, object]) -> dict[str, object] | None:
@@ -186,7 +227,7 @@ def filtered_server_line(line: bytes) -> bytes:
     except RecursionError:
         # Too deep for this interpreter's json to write back: the client gets an error for that answer, never the survey or
         # the tool.
-        return _error(message.get("id"), -32603, "Internal error: the answer is nested too deep to pass on")
+        return _error(_reply_id(message), -32603, "Internal error: the answer is nested too deep to pass on")
 
 
 def _write_all(fd: int, data: bytes | bytearray) -> None:

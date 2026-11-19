@@ -40,6 +40,8 @@ pytestmark = pytest.mark.skipif(
 class Stack:
     shim_port: int
     layout: Layout
+    run: subprocess.Popen[bytes]
+    output: Path
 
     def password(self) -> str:
         return read_password(self.layout.password_file)
@@ -50,6 +52,20 @@ class Stack:
         while time.monotonic() < deadline and not _complete_lines(path):
             time.sleep(0.05)
         return _complete_lines(path)
+
+    def stop_and_read_journal(self) -> str:
+        """Stop the stack, then return everything it wrote to stdout and stderr (what a unit's journal gets): stopped first so
+        nothing is still in flight."""
+        _stop(self.run)
+        return self.output.read_text(errors="replace")
+
+
+def _assert_the_journal_holds_no_request(stack: Stack) -> None:
+    """The bridge's own output is what its unit writes to the journal: no per-request record, OAuth parameter or message copy."""
+    journal = stack.stop_and_read_journal()
+    leaks = ('"severity":"INFO"', "client_id=", "redirect_uri=", "code_challenge=", "state=", "SECRET-ARG", "stub-config")
+    for leak in (*leaks, "tools/call"):
+        assert leak not in journal, f"{leak!r} reached the journal:\n{journal[-2000:]}"
 
 
 def _complete_lines(path: Path) -> list[str]:
@@ -67,7 +83,7 @@ def _install_scratch_stack(settings: Settings, node_dir: Path) -> Layout:
     return layout
 
 
-def _wait_until_serving(port: int, process: subprocess.Popen[bytes]) -> None:
+def _wait_until_serving(port: int, process: subprocess.Popen[bytes], output: Path) -> None:
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         try:
@@ -76,22 +92,18 @@ def _wait_until_serving(port: int, process: subprocess.Popen[bytes]) -> None:
         except OSError:
             pass
         time.sleep(0.3)
-    raise AssertionError(f"the stack did not come up: {_stderr_after_stopping(process)}")
+    _stop(process)
+    raise AssertionError(f"the stack did not come up: {output.read_text(errors='replace')[-2000:]}")
 
 
-def _stderr_after_stopping(process: subprocess.Popen[bytes]) -> str:
-    """Stop `run` first: reading the pipe of a live process blocks until it writes or exits, hanging instead of failing.
-    SIGTERM lets `run` stop its children too; every wait is bounded because an orphaned child could hold the pipe open."""
+def _stop(process: subprocess.Popen[bytes]) -> None:
+    """SIGTERM lets `run` stop its children too; the wait is bounded so a child that ignores it cannot hang the suite."""
     process.terminate()
     try:
-        _, err = process.communicate(timeout=20)
+        process.wait(20)
     except subprocess.TimeoutExpired:
         process.kill()
-        try:
-            _, err = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            return "(no stderr: the pipe stayed open after the kill)"
-    return err[-2000:].decode(errors="replace") if err else ""
+        process.wait()
 
 
 @pytest.fixture
@@ -103,19 +115,15 @@ def stack(tmp_path: Path) -> Generator[Stack]:
     settings = Settings(scheme="http", hostname=f"127.0.0.1:{shim_port}", shim_port=shim_port, proxy_port=proxy_port)
     save_settings(settings)
     layout = _install_scratch_stack(settings, tmp_path)
-    process = subprocess.Popen(
-        [sys.executable, "-m", "computerlib.cli", "chatgpt", "run"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-    )
+    # A file, not a pipe: nobody reads while the stack runs, and a full pipe would block it.
+    output = tmp_path / "run-output.log"
+    with output.open("wb") as sink:
+        process = subprocess.Popen([sys.executable, "-m", "computerlib.cli", "chatgpt", "run"], stdout=sink, stderr=sink)
     try:
-        _wait_until_serving(shim_port, process)
-        yield Stack(shim_port, layout)
+        _wait_until_serving(shim_port, process, output)
+        yield Stack(shim_port, layout, process, output)
     finally:
-        process.terminate()
-        try:
-            process.wait(20)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        _stop(process)
     time.sleep(0.5)
     for port in (shim_port, proxy_port):
         with pytest.raises(OSError):
@@ -146,7 +154,8 @@ def test_the_full_chatgpt_flow_reaches_a_tool_and_is_logged_with_a_verified_labe
     assert driver.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}).status == 202
     listed = driver.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     assert "get_config" in listed.body.decode()
-    call = {"name": "get_config", "arguments": {"secret_argument": "SECRET-ARG"}}
+    # The trouble words make a copy of this request a candidate for the journal if the message-copy rule ever slips.
+    call = {"name": "get_config", "arguments": {"secret_argument": "SECRET-ARG error timeout exited"}}
     called = driver.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": call})
     assert "stub-config for get_config" in called.body.decode()
     lines = stack.log()
@@ -155,6 +164,7 @@ def test_the_full_chatgpt_flow_reaches_a_tool_and_is_logged_with_a_verified_labe
     assert "client=openai-mcp" in next(line for line in lines if "/.idp/token" in line)
     for secret in ("SECRET-ARG", driver.token, stack.password(), "e2e-callback"):
         assert secret not in text
+    _assert_the_journal_holds_no_request(stack)
 
 
 def test_chatgpt_is_offered_no_feedback_tool_and_no_survey(stack: Stack) -> None:
@@ -206,3 +216,4 @@ def test_a_wrong_password_is_refused_without_a_bearer_challenge(stack: Stack) ->
     assert reply.status == 400
     assert b"Invalid password" in reply.body
     assert "www-authenticate" not in reply.headers
+    _assert_the_journal_holds_no_request(stack)  # a refused login is no reason to keep its query string

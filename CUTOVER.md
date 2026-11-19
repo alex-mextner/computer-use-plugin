@@ -10,7 +10,7 @@ Nothing here is automated by this repo; it is the checklist for the person (or a
 |---|---|---|
 | Units | `dc-mcp-bridge`, `dc-mcp-shim`, `dc-mcp-tunnel` (`Restart=always`, `StartLimitIntervalSec=0`) | `unit_prefix = "dc-mcp"` gives the same three names; unit text is rewritten by `init` |
 | Ports | proxy 8766, shim 8767, cloudflared metrics 20241 (auto-picked today) | `proxy_port`, `shim_port`, `metrics_port` (pinned with `--metrics`) |
-| Hostname / tunnel | `dc-mcp.mextner.com`, tunnel `dc-local` | `hostname`, `tunnel_name`; cloudflared state in `cloudflared_dir` (default `~/.config/computer/chatgpt/cloudflared`): copy `~/.cloudflared/cert.pem` there and the tunnel's `<tunnel id>.json` as `dc-local.json` (mode 600); `~/.cloudflared` itself is never touched |
+| Hostname / tunnel | `dc-mcp.mextner.com`, tunnel `dc-local` | `hostname`, `tunnel_name`; cloudflared state in `cloudflared_dir` (default `~/.config/computer/chatgpt/cloudflared`): copy `~/.cloudflared/cert.pem` there and the tunnel's `<tunnel id>.json` as `dc-local.json` (mode 600; an old file without TunnelID needs a copy under its own name `<tunnel id>.json` there too, so a later `login` or `install` can tell which tunnel it is); `~/.cloudflared` itself is never touched |
 | OAuth state | `~/.local/share/mcp-auth-proxy` (keys, BoltDB: losing it makes ChatGPT re-authorize) | `data_dir`, kept as is |
 | Access log + client table | `~/.local/state/dc-mcp/access.log`, `clients.json` | `state_dir`; same file names and line format, so history carries over |
 | Password | `~/.config/dc-mcp-auth.env` (`PASSWORD=`, mode 600) | `password_file`, kept as is (no new password) |

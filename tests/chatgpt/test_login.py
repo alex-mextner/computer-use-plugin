@@ -6,7 +6,9 @@ device on a headless machine), re-running changes nothing, a new DNS record is c
 points elsewhere is only replaced with consent, an existing tunnel without local credentials is refused unless named with
 --tunnel-name, and an account certificate from another machine can stand in for the browser login. The same-name guards (#31):
 a running tunnel is adopted only with --force-takeover, the record of a --domain hostname is never replaced by --yes, and a
-credentials file of another tunnel id is not this machine's tunnel; this machine's own running tunnel needs no override.
+credentials file of another tunnel id is not this machine's tunnel; this machine's own running tunnel needs no override. And
+(#46): a connector without connection data is unknown liveness, DNS is routed by the checked tunnel id whatever credentials-file
+the config names, and an old credentials file without TunnelID is bound by its `<tunnel id>.json` name and migrated.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import base64
 import json
 import os
 import stat
+import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -29,6 +32,18 @@ from tests.chatgpt.cli_helpers import layout, run_cli
 from tests.chatgpt.fake_cloudflared import FAKE_CLOUDFLARED, account_cert
 
 HOST = "dc.example.test"
+OTHER_ID = "00000000-0000-0000-0000-0000000000bb"
+LEGACY = {"AccountTag": "acct", "TunnelSecret": "c2VjcmV0"}  # what cloudflared wrote before credentials carried a TunnelID
+
+
+def _write_legacy(path: Path, secret: str = "c2VjcmV0") -> None:
+    if path.exists():
+        path.chmod(0o600)
+    path.write_text(json.dumps({**LEGACY, "TunnelSecret": secret}))
+
+
+def _tunnel_id_in(path: Path) -> str:
+    return json.loads(path.read_text())["TunnelID"]
 
 
 @pytest.fixture
@@ -130,6 +145,62 @@ def test_skip_dns_never_touches_the_zone(capsys: pytest.CaptureFixture[str], acc
     assert result.code == 0, result.err
     assert not any(" route " in call for call in _calls(account))
     assert fake_cloudflared.routes(account) == {HOST: "someone-elses-tunnel"}
+    # The command to run by hand names this target's binary, config and certificate and routes by id: a bare `cloudflared`
+    # would read ~/.cloudflared/config.yml, whose credentials-file may resolve the name to another tunnel.
+    own = layout().cloudflared_dir
+    hint = f"{layout().bin_dir / 'cloudflared'} tunnel --config {own / 'config.yml'} --origincert {own / 'cert.pem'} route dns"
+    assert f'env -u TUNNEL_FORCE_PROVISIONING_DNS {hint} "$tunnel_id" {HOST}' in result.out
+    assert "0000000000aa" not in result.out
+
+
+def _paste(command: str, variables: dict[str, str] | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, **(variables or {})}
+    return subprocess.run(["bash", "-c", command], cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+
+
+def test_the_route_command_skip_dns_prints_never_reaches_a_tunnel_by_name(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path
+) -> None:
+    """The printed command routes by the TunnelID of this tunnel's credentials file, read when it runs: a stale id in the
+    shell cannot redirect it, and a file without a UUID there stops it before cloudflared, which would take any other word for
+    a name and resolve it through the config's credentials-file (here another tunnel's)."""
+    fake_cloudflared.recreated(account, "other", OTHER_ID)
+    other_credentials = tmp_path / "other.json"
+    other_credentials.write_text(json.dumps({**LEGACY, "TunnelID": OTHER_ID}))
+    own = layout().cloudflared_dir
+    own.mkdir(parents=True, mode=0o700)
+    (own / "config.yml").write_text(f"no-autoupdate: true\ncredentials-file: {other_credentials}\n")
+    result = run_cli(capsys, "login", "--skip-dns")
+    assert result.code == 0, result.err
+    command = next(line for line in result.out.splitlines() if line.startswith("dns: skipped")).split(" then run: ", 1)[1]
+    credentials = own / "my-tunnel.json"
+    bound = credentials.read_text()
+    credentials.chmod(0o600)  # written read-only
+    for unusable in (json.dumps({**LEGACY, "TunnelID": "other"}), json.dumps(LEGACY)):
+        credentials.write_text(unusable)
+        assert _paste(command).returncode != 0
+    credentials.unlink()
+    assert _paste(command).returncode != 0
+    assert not any(" route " in call for call in _calls(account))
+    credentials.write_text(bound)
+    # A stale id in the shell is not read, an exported TUNNEL_FORCE_PROVISIONING_DNS cannot replace a record elsewhere, and a
+    # `uuid` planted where the command is pasted (or on PYTHONPATH) cannot hand it another tunnel's id.
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "uuid.py").write_text(f"def UUID(_):\n    return {OTHER_ID!r}\n")
+    stale = {
+        "COMPUTER_TUNNEL_ID": OTHER_ID,
+        "TUNNEL_ID": OTHER_ID,
+        "TUNNEL_FORCE_PROVISIONING_DNS": "true",
+        "PYTHONPATH": str(hostile),
+    }
+    fake_cloudflared.existing_record(account, HOST, "someone-elses-tunnel")
+    assert _paste(command, stale).returncode != 0
+    assert fake_cloudflared.routes(account) == {HOST: "someone-elses-tunnel"}
+    (account / "routes.json").write_text("{}")
+    routed = _paste(command, stale, cwd=hostile)
+    assert routed.returncode == 0, routed.stderr
+    assert fake_cloudflared.routes(account) == {HOST: "my-tunnel"}
 
 
 def test_lost_credentials_of_an_existing_tunnel_are_refused_unless_the_tunnel_is_named(
@@ -244,6 +315,246 @@ def test_credentials_of_another_tunnel_id_are_not_this_machines_tunnel(
         assert "REFUSED" in refused.err and "is NOT the credentials of the tunnel 'my-tunnel'" in refused.err
         assert credentials.read_text() == stale
     assert not any(" token " in call for call in _calls(account))
+
+
+@pytest.mark.parametrize("conns", ["null", "missing"])
+def test_a_connector_without_connection_data_is_unknown_liveness(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], conns: str
+) -> None:
+    """A connector listed with `conns: null` (or none at all) may be running: counting it as zero connections would let
+    --tunnel-name adopt a tunnel a same-name machine serves."""
+    run_cli(capsys, "login")
+    credentials = _drop_credentials()
+    fake_cloudflared.connector_without_connections(account, "my-tunnel", conns)
+    refused = run_cli(capsys, "login", "--tunnel-name", "my-tunnel")
+    assert refused.code == 2
+    assert "REFUSED" in refused.err and "cannot tell whether it runs right now" in refused.err
+    assert not credentials.exists()
+    assert not any(" token " in call for call in _calls(account))
+    taken = run_cli(capsys, "login", "--tunnel-name", "my-tunnel", "--force-takeover")
+    assert taken.code == 0, taken.err
+    assert "whose live connections Cloudflare did not report" in taken.out and credentials.is_file()
+
+
+def test_a_connector_without_connection_data_beside_live_ones_still_reports_them(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """Live connections that are visible are the answer, not "unknown": the refusal must say the tunnel IS running."""
+    run_cli(capsys, "login")
+    credentials = _drop_credentials()
+    fake_cloudflared.connector_without_connections(account, "my-tunnel", "null", active=2)
+    refused = run_cli(capsys, "login", "--tunnel-name", "my-tunnel")
+    assert refused.code == 2 and "RUNNING right now (2 live connection(s))" in refused.err
+    assert not credentials.exists()
+
+
+def test_a_created_tunnel_whose_credentials_name_no_id_is_never_routed(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DNS is routed by the id in the new tunnel's credentials file; without one there is nothing safe to route to. The file is
+    removed, so the advised re-run with --tunnel-name fetches the credentials by id instead of refusing a leftover."""
+    monkeypatch.setenv("FAKE_CF_CREDENTIALS", "no-tunnel-id")
+    result = run_cli(capsys, "login")
+    assert result.code == 1  # AgentToolError: what cloudflared wrote is unusable, nothing of the user's is wrong
+    assert "names no valid tunnel id" in result.err and "--tunnel-name my-tunnel" in result.err
+    assert not any(" route " in call for call in _calls(account))
+    assert fake_cloudflared.routes(account) == {}
+    credentials = layout().cloudflared_dir / "my-tunnel.json"
+    assert not credentials.exists()
+    monkeypatch.delenv("FAKE_CF_CREDENTIALS")
+    adopted = run_cli(capsys, "login", "--tunnel-name", "my-tunnel")
+    assert adopted.code == 0, adopted.err
+    assert "adopted" in adopted.out and fake_cloudflared.routes(account) == {HOST: "my-tunnel"}
+
+
+@pytest.mark.parametrize("content", [b"\xff\xfe not json", b"[" * 100_000], ids=["not-utf8", "nested-too-deep"])
+def test_a_credentials_file_that_cannot_be_read_is_refused_not_a_crash(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], content: bytes
+) -> None:
+    run_cli(capsys, "login")
+    credentials = layout().cloudflared_dir / "my-tunnel.json"
+    credentials.chmod(0o600)
+    credentials.write_bytes(content)
+    refused = run_cli(capsys, "login")
+    assert refused.code == 2 and "is NOT the credentials of the tunnel 'my-tunnel'" in refused.err
+
+
+def test_adopting_by_id_never_writes_through_a_dangling_link(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path
+) -> None:
+    """`<name>.json` linked to a file in ~/.cloudflared that is gone: the copy of `<tunnel id>.json` replaces the link and
+    creates nothing where it pointed."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    credentials = own / "my-tunnel.json"
+    (own / f"{_tunnel_id_in(credentials)}.json").write_text(credentials.read_text())
+    _drop_credentials()
+    gone = tmp_path / "dot-cloudflared" / "my-tunnel.json"
+    credentials.symlink_to(gone)
+    adopted = run_cli(capsys, "login")
+    assert adopted.code == 0, adopted.err
+    assert not credentials.is_symlink() and credentials.is_file()
+    assert not gone.parent.exists()
+
+
+def test_a_file_named_by_the_tunnel_id_that_names_another_tunnel_is_not_adopted(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """Only an old file WITHOUT TunnelID is bound by its name: one whose TunnelID is another id is neither copied nor given
+    the listed id."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    tunnel_id = _tunnel_id_in(own / "my-tunnel.json")
+    credentials = _drop_credentials()
+    (own / f"{tunnel_id}.json").write_text(json.dumps({**LEGACY, "TunnelID": OTHER_ID}))
+    refused = run_cli(capsys, "login")
+    assert refused.code == 2 and "no credentials for it" in refused.err
+    assert not credentials.exists()
+
+
+def test_dns_is_routed_to_the_checked_tunnel_id_even_when_the_config_names_other_credentials(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path
+) -> None:
+    """cloudflared resolves a tunnel NAME through the credentials-file of its config first: with --cloudflared-dir at a config
+    that names another tunnel's credentials, `route dns my-tunnel` would point the hostname at that other tunnel. Every route
+    (new record, already routed, replaced with --yes) must name the id of the tunnel that was checked."""
+    fake_cloudflared.recreated(account, "other", OTHER_ID)
+    other_credentials = tmp_path / "other.json"
+    other_credentials.write_text(json.dumps({"AccountTag": "acct", "TunnelSecret": "b3RoZXI=", "TunnelID": OTHER_ID}))
+    own = layout().cloudflared_dir
+    own.mkdir(parents=True, mode=0o700)
+    (own / "config.yml").write_text(f"no-autoupdate: true\ncredentials-file: {other_credentials}\n")
+    created = run_cli(capsys, "login")
+    assert created.code == 0, created.err
+    my_id = _tunnel_id_in(own / "my-tunnel.json")
+    assert my_id != OTHER_ID
+    assert fake_cloudflared.routes(account) == {HOST: "my-tunnel"}
+    again = run_cli(capsys, "login")
+    assert again.code == 0 and "already routed" in again.out
+    fake_cloudflared.existing_record(account, HOST, "someone-elses-tunnel")
+    replaced = run_cli(capsys, "login", "--yes")
+    assert replaced.code == 0, replaced.err
+    assert fake_cloudflared.routes(account) == {HOST: "my-tunnel"}
+    routed = [call.split() for call in _calls(account) if " route dns " in call]
+    assert len(routed) == 4 and all(words[-2] == my_id for words in routed)
+    assert not any(my_id in printed for printed in (created.out, created.err, again.out, replaced.out))
+
+
+def test_a_legacy_credentials_file_named_by_the_tunnel_id_is_migrated(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """An old `cloudflared tunnel create` left `<tunnel id>.json` without TunnelID: its file name binds it to the tunnel, so it
+    becomes `<name>.json` with the checked id added (cloudflared reads both shapes); no token fetch, nothing identifying
+    printed."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    tunnel_id = _tunnel_id_in(own / "my-tunnel.json")
+    _drop_credentials()
+    by_id = own / f"{tunnel_id}.json"
+    _write_legacy(by_id)
+    migrated = run_cli(capsys, "login")
+    assert migrated.code == 0, migrated.err
+    assert "TunnelID added" in migrated.out
+    assert json.loads((own / "my-tunnel.json").read_text()) == {**LEGACY, "TunnelID": tunnel_id}
+    assert stat.S_IMODE((own / "my-tunnel.json").stat().st_mode) == 0o600
+    assert json.loads(by_id.read_text()) == LEGACY  # the user's own file is left as it was
+    assert tunnel_id not in migrated.out + migrated.err
+    assert not any(" token " in call for call in _calls(account))
+    again = run_cli(capsys, "login")
+    assert again.code == 0 and "tunnel my-tunnel: exists" in again.out
+
+
+def test_a_legacy_credentials_file_under_the_tunnel_name_has_a_way_back(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """CUTOVER.md copies an old `<tunnel id>.json` as `<name>.json`. Without a TunnelID nothing in it says which tunnel it is,
+    so it is refused (even with --force-takeover) with a fix that works: a copy named by the tunnel id binds it, and the next
+    run adds the TunnelID. A copy under the id whose secret differs does not."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    credentials = own / "my-tunnel.json"
+    tunnel_id = _tunnel_id_in(credentials)
+    _write_legacy(credentials)
+    for extra in ((), ("--tunnel-name", "my-tunnel", "--force-takeover")):
+        refused = run_cli(capsys, "login", *extra)
+        assert refused.code == 2
+        assert "REFUSED" in refused.err and "old credentials file without a TunnelID" in refused.err
+        assert "the name cloudflared gave it" in refused.err and "<tunnel id>.json" in refused.err
+        assert "Never name a copy after the id Cloudflare lists now" in refused.err
+        assert json.loads(credentials.read_text()) == LEGACY
+    by_id = own / f"{tunnel_id}.json"
+    _write_legacy(by_id, secret="ZGlmZmVyZW50")
+    assert run_cli(capsys, "login").code == 2
+    assert json.loads(credentials.read_text()) == LEGACY
+    _write_legacy(by_id)
+    fixed = run_cli(capsys, "login")
+    assert fixed.code == 0, fixed.err
+    assert "TunnelID added" in fixed.out and tunnel_id not in fixed.out + fixed.err
+    assert json.loads(credentials.read_text()) == {**LEGACY, "TunnelID": tunnel_id}
+    assert not any(" token " in call for call in _calls(account))
+
+
+def test_a_legacy_name_file_beside_a_new_file_of_the_tunnel_id_gets_its_tunnel_id(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """The tunnel's own `<tunnel id>.json` already carries TunnelID and the same secret: the old `<name>.json` is that file."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    credentials = own / "my-tunnel.json"
+    tunnel_id = _tunnel_id_in(credentials)
+    (own / f"{tunnel_id}.json").write_text(credentials.read_text())
+    _write_legacy(credentials)
+    migrated = run_cli(capsys, "login")
+    assert migrated.code == 0, migrated.err
+    assert json.loads(credentials.read_text()) == {**LEGACY, "TunnelID": tunnel_id}
+
+
+def test_old_credentials_of_a_tunnel_created_again_elsewhere_are_never_bound(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str]
+) -> None:
+    """A same-name machine deleted the tunnel and created it again (new id): the old `<old id>.json` without TunnelID, alone or
+    with an old `<name>.json` copied from it, never binds to the new tunnel, not even with --force-takeover, and the refusal
+    says what likely happened and how to get past it."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    old_id = _tunnel_id_in(own / "my-tunnel.json")
+    credentials = _drop_credentials()
+    _write_legacy(own / f"{old_id}.json")
+    fake_cloudflared.recreated(account, "my-tunnel", OTHER_ID)
+    calls_before = len(fake_cloudflared.calls(account))
+    alone = run_cli(capsys, "login")
+    assert alone.code == 2 and "no credentials for it" in alone.err
+    assert not credentials.exists()
+    _write_legacy(credentials)
+    for extra in ((), ("--tunnel-name", "my-tunnel", "--force-takeover")):
+        refused = run_cli(capsys, "login", *extra)
+        assert refused.code == 2 and "old credentials file without a TunnelID" in refused.err
+        assert "created again" in refused.err and "--tunnel-name my-tunnel" in refused.err
+        assert json.loads(credentials.read_text()) == LEGACY
+    new = [" ".join(call.argv) for call in fake_cloudflared.calls(account)[calls_before:]]
+    assert not any(" token " in call or " route " in call for call in new)
+
+
+def test_migrating_a_linked_old_credentials_file_never_writes_through_the_link(
+    capsys: pytest.CaptureFixture[str], account: Path, opened: list[str], tmp_path: Path
+) -> None:
+    """Both files linked to the original in ~/.cloudflared (which is never written): the migration gives `<name>.json` a file
+    of its own and leaves the original as it was."""
+    run_cli(capsys, "login")
+    own = layout().cloudflared_dir
+    credentials = own / "my-tunnel.json"
+    tunnel_id = _tunnel_id_in(credentials)
+    original = tmp_path / "dot-cloudflared" / f"{tunnel_id}.json"
+    original.parent.mkdir()
+    _write_legacy(original)
+    _drop_credentials()
+    credentials.symlink_to(original)
+    (own / f"{tunnel_id}.json").symlink_to(original)
+    migrated = run_cli(capsys, "login")
+    assert migrated.code == 0, migrated.err
+    assert not credentials.is_symlink() and json.loads(credentials.read_text()) == {**LEGACY, "TunnelID": tunnel_id}
+    assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
+    assert json.loads(original.read_text()) == LEGACY
 
 
 def test_yes_never_replaces_the_record_of_a_domain_hostname(

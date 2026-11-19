@@ -21,6 +21,7 @@ import pytest
 
 from computerlib.cli import main
 from computerlib.dc_relay import FEEDBACK_TOOL, filtered_server_line, local_answer, without_survey
+from computerlib.jsonvalue import as_dict
 from tests.fakes import MINIMAL_PATH, fake_node, fake_npm, write_executable
 from tests.mcp_session import McpSession, items, result_texts
 from tests.stub_mcp_server import SURVEYS
@@ -109,11 +110,49 @@ def test_a_request_nested_past_the_cap_is_refused_with_its_id() -> None:
     assert answer["error"]["code"] == -32600
 
 
-def test_a_request_past_any_interpreters_json_limit_is_refused_not_forwarded() -> None:
-    """3.13's json gives up near depth 1000 (no id can be read) while 3.14's read 100 000 levels (CI): refused either way."""
+def test_a_request_past_any_interpreters_json_limit_is_refused_as_too_deep() -> None:
+    """3.13's json gives up near depth 10 000 while 3.14's reads 100 000 levels (CI): the same answer either way."""
     answer = local_answer(_call_nested(100_000))
     assert answer is not None
-    assert json.loads(answer)["error"]["code"] in (-32700, -32600)
+    assert json.loads(answer)["error"]["code"] == -32600
+
+
+def _strict_json(answer: bytes | None) -> dict[str, object]:
+    """`answer` read the way a client's JSON parser reads it: `Infinity` and `NaN` are not JSON."""
+
+    def refuse(constant: str) -> object:
+        raise ValueError(f"{constant} is not JSON")
+
+    return as_dict(json.loads(answer or b"null", parse_constant=refuse))
+
+
+@pytest.mark.parametrize(
+    ("raw_id", "echoed"),
+    [(b'"a"', "a"), (b"7", 7), (b"1.5", 1.5), (b"null", None), (b"true", None), (b"[1]", None), (b"1e400", None), (b"NaN", None)],
+)
+def test_an_answer_echoes_only_an_id_json_rpc_allows(raw_id: bytes, echoed: object) -> None:
+    nested = b"[" * 300 + b"]" * 300
+    too_deep = b'{"jsonrpc":"2.0","id":' + raw_id + b',"method":"tools/list","p":' + nested + b"}\n"
+    feedback = (
+        b'{"jsonrpc":"2.0","id":' + raw_id + b',"method":"tools/call","params":{"name":"' + FEEDBACK_TOOL.encode() + b'"}}\n'
+    )
+    for line in (too_deep, feedback):
+        assert _strict_json(local_answer(line))["id"] == echoed
+
+
+def test_a_request_with_a_deeply_nested_id_is_refused_with_id_null_and_the_session_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Echoing a 100 000-deep id cannot be encoded: the client-reading thread died and every later request went unanswered.
+    _install(tmp_path, monkeypatch)
+    env, _ = _env_with_browser(tmp_path)
+    deep_id = b"[" * 100_000 + b"]" * 100_000
+    with McpSession(SERVE, env) as session:
+        session.initialize(timeout=20)
+        session.send_line(b'{"jsonrpc":"2.0","id":' + deep_id + b',"method":"tools/list","params":{}}\n')
+        refused = session.answer(None, "the deeply nested request", timeout=10)
+        assert as_dict(refused["error"])["code"] == -32600
+        assert len(items(session.request("tools/list", {}, timeout=10), "tools")) == 3
 
 
 def test_a_request_nested_up_to_the_cap_is_forwarded() -> None:
