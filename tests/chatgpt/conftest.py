@@ -55,6 +55,10 @@ elif cmd in ("stop", "disable"):
         put(u, active="inactive")
         if cmd == "disable":
             put(u, enabled="disabled")
+elif cmd == "try-restart":  # restarts only a running unit (and the job-mode never replaces a stop: no queue here)
+    for u in units(args):
+        if get(u, "active", "inactive") == "active":
+            put(u, active="active")
 elif cmd == "show":
     u = args[1]
     print("ActiveState=" + get(u, "active", "inactive"))

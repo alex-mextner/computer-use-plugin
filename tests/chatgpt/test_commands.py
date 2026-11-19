@@ -204,6 +204,7 @@ def test_doctor_names_what_is_wrong_and_how_to_fix_it_without_changing_anything(
     assert "[FAIL] computer-chatgpt-bridge.service active" in result.out
     assert "run `computer chatgpt start`" in result.out
     assert [c for c in machine.calls()[len(before) :] if not c.startswith("show ")] == []
+    assert not (layout().state_dir / "heal.json").exists()  # the watchdog state is --heal's alone
 
 
 def test_doctor_fails_a_checksum_correct_binary_without_the_exec_bit_and_init_repairs_it(

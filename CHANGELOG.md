@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- `computer chatgpt doctor --heal` runs one bounded watchdog pass (public mode) for a unit that stays active but stops
+  answering, which `Restart=always` never restarts: the bridge and the shim are probed on their local ports, cloudflared by its
+  own `/ready` on the metrics port, and the public URL not at all. A unit is restarted after 3 failing passes in a row, at most 3
+  times an hour and 10 minutes apart, never while the internet is unreachable, and two passes never overlap (a lock). Nothing
+  schedules it; the README shows a user timer that runs it every two minutes (#6).
+
 ## 0.3.15
 
 - `computer chatgpt doctor` prints its `chmod 600` and `chmod 755` fix hints with the path shell-quoted, so a hint for a data or

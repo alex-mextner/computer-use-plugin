@@ -1,4 +1,5 @@
-"""`computer chatgpt doctor`: diagnose the whole chain and say how to fix what is wrong. It never restarts or changes anything.
+"""`computer chatgpt doctor`: diagnose the whole chain and say how to fix what is wrong. It never restarts or changes anything,
+except with `--heal`, which instead runs one bounded watchdog pass (see heal.py) and restarts only a unit that is active but hung.
 
 Tunnel mode checks instead: the tunnel id, the pinned tunnel-client, Desktop Commander and node, the runtime key file (present,
 mode 600), unit files, the unit, lingering, and tunnel-client's own health port (ready, control plane polled); there is nothing
@@ -22,12 +23,13 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from agenttools_errors import AgentToolError
+from agenttools_errors import AgentToolError, UsageError
 
 from computerlib import desktop_commander, pdf_sandbox
 from computerlib.commandtree import Command
 from computerlib.pins import DESKTOP_COMMANDER_VERSION, binary_pin, zip_member_pin
 from computerlib.targets.chatgpt.context import Context, load_context
+from computerlib.targets.chatgpt.heal import heal
 from computerlib.targets.chatgpt.install import sha256_file
 from computerlib.targets.chatgpt.lifecycle import tunnel_serving, unit_names
 from computerlib.targets.chatgpt.password import read_password
@@ -37,6 +39,7 @@ from computerlib.targets.chatgpt.stack import external_url, unit_launcher
 from computerlib.targets.chatgpt.tunnel import has_key, valid_tunnel_id
 from computerlib.targets.chatgpt.tunnel_health import read_state
 from computerlib.targets.chatgpt.units import render_unit, unit_name
+from computerlib.targets.chatgpt.watchdog import DEFAULT_POLICY
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,16 @@ class Check:
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--local", action="store_true", help="skip the checks through the public URL (public mode)")
     parser.add_argument("--json", action="store_true", help="print the checks as JSON")
+    policy = DEFAULT_POLICY
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "instead of the checks, run one watchdog pass (public mode): restart a unit that is active but fails its local "
+            f"probe {policy.threshold} passes in a row, at most {policy.budget} times an hour and {policy.spacing / 60:g} "
+            "minutes apart, never while the internet is down; meant for a user timer (README)"
+        ),
+    )
 
 
 def _not_executable(name: str, path: Path) -> Check:
@@ -299,8 +312,20 @@ def _print(check: Check) -> None:
         print(f"       fix: {check.fix}")
 
 
+def _heal(ctx: Context, args: argparse.Namespace) -> int:
+    if args.json or args.local:
+        raise UsageError(
+            what="--heal takes no --json or --local",
+            why="the watchdog pass prints one line per decision and never probes the public URL",
+            fix="run `computer chatgpt doctor --heal` alone",
+        )
+    return heal(ctx)
+
+
 def run(args: argparse.Namespace) -> int:
     ctx = load_context()
+    if args.heal:
+        return _heal(ctx, args)
     checks = collect(ctx, args.local)
     if args.json:
         print(json.dumps([asdict(c) for c in checks], indent=2))
@@ -311,5 +336,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 COMMAND = Command(
-    name="doctor", help="diagnose the chain end to end and say how to fix it (never restarts)", run=run, configure=configure
+    name="doctor",
+    help="diagnose the chain end to end and say how to fix it (never restarts; --heal restarts a hung unit)",
+    run=run,
+    configure=configure,
 )

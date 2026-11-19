@@ -117,6 +117,13 @@ class Systemd:
     def restart(self, names: list[str]) -> None:
         self._ctl("restart", *names)
 
+    def try_restart(self, name: str) -> bool:
+        """Restart the unit only while it runs, and never in place of a stop that is under way: `try-restart` leaves a stopped
+        unit stopped, and `--job-mode=fail` refuses instead of replacing a queued stop job (or the stop of a unit it Wants=).
+        So a `stop` or `end` racing a heal pass always wins. True when the unit was restarted and runs afterwards."""
+        result = self._ctl("try-restart", "--job-mode=fail", name, check=False)
+        return result.returncode == 0 and self.state(name).active in _LIVE_STATES
+
     def disable_now(self, names: list[str]) -> None:
         """Stop and disable the units. Success is judged by the resulting state, never by the exit code alone: access must really
         be off, so a unit still running or still enabled afterwards is an error (an unknown unit is not)."""
