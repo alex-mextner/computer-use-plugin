@@ -47,3 +47,36 @@ def test_lingering_can_be_read_and_enabled(tmp_path: Path, machine: FakeMachine)
     assert not systemd.lingering("someone")
     systemd.enable_lingering("someone")
     assert systemd.lingering("someone")
+
+
+def test_remove_drops_the_enablement_links_of_the_removed_units_only(tmp_path: Path, machine: FakeMachine) -> None:
+    systemd = Systemd(tmp_path)
+    (tmp_path / "a.service").write_text("x")
+    for target in ("default.target.wants", "multi-user.target.requires"):
+        (tmp_path / target).mkdir()
+        (tmp_path / target / "a.service").symlink_to(tmp_path / "a.service")
+        (tmp_path / target / "other.service").symlink_to(tmp_path / "other.service")
+    systemd.remove(["a.service", "b.service"])
+    assert sorted(p.name for p in tmp_path.rglob("*.service") if p.is_symlink()) == ["other.service", "other.service"]
+    assert not (tmp_path / "a.service").exists()
+
+
+def test_remove_keeps_a_link_that_still_reaches_a_unit_file_elsewhere(tmp_path: Path, machine: FakeMachine) -> None:
+    """A same-named unit in another search path, enabled from this dir, is the user's: its working link survives."""
+    units = tmp_path / "units"
+    wants = units / "default.target.wants"
+    wants.mkdir(parents=True)
+    elsewhere = tmp_path / "share" / "a.service"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("x")
+    (wants / "a.service").symlink_to(elsewhere)
+    Systemd(units).remove(["a.service"])
+    assert (wants / "a.service").is_symlink()
+
+
+def test_remove_never_reads_a_unit_name_as_a_glob_pattern(tmp_path: Path, machine: FakeMachine) -> None:
+    wants = tmp_path / "default.target.wants"
+    wants.mkdir()
+    (wants / "mine-shim.service").symlink_to(tmp_path / "mine-shim.service")
+    Systemd(tmp_path).remove(["*-shim.service"])
+    assert (wants / "mine-shim.service").is_symlink()

@@ -43,7 +43,7 @@ def get(unit, k, default):
     return p.read_text() if p.exists() else default
 cmd = args[0]
 if cmd in os.environ.get("FAKE_SYSTEMD_FAIL", "").split(","):
-    sys.stderr.write("Failed to " + cmd + ": Access denied\\n")
+    sys.stderr.write(os.environ.get("FAKE_SYSTEMD_FAIL_STDERR", "Failed to " + cmd + ": Access denied") + "\\n")
     sys.exit(1)
 if cmd in ("enable", "start", "restart"):
     for u in units(args):

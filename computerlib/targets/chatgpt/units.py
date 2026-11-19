@@ -26,11 +26,16 @@ def unit_name(prefix: str, service: str) -> str:
 
 
 def written_here(path: Path) -> bool:
-    """True when the unit file `path` is one `render_unit` wrote: its first line is MARKER."""
-    if not path.is_file():
+    """True when the unit file `path` is one `render_unit` wrote: its first line is MARKER. Anything else proves nothing and is
+    not ours: a FIFO or a device would block the open or never end the line, and a file that cannot be read (mode 000, deleted
+    after the listing) would raise and abort a purge before it stops the units."""
+    try:
+        if not path.is_file():
+            return False
+        with path.open("rb") as unit:
+            return unit.readline(len(MARKER) + 2).rstrip(b"\n") == MARKER.encode()
+    except OSError:
         return False
-    with path.open("rb") as unit:
-        return unit.readline().rstrip(b"\n") == MARKER.encode()
 
 
 def managed_prefixes(unit_dir: Path, services: Sequence[str]) -> list[str]:

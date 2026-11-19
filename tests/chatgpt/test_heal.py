@@ -4,10 +4,13 @@ port."""
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import http.server
+import json
 import socket
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -17,6 +20,7 @@ import pytest
 
 from computerlib.targets.chatgpt import heal, watchdog
 from computerlib.targets.chatgpt.context import Context
+from computerlib.targets.chatgpt.probe import Answer, request
 from computerlib.targets.chatgpt.settings import load_settings, save_settings
 from tests.chatgpt.cli_helpers import (
     Result,
@@ -318,9 +322,9 @@ def test_warnings_only_when_the_pass_acts(tmp_path: Path) -> None:
     now = [0.0]
     policy = watchdog.Policy(threshold=2, budget=1, spacing=0.0)
 
-    def restart(unit: str) -> bool:
+    def restart(unit: str) -> watchdog.RestartResult:
         restarted.append(unit)
-        return True
+        return watchdog.RestartResult("restarted")
 
     def run(probe: watchdog.Watched) -> None:
         watchdog.heal_pass(
@@ -345,3 +349,267 @@ def test_warnings_only_when_the_pass_acts(tmp_path: Path) -> None:
     assert len(warnings) == 2
     assert warnings[0].startswith("heal: restarted a.service") and "budget is spent" in warnings[1]
     assert said[0] == (watchdog.DEBUG, "heal: 1 unit(s) healthy, nothing to do")
+
+
+@contextmanager
+def trickling_server(head: bytes, step: bytes) -> Generator[int]:
+    """Answers every connection with `head`, then sends `step` every 50 ms for as long as the client listens."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    stop = threading.Event()
+
+    def feed(conn: socket.socket) -> None:
+        with conn:
+            try:
+                conn.recv(4096)
+                conn.sendall(head)
+                while not stop.wait(0.05):
+                    conn.sendall(step)
+            except OSError:
+                return
+
+    def accept() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=feed, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        stop.set()
+        # shutdown, not close alone, wakes the accept() blocked in the other thread.
+        with contextlib.suppress(OSError):
+            listener.shutdown(socket.SHUT_RDWR)
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("head", "step"),
+    [
+        (b"", b"H"),  # headers one byte at a time, never finished
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"1\r\nx\r\n"),  # a chunked body that never ends
+    ],
+    ids=["trickled-headers", "endless-chunks"],
+)
+def test_a_trickling_answer_cannot_hold_a_probe_past_its_timeout(head: bytes, step: bytes) -> None:
+    with trickling_server(head, step) as port:
+        answers: list[Answer | None] = []
+        elapsed: list[float] = []
+
+        def run() -> None:
+            started = time.monotonic()
+            answers.append(request(f"http://127.0.0.1:{port}/ready", timeout=0.5))
+            elapsed.append(time.monotonic() - started)
+
+        # In a thread so an unbounded probe fails the test instead of hanging the suite; the join is generous so a loaded
+        # runner does not flake, and the bound itself is checked on the measured time.
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(5.0)
+        assert not worker.is_alive()
+    assert answers == [None]
+    assert elapsed[0] < 1.5  # the timeout plus a small margin
+
+
+def _pass(
+    tmp_path: Path,
+    units: list[watchdog.Watched],
+    now: list[float],
+    policy: watchdog.Policy,
+    restart: Callable[[str], watchdog.RestartResult] | None = None,
+    states: dict[str, str] | None = None,
+) -> list[str]:
+    restarted: list[str] = []
+
+    def record(unit: str) -> watchdog.RestartResult:
+        restarted.append(unit)
+        return watchdog.RestartResult("restarted")
+
+    watchdog.heal_pass(
+        units,
+        state_file=tmp_path / "heal.json",
+        active_state=lambda unit: (states or {}).get(unit, "active"),
+        restart=restart or record,
+        online=lambda: True,
+        clock=lambda: now[0],
+        say=lambda _priority, _text: None,
+        policy=policy,
+    )
+    return restarted
+
+
+def test_restart_spacing_counts_from_when_the_restart_ran_not_when_the_pass_began(tmp_path: Path) -> None:
+    now = [0.0]
+    slow = [400.0]
+
+    def hung() -> str:
+        now[0] += slow[0]  # a probe that takes its time, as a hung one does
+        return "hung"
+
+    unit = [watchdog.Watched("a.service", hung)]
+    policy = watchdog.Policy(threshold=1)
+    assert _pass(tmp_path, unit, now, policy) == ["a.service"]  # ran at 400
+    slow[0] = 0.0
+    now[0] = 700.0  # 700 s after the pass began, only 300 s after the restart
+    assert _pass(tmp_path, unit, now, policy) == []
+    now[0] = 1000.0
+    assert _pass(tmp_path, unit, now, policy) == ["a.service"]
+
+
+def test_the_hourly_budget_counts_from_when_the_restart_ran(tmp_path: Path) -> None:
+    now = [0.0]
+    slow = [3000.0]
+
+    def hung() -> str:
+        now[0] += slow[0]
+        return "hung"
+
+    unit = [watchdog.Watched("a.service", hung)]
+    policy = watchdog.Policy(threshold=1, budget=1, spacing=0.0)
+    assert _pass(tmp_path, unit, now, policy) == ["a.service"]  # ran at 3000
+    slow[0] = 0.0
+    now[0] = 3700.0  # past the hour since the pass began, 700 s since the restart
+    assert _pass(tmp_path, unit, now, policy) == []
+
+
+def test_a_restart_that_raises_still_saves_the_other_units_counts(tmp_path: Path) -> None:
+    now = [0.0]
+    policy = watchdog.Policy(threshold=2)
+    hung_a = watchdog.Watched("a.service", lambda: "hung")
+    hung_b = watchdog.Watched("b.service", lambda: "hung")
+    _pass(tmp_path, [hung_a, hung_b], now, policy)  # one failure each
+
+    def broken(unit: str) -> watchdog.RestartResult:
+        raise RuntimeError(f"systemctl vanished while restarting {unit}")
+
+    healthy_b = watchdog.Watched("b.service", lambda: None)
+    with pytest.raises(RuntimeError, match="systemctl vanished"):
+        _pass(tmp_path, [hung_a, healthy_b], now, policy, restart=broken)
+    saved = json.loads((tmp_path / "heal.json").read_text())["units"]
+    assert saved["b.service"]["failures"] == 0
+    assert saved["a.service"] == {"failures": 0, "restarts": [0.0]}
+
+
+def test_the_tunnel_is_not_restarted_while_a_unit_it_wants_is_stopped(
+    capsys: pytest.CaptureFixture[str],
+    machine: FakeMachine,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Clock,
+    internet: socket.socket,
+) -> None:
+    """The owner stopped the bridge and shim and left cloudflared running: restarting the tunnel would start them again."""
+    _init(capsys, monkeypatch, machine, TUNNEL)
+    for unit in (BRIDGE, SHIM):
+        (machine.state_dir / f"{unit}.active").write_text("inactive")
+    settings = replace(load_settings(), tunnel_name="test-box", metrics_port=free_port())
+    save_settings(settings)
+    with serving(settings.metrics_port):
+        outputs = [heal_pass(capsys).out for _ in range(4)]
+    assert restarts(machine) == []
+    assert f"heal: {TUNNEL} unhealthy: not restarted while {SHIM}, which it Wants=, is inactive" in outputs[-1]
+
+
+def test_the_tunnel_is_not_restarted_while_only_the_bridge_is_stopped(
+    capsys: pytest.CaptureFixture[str],
+    machine: FakeMachine,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Clock,
+    internet: socket.socket,
+) -> None:
+    """The tunnel's Wants= chain runs through the shim to the bridge: a tunnel restart starts a stopped bridge too."""
+    _init(capsys, monkeypatch, machine, SHIM, TUNNEL)
+    (machine.state_dir / f"{BRIDGE}.active").write_text("inactive")
+    settings = replace(load_settings(), tunnel_name="test-box", metrics_port=free_port())
+    save_settings(settings)
+    with serving(settings.shim_port), serving(settings.metrics_port):
+        outputs = [heal_pass(capsys).out for _ in range(4)]
+    assert restarts(machine) == []
+    assert f"heal: {TUNNEL} unhealthy: not restarted while {BRIDGE}, which it Wants=, is inactive" in outputs[-1]
+
+
+def test_a_try_restart_refused_while_the_unit_runs_is_a_failed_restart(
+    capsys: pytest.CaptureFixture[str],
+    machine: FakeMachine,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Clock,
+    internet: socket.socket,
+) -> None:
+    _init(capsys, monkeypatch, machine)
+    monkeypatch.setenv("FAKE_SYSTEMD_FAIL", "try-restart")  # the unit keeps running
+    monkeypatch.setenv(
+        "FAKE_SYSTEMD_FAIL_STDERR",
+        f"Failed to try-restart {BRIDGE}: Access denied\nSee user logs and 'systemctl --user status {BRIDGE}' for details.",
+    )
+    with hung_server(load_settings().proxy_port):
+        outputs = [heal_pass(capsys).out for _ in range(3)]
+    assert machine.unit_state(BRIDGE, "active") == "active"
+    failed = [line for line in outputs[-1].splitlines() if line.startswith(f"heal: restarting {BRIDGE} failed: ")]
+    assert len(failed) == 1  # systemctl's two lines stay on the one warning line
+    assert f"Access denied See user logs and 'systemctl --user status {BRIDGE}' for details.; it is active" in failed[0]
+    assert "stopped during the pass" not in outputs[-1]
+
+
+def test_a_stop_queued_behind_the_tunnel_is_a_stop_not_a_failed_restart(
+    capsys: pytest.CaptureFixture[str],
+    machine: FakeMachine,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Clock,
+    internet: socket.socket,
+) -> None:
+    """`end` stops tunnel, shim and bridge in one transaction; the bridge stays active until cloudflared is down, and
+    `--job-mode=fail` refuses to replace its queued stop job."""
+    _init(capsys, monkeypatch, machine)
+    monkeypatch.setenv("FAKE_SYSTEMD_FAIL", "try-restart")
+    monkeypatch.setenv(
+        "FAKE_SYSTEMD_FAIL_STDERR",
+        f"Failed to restart {BRIDGE}: Transaction for {BRIDGE}/restart is destructive "
+        f"({BRIDGE} has 'stop' job queued, but 'start' is included in transaction).",
+    )
+    with hung_server(load_settings().proxy_port):
+        outputs = [heal_pass(capsys).out for _ in range(3)]
+    assert f"heal: {BRIDGE} stopped during the pass: not restarted" in outputs[-1]
+    assert "failed" not in outputs[-1]
+
+
+def test_a_stop_that_ends_failed_is_still_a_stop(
+    capsys: pytest.CaptureFixture[str],
+    machine: FakeMachine,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Clock,
+    internet: socket.socket,
+) -> None:
+    """A hung unit killed after TimeoutStopSec ends its stop as `failed`."""
+    _init(capsys, monkeypatch, machine)
+    with hung_server(load_settings().proxy_port):
+        for _ in range(2):
+            heal_pass(capsys)
+        found = heal.watched
+
+        def killed_while_probing(ctx: Context) -> list[watchdog.Watched]:
+            def stopping(probe: Callable[[], str | None]) -> Callable[[], str | None]:
+                def run() -> str | None:
+                    (machine.state_dir / f"{BRIDGE}.active").write_text("failed")
+                    return probe()
+
+                return run
+
+            return [replace(item, probe=stopping(item.probe)) if item.unit == BRIDGE else item for item in found(ctx)]
+
+        monkeypatch.setattr(heal, "watched", killed_while_probing)
+        third = heal_pass(capsys)
+    assert f"heal: {BRIDGE} stopped during the pass: not restarted" in third.out
+    assert "restarting" not in third.out
+
+
+@pytest.mark.parametrize("state", ["activating", "deactivating"])
+def test_a_unit_systemd_is_restarting_does_not_hold_back_one_that_wants_it(tmp_path: Path, state: str) -> None:
+    """A crash-looping bridge goes through `deactivating` and `activating`: starting it early undoes no owner stop, so the hung
+    tunnel is still restarted."""
+    tunnel = watchdog.Watched("tunnel.service", lambda: "hung", wants=("bridge.service",))
+    restarted = _pass(tmp_path, [tunnel], [0.0], watchdog.Policy(threshold=1), states={"bridge.service": state})
+    assert restarted == ["tunnel.service"]

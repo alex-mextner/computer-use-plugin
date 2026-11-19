@@ -16,8 +16,11 @@ from pathlib import Path
 
 from agenttools_errors import AgentToolError, MissingDepError
 
+from computerlib.targets.chatgpt.watchdog import STOPPED_STATES, RestartResult
+
 # "unknown" is what `show` reports when the manager cannot be reached: that is not evidence the unit is off.
 _LIVE_STATES = frozenset({"active", "activating", "deactivating", "reloading", "refreshing", "unknown"})
+_RUNNING_STATES = frozenset({"active", "activating", "reloading", "refreshing"})
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
@@ -117,12 +120,23 @@ class Systemd:
     def restart(self, names: list[str]) -> None:
         self._ctl("restart", *names)
 
-    def try_restart(self, name: str) -> bool:
+    def try_restart(self, name: str) -> RestartResult:
         """Restart the unit only while it runs, and never in place of a stop that is under way: `try-restart` leaves a stopped
         unit stopped, and `--job-mode=fail` refuses instead of replacing a queued stop job (or the stop of a unit it Wants=).
-        So a `stop` or `end` racing a heal pass always wins. True when the unit was restarted and runs afterwards."""
+        So a `stop` or `end` racing a heal pass always wins, and reads as "stopped"; any other refusal (Access denied, a start
+        that did not come up) is "failed", with systemctl's message."""
         result = self._ctl("try-restart", "--job-mode=fail", name, check=False)
-        return result.returncode == 0 and self.state(name).active in _LIVE_STATES
+        state = self.state(name).active
+        # "unknown" only means `show` could not reach the manager: after an accepted restart that is no failure.
+        if result.returncode == 0 and state in _RUNNING_STATES | {"unknown"}:
+            return RestartResult("restarted")
+        # A stop queued behind an After= peer leaves the unit active until its turn; systemd refuses that transaction with
+        # "Transaction for <unit>/restart is destructive (...)". The phrase, not the word: unit names are the owner's choice.
+        if state in STOPPED_STATES or "is destructive (" in result.stderr:
+            return RestartResult("stopped")
+        # One line: systemctl's message spans two, and the journal would file the second apart from the warning prefix.
+        why = " ".join((result.stderr or result.stdout).split()) or f"exit {result.returncode}"
+        return RestartResult("failed", f"{why}; it is {state}")
 
     def disable_now(self, names: list[str]) -> None:
         """Stop and disable the units. Success is judged by the resulting state, never by the exit code alone: access must really
@@ -134,6 +148,15 @@ class Systemd:
     def remove(self, names: list[str]) -> None:
         for name in names:
             (self._unit_dir / name).unlink(missing_ok=True)
+            # `disable` cannot drop an enablement link once the unit file is gone, so a purge without a config would leave
+            # it behind. `render_unit` only enables into default.target.wants/; .requires/ covers links the user added by
+            # hand. Only the folders are globbed (a discovered prefix may hold glob syntax). The file in unit_dir is gone by
+            # now, so a link to it dangles; a link that still reaches a file (a same-named unit in another search path) is
+            # the user's and kept.
+            for folder in (*self._unit_dir.glob("*.wants"), *self._unit_dir.glob("*.requires")):
+                link = folder / name
+                if link.is_symlink() and not link.exists():
+                    link.unlink(missing_ok=True)
         self._ctl("daemon-reload", check=False)
         # A unit that exited non-zero on stop stays listed as "not-found failed" after its file is gone; forget it too.
         self._ctl("reset-failed", *names, check=False)
