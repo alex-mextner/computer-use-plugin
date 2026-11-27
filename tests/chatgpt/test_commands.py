@@ -201,6 +201,7 @@ def test_doctor_names_what_is_wrong_and_how_to_fix_it_without_changing_anything(
     result = run_cli(capsys, "doctor", "--local")
     assert result.code == 3
     assert "[FAIL] login password" in result.out and "chmod 600" in result.out
+    assert "PDF browser sandbox" not in result.out
     assert "[FAIL] computer-chatgpt-bridge.service active" in result.out
     assert "run `computer chatgpt start`" in result.out
     assert [c for c in machine.calls()[len(before) :] if not c.startswith("show ")] == []
@@ -340,3 +341,23 @@ def test_connect_needs_a_running_stack(
     result = run_cli(capsys, "connect", "--no-wait", "--no-open", "--no-copy")
     assert result.code == 3
     assert "computer chatgpt start" in result.err
+
+
+def test_doctor_prints_a_failed_optional_check_as_a_warning_and_exits_0(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from computerlib.cli import main
+    from computerlib.targets.chatgpt.commands import doctor
+
+    checks = [doctor.Check("needed", True, "fine"), doctor.Check("optional", False, "broken", "do this", required=False)]
+
+    def collect(_ctx: object, _local_only: bool) -> list[doctor.Check]:
+        return checks
+
+    monkeypatch.setattr(doctor, "load_context", lambda: None)
+    monkeypatch.setattr(doctor, "collect", collect)
+    assert main(["chatgpt", "doctor", "--local"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn] optional: broken\n       fix: do this" in out
+    checks.append(doctor.Check("needed too", False, "down", required=True))
+    assert main(["chatgpt", "doctor", "--local"]) == 3

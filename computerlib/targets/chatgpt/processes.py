@@ -4,7 +4,7 @@ WHAT: `processes()` returns the three public-mode processes (`stack.stack`) or t
 (`tunnel.tunnel_client`); `services()` names them without needing the launcher. Units, `run`, `doctor`, `start`, `status` and
 `end` all go through here.
 INVARIANTS: nothing here changes the mode; the mode comes from the settings only. Both modes run Desktop Commander through the
-shared core (`computer mcp serve`).
+shared core (`computer mcp serve --terminal-only`).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def processes(settings: Settings, layout: Layout, launcher: Launcher) -> list[Pr
                 layout.tunnel_client_binary,
                 settings.tunnel_id,
                 layout.tunnel_key_file,
-                (*launcher, "mcp", "serve"),
+                (*launcher, "mcp", "serve", "--terminal-only"),
                 settings.tunnel_health_port,
                 core_environment(),
             )

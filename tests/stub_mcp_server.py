@@ -7,6 +7,7 @@ call awaits `xdg-open "<form URL>"` through the shell as dist/tools/feedback.js 
 variant of dist/utils/usageTracker.js (verbatim) to every tool result, the way dist/server.js does with the `user_surveys` flag
 on: to the first content item when it is text, else as an item of its own. Any other tools/call answers `<name> done`, or
 `size` x's when the arguments give a `size`, with an image first when they ask for `image`.
+`--record-calls=<path>` records tools/call parameters for forwarding assertions.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import cast
 
 FEEDBACK_TOOL = "give_feedback_to_desktop_commander"
@@ -55,6 +57,13 @@ def _call(params: dict[str, object], survey: str | None) -> dict[str, object]:
     return {"content": content}
 
 
+def _record_call(args: list[str], params: object) -> None:
+    call_log = next((Path(arg.split("=", 1)[1]) for arg in args if arg.startswith("--record-calls=")), None)
+    if call_log is not None:
+        with call_log.open("a") as stream:
+            stream.write(json.dumps(params) + "\n")
+
+
 def main() -> None:
     args = sys.argv[1:]
     if "--crash" in args:
@@ -79,6 +88,7 @@ def main() -> None:
         elif method == "tools/list":
             result = {"tools": tools}
         elif method == "tools/call":
+            _record_call(args, message.get("params", {}))
             result = _call(message.get("params", {}), survey)
         else:
             continue

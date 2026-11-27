@@ -23,11 +23,12 @@ for raw in sys.stdin:
         result = {
             "protocolVersion": message["params"]["protocolVersion"],
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "stub", "version": "0"},
+            "serverInfo": {"name": "stub", "version": "0 --terminal-only" if "--terminal-only" in sys.argv[1:] else "0"},
         }
     elif method == "tools/list":
         tools = [
-            {"name": name, "description": "stub", "inputSchema": {"type": "object"}} for name in ("get_config", FEEDBACK_TOOL)
+            {"name": name, "description": "stub", "inputSchema": {"type": "object"}}
+            for name in ("start_process", "get_config", FEEDBACK_TOOL)
         ]
         result = {"tools": tools}
     elif method == "tools/call":

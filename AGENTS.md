@@ -2,7 +2,7 @@
 
 `computer` is a Python CLI that gives a chat client a shell and files on this PC through an MCP server (Desktop Commander).
 Targets: `mcp` (the client-neutral core: pinned Desktop Commander install and stdio launcher), `claude` (the Claude Desktop adapter)
-and `chatgpt` (the ChatGPT adapter: Cloudflare named tunnel -> shim -> mcp-auth-proxy -> `computer mcp serve`, systemd user units).
+and `chatgpt` (the ChatGPT adapter: Cloudflare named tunnel -> shim -> mcp-auth-proxy -> `computer mcp serve --terminal-only`, systemd user units).
 `computer <target> <command>`; each client target has ONE `install` command that sets everything up.
 
 Python-only (agent-tools "Python-only tools" rule): Desktop Commander (npm), mcp-auth-proxy (Go), cloudflared and tunnel-client are
@@ -18,7 +18,8 @@ computerlib/            import package; dist name `hyper-computer`, command `com
                         flock) and launch_spec; pins.py is the one pin table (Desktop Commander and the sha256-pinned release
                         binaries of the chatgpt target)
   childexit.py          exit_like: a wrapper (`chatgpt quiet`, the `mcp serve` relay) ends the way its child ended
-  dc_relay.py           the stdio relay `mcp serve` runs Desktop Commander behind: withholds its feedback tool and survey text
+  dc_relay.py           the stdio relay `mcp serve` runs Desktop Commander behind: withholds feedback/surveys; ChatGPT selects
+                        its terminal-only profile to withhold file tools, previews and UI-origin calls
   mcp_probe.py          real MCP handshake used by every adapter's status
   targets/<name>/       one package per target, exposes TARGET (self-registered, no registry to edit)
     <name>/commands/    one module per command exposing COMMAND (mcp: install, serve; claude: install, status, uninstall;

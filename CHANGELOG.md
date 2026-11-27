@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- ChatGPT's public and tunnel launchers select the new `computer mcp serve --terminal-only` profile. It exposes seven
+  terminal/process tools with their original schemas and safety annotations, withholds interactive file previews/resources,
+  and rejects stale hidden-tool or UI-origin calls without executing them (public mode may reject hidden tools at the proxy). File work uses bounded shell commands;
+  generic MCP and Claude retain their existing tool surface (#79).
+- Connection instructions use a bounded `start_process` smoke command. ChatGPT doctor no longer checks the PDF browser for
+  the unavailable `write_pdf` tool; the shared installer and Claude checks remain. Controlled upgrades regenerate units with
+  `init` (or `init --no-install` when dependency pins are unchanged), wait for active sessions, then restart the affected unit. Existing rendered cards may remain; mobile
+  client recovery has not been independently verified (#79).
+
 ## 0.4.7
 
 - `computer claude status` now fails an autostart entry whose Exec has an unterminated quote or ends in a backslash

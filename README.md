@@ -7,7 +7,7 @@ Two targets, each set up by ONE command:
 | Target | One command | Needs on this PC / account |
 |---|---|---|
 | **Claude Desktop** | `computer claude install` | Linux; the Claude Desktop app; Node.js 18+ and npm. For PDF output (write_pdf) on Ubuntu 23.10+: an AppArmor profile for Desktop Commander's Chrome (see [PDF output on Ubuntu 23.10+](#pdf-output-on-ubuntu-2310-apparmor)) |
-| **ChatGPT** | `computer chatgpt install --domain example.com` (one per machine: `<machine>-mcp.example.com`) | Linux (x86_64 or aarch64) with systemd `--user` (and `loginctl`); Node.js 18+ and npm; a Cloudflare account with your domain (zone) on it; a ChatGPT plan that lets you add custom MCP servers with write tools (see below). `cloudflared` and `mcp-auth-proxy` are downloaded automatically, pinned and sha256-verified. For PDF output (write_pdf) on Ubuntu 23.10+: an AppArmor profile for Desktop Commander's Chrome (see [PDF output on Ubuntu 23.10+](#pdf-output-on-ubuntu-2310-apparmor)). macOS is not supported (no systemd) |
+| **ChatGPT** | `computer chatgpt install --domain example.com` (one per machine: `<machine>-mcp.example.com`) | Linux (x86_64 or aarch64) with systemd `--user` (and `loginctl`); Node.js 18+ and npm; a Cloudflare account with your domain (zone) on it; a ChatGPT plan that lets you add custom MCP servers with write tools (see below). `cloudflared` and `mcp-auth-proxy` are downloaded automatically, pinned and sha256-verified. macOS is not supported (no systemd) |
 
 Both run the same pinned [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) from the shared core
 (`computer mcp`), never a floating `npx ...@latest`.
@@ -34,7 +34,7 @@ Needs Python 3.13. License: MIT.
 ```
 Claude Desktop --stdio--> computer mcp serve --> Desktop Commander (pinned)
 
-ChatGPT --HTTPS--> Cloudflare named tunnel --> shim (127.0.0.1:8767) --> mcp-auth-proxy (127.0.0.1:8766) --stdio--> computer mcp serve
+ChatGPT --HTTPS--> Cloudflare named tunnel --> shim (127.0.0.1:8767) --> mcp-auth-proxy (127.0.0.1:8766) --stdio--> computer mcp serve --terminal-only
 ```
 
 The core (`computer mcp`) owns one pinned Desktop Commander install; each client gets a thin adapter that only knows that client.
@@ -61,12 +61,20 @@ login in front of Desktop Commander, and a small shim that adds what ChatGPT's c
   with `xdg-open` on this computer and waits for it), and the survey request Desktop Commander adds to a tool result when its
   remote `user_surveys` flag is on is removed before the client sees it. Desktop Commander 0.3.2 has no setting that hides the
   tool, and its survey opt-out (`feedbackGiven` in its config) is one the model can set back, so `computer mcp serve` relays
-  Desktop Commander's stdio and leaves out exactly these; everything else passes through unchanged.
+  Desktop Commander's stdio and leaves out these in its default profile; other messages pass through unchanged.
   To give the Desktop Commander team feedback, open https://tally.so/r/mKqoKg yourself.
+- `computer mcp serve --terminal-only` exposes only `start_process`, `read_process_output`, `interact_with_process`,
+  `force_terminate`, `list_sessions`, `list_processes` and `kill_process`. The `--terminal-only` flag preserves their schemas and
+  safety annotations while withholding file tools, interactive preview metadata and UI resources. Calls from old file cards,
+  other hidden tools and calls marked `origin: ui` receive a local unavailable response without reaching Desktop Commander.
+  The relay response tells the caller to stop retrying and use bounded shell commands. ChatGPT public mode rejects hidden
+  tools earlier with the proxy’s `tool not found` error; UI-origin calls to listed tools reach the relay refusal. The original
+  `start_process` description is retained with terminal-profile guidance appended, so public mode receives it even though its
+  proxy omits initialization instructions. Ordinary command results are not truncated by this profile. Generic MCP and Claude keep the default profile unless the flag is explicitly passed.
 
 ### PDF output on Ubuntu 23.10+ (AppArmor)
 
-Desktop Commander's `write_pdf` renders with Chrome. It first uses the Chrome for Testing build in its own cache
+Desktop Commander's `write_pdf`, available in the default MCP and Claude profiles, renders with Chrome. It first uses the Chrome for Testing build in its own cache
 (`~/.claude-server-commander/puppeteer-cache/chrome/<build>/chrome-linux64/chrome`), then a packaged browser at
 `/usr/bin/google-chrome`, `/usr/bin/google-chrome-stable`, `/usr/bin/chromium`, `/usr/bin/chromium-browser` or
 `/snap/bin/chromium`, and with neither it downloads Chrome for Testing into that cache. Ubuntu 23.10+ sets
@@ -75,8 +83,9 @@ sandbox: write_pdf then fails with `No usable sandbox!`. Packaged browsers bring
 confinement); the downloaded build has none. The shell and file tools are not affected.
 
 `computer mcp install` (and so `computer claude install` and `computer chatgpt install`) prints a `warning:` when the restriction
-is on and no profile in `/etc/apparmor.d` covers the Chrome write_pdf will launch; `computer chatgpt doctor` shows it as a `[warn]`
-check and `computer claude status` as a `[warn] pdf:` line. When several profiles match that Chrome, the most specific one
+is on and no profile in `/etc/apparmor.d` covers the Chrome write_pdf will launch; `computer claude status` shows a `[warn] pdf:`
+line. This shared installer warning concerns PDF output in generic MCP or Claude; terminal-only ChatGPT does not need the
+AppArmor change and its doctor omits that check. When several profiles match that Chrome, the most specific one
 decides, as in the kernel: the one that matches more of the path before its first `*` (an exact path matches all of it), and a
 tie applies none. A profile on disk counts only once the kernel lists a profile of that name as loaded, in
 `/sys/kernel/security/apparmor/profiles` (readable by root) or `/sys/kernel/security/apparmor/policy/profiles` (readable by any
@@ -141,6 +150,17 @@ is still read.
 Design: `docs/superpowers/specs/2026-11-11-claude-desktop-support-design.md`.
 
 ## ChatGPT: `computer chatgpt`
+
+Both ChatGPT modes select the terminal-only profile automatically. File work uses shell commands through `start_process`, so
+routine reads do not create Desktop Commander's “View file” or “View lines” widgets. This also blocks a previously cached
+widget from performing another file read or launching an `origin: ui` command.
+
+For a controlled upgrade, use `computer chatgpt init` after updating the package: it updates pinned dependencies and regenerates
+units without restarting them. `init --no-install` is sufficient for 0.5.0 because its dependency pins are unchanged. Re-running `computer chatgpt install` instead restarts any unit whose file changed, ending active sessions. Wait for
+active command sessions to finish, then restart the bridge unit in public mode or the tunnel-client unit in tunnel mode to
+activate the profile. A restart ends those sessions. The configured shim, Cloudflare tunnel and OAuth state need no changes.
+Refresh the connector's tool metadata if the client still shows old tool names. Previously rendered cards may remain in the
+conversation; this server change does not remove them or prove recovery of an untested mobile client.
 
 ### One command
 
@@ -258,7 +278,7 @@ names ignoring case and would read the last).
 ### How it runs
 
 - **mcp-auth-proxy** does all authentication (OAuth 2.1, dynamic client registration, PKCE, a password login page); its stdio child
-  is the absolute `computer mcp serve` command, so Desktop Commander comes from the shared core.
+  is the absolute `computer mcp serve --terminal-only` command, so Desktop Commander comes from the shared core.
 - **shim** adds what ChatGPT's setup needs and the proxy lacks: a `WWW-Authenticate: Bearer resource_metadata=...` challenge on every
   401 outside the login pages, the path-suffix form of `/.well-known/oauth-protected-resource`, and an SSE comment on an idle event
   stream so Cloudflare releases the headers. It also writes the access log. It passes request bodies on as they arrive (never
@@ -361,7 +381,7 @@ The default is `public` and never changes by itself: no command, no fallback and
 
 ### Tunnel mode (experimental)
 
-OpenAI's `tunnel-client` v0.0.17 runs `computer mcp serve` over stdio and relays ChatGPT's requests through OpenAI's own tunnel service
+OpenAI's `tunnel-client` v0.0.17 runs `computer mcp serve --terminal-only` over stdio and relays ChatGPT's requests through OpenAI's own tunnel service
 ([Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)): no domain, no Cloudflare, no proxy or shim,
 nothing listening on the internet. One unit, `computer-chatgpt-tunnel-client.service`.
 

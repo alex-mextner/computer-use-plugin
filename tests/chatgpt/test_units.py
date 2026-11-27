@@ -45,7 +45,7 @@ def test_cloudflared_runs_from_this_targets_own_directory_never_from_dot_cloudfl
 def test_the_bridge_runs_the_shared_core_desktop_commander_and_never_npx() -> None:
     bridge = _units(Settings(hostname="h.example.test"))["computer-chatgpt-bridge.service"]
     exec_line = next(line for line in bridge.splitlines() if line.startswith("ExecStart="))
-    assert exec_line.endswith(" -- /opt/tools/computer mcp serve")
+    assert exec_line.endswith(" -- /opt/tools/computer mcp serve --terminal-only")
     assert "npx" not in bridge and "@latest" not in bridge
 
 
