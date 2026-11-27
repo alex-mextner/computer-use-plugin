@@ -540,6 +540,7 @@ def test_doctor_in_tunnel_mode_checks_the_tunnel_chain_and_nothing_public(
     } <= set(checks)
     assert not any("proxy" in name or "shim" in name or "public URL" in name or "challenge" in name for name in checks)
     assert checks["tunnel runtime key"]["ok"]
+    assert "PDF browser sandbox (write_pdf)" not in checks
 
 
 def test_doctor_names_the_failure_of_each_link_and_how_to_fix_it_without_changing_anything(

@@ -3,6 +3,7 @@
 INVARIANTS: nothing but MCP protocol is ever written to stdout (errors go to stderr via `guard`); needs no PATH, the node binary
 recorded by `computer mcp install` is started by absolute path; Desktop Commander always runs with `--no-onboarding`; every
 client reaches it through `dc_relay.relay`, which hides `give_feedback_to_desktop_commander` and DC's survey requests (#24).
+ChatGPT selects `--terminal-only` to withhold file tools and interactive UI resources, including stale widget calls (#79).
 """
 
 from __future__ import annotations
@@ -24,14 +25,23 @@ from computerlib.desktop_commander import launch_spec
 NO_ONBOARDING = "--no-onboarding"
 
 
-def run(_args: argparse.Namespace) -> int:
+def configure(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--terminal-only",
+        action="store_true",
+        help="expose terminal/process tools only, without file tools or interactive UI resources (used by ChatGPT)",
+    )
+
+
+def run(args: argparse.Namespace) -> int:
     spec = launch_spec()
     sys.stdout.flush()
-    return relay(spec.node, [str(spec.entry), NO_ONBOARDING])
+    return relay(spec.node, [str(spec.entry), NO_ONBOARDING], terminal_only=args.terminal_only)
 
 
 COMMAND = Command(
     name="serve",
     help="run the pinned Desktop Commander over stdio (what a client's config launches; stdout is MCP protocol only)",
     run=run,
+    configure=configure,
 )

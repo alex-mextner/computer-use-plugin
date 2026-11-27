@@ -15,7 +15,7 @@ Nothing here is automated by this repo; it is the checklist for the person (or a
 | Access log + client table | `~/.local/state/dc-mcp/access.log`, `clients.json` | `state_dir`; same file names and line format, so history carries over |
 | Password | `~/.config/dc-mcp-auth.env` (`PASSWORD=`, mode 600) | `password_file`, kept as is (no new password) |
 | Binaries | `mcp-auth-proxy v2.10.2`, `cloudflared 2026.10.7` in `~/.local/bin` (digests equal the pin table) | downloaded again into `~/.local/share/computer/chatgpt/bin` and verified; the old copies stay until `.files` drops them |
-| Desktop Commander | `npx -y @wonderwhy-er/desktop-commander@latest` on every start | the shared core: pinned 0.3.2 via `computer mcp install`, run by the bridge as `computer mcp serve`, no `npx` |
+| Desktop Commander | `npx -y @wonderwhy-er/desktop-commander@latest` on every start | the shared core: pinned 0.3.2 via `computer mcp install`, run by the bridge as `computer mcp serve --terminal-only`, no `npx` |
 | Node shim | `~/.local/share/dc-mcp-shim/shim.mjs` | replaced by `computer chatgpt shim` (same rules, same log format) |
 | `dc-mcp-quiet`, `dc-mcp-log` | shell scripts | `computer chatgpt quiet`, `computer chatgpt logs` |
 | Tool-log pruning timer | `dc-mcp-tool-log-prune.{service,timer}` | not part of this release; leave it in place until a pruner lands in agent-tools |

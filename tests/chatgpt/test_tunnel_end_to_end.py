@@ -50,7 +50,7 @@ class Daemon:
     def __init__(self, plane: ControlPlane, key_text: str, tmp: Path) -> None:
         self.port = free_port()
         # A command WITH arguments, like the real `computer mcp serve`: proves tunnel-client splits --mcp.command into argv.
-        mcp_command = (sys.executable, str(STUB))
+        mcp_command = (sys.executable, str(STUB), "--terminal-only")
         key_file = tmp / "tunnel-key"
         write_key(key_file, key_text)
         self.key_file = key_file
@@ -93,6 +93,8 @@ def test_discovery_and_a_tool_call_flow_through_the_real_daemon_and_the_state_ma
         plane.send("r3", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         listed = plane.response_to("r3")
         assert listed is not None and "get_config" in str(listed["resp_json"])
+        initialized = plane.response_to("r1")
+        assert initialized is not None and "0 --terminal-only" in str(initialized["resp_json"])
         assert _wait(lambda: read_state(daemon.port, baseline).state == "awaiting_tool_call")
         plane.send("r4", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_config", "arguments": {}}})
         called = plane.response_to("r4")

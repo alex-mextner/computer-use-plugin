@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from computerlib.jsonvalue import as_dict
 from computerlib.pins import binary_pin
 from computerlib.targets.chatgpt.install import sha256_file
 from computerlib.targets.chatgpt.password import ensure_password, read_password
@@ -153,16 +154,22 @@ def test_the_full_chatgpt_flow_reaches_a_tool_and_is_logged_with_a_verified_labe
     hello = {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "0"}}
     init = driver.rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": hello})
     assert init.status == 200 and init.json()["result"]
+    # The pinned proxy does not forward initialize.instructions; the tool description carries the guidance.
+    assert "instructions" not in as_dict(init.json()["result"])
     assert driver.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}).status == 202
     listed = driver.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert "get_config" in listed.body.decode()
+    assert "start_process" in listed.body.decode() and "get_config" not in listed.body.decode()
+    assert "terminal/process tools only" in listed.body.decode()
     # The trouble words make a copy of this request a candidate for the journal if the message-copy rule ever slips.
-    call = {"name": "get_config", "arguments": {"secret_argument": "SECRET-ARG error timeout exited"}}
+    call = {"name": "start_process", "arguments": {"secret_argument": "SECRET-ARG error timeout exited"}}
     called = driver.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": call})
-    assert "stub-config for get_config" in called.body.decode()
+    assert "stub-config for start_process" in called.body.decode()
+    ui_call = {"name": "start_process", "arguments": {"command": "must not run", "origin": "ui"}}
+    denied = driver.rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": ui_call})
+    assert "origin='llm'" in denied.body.decode() and "stub-config" not in denied.body.decode()
     lines = stack.log()
     text = "\n".join(lines)
-    assert "client=openai-mcp rpc=tools/call tool=get_config" in text
+    assert "client=openai-mcp rpc=tools/call tool=start_process" in text
     assert "client=openai-mcp" in next(line for line in lines if "/.idp/token" in line)
     for secret in ("SECRET-ARG", driver.token, stack.password(), "e2e-callback"):
         assert secret not in text
@@ -180,12 +187,12 @@ def test_chatgpt_is_offered_no_feedback_tool_and_no_survey(stack: Stack) -> None
     listed = driver.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).body.decode()
     feedback: dict[str, object] = {"name": "give_feedback_to_desktop_commander", "arguments": {}}
     withheld = driver.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": feedback}).body.decode()
-    called = driver.rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "get_config"}}).body.decode()
-    assert "get_config" in listed and "give_feedback" not in listed
+    called = driver.rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "start_process"}}).body.decode()
+    assert "start_process" in listed and "give_feedback" not in listed and "get_config" not in listed
     # mcp-auth-proxy refuses a tool its tools/list did not show before serve sees the call; serve's own answer covers the rest.
     assert "tool not found" in withheld
     assert not (Path.home() / "feedback-tool-ran").exists(), "the feedback call reached Desktop Commander"
-    assert "stub-config for get_config" in called and "SYSTEM INSTRUCTION" not in called and "feedback" not in called
+    assert "stub-config for start_process" in called and "SYSTEM INSTRUCTION" not in called and "feedback" not in called
 
 
 def test_a_token_of_a_foreign_client_and_a_forged_user_agent_are_both_unverified(stack: Stack) -> None:

@@ -1,8 +1,8 @@
 """Whether the Chrome that Desktop Commander's write_pdf launches can start its sandbox under AppArmor's userns restriction.
 
 HOW IT IS REACHED: `desktop_commander.install()` appends `problem()` to its report as a warning (so `computer mcp install` and
-every adapter's install show it); `computer chatgpt doctor` and `computer claude status` list it as a warning that does not fail
-them, because the shell and file tools work either way.
+every adapter's shared install shows it); `computer claude status` lists it as a warning that does not fail status.
+The warning concerns generic MCP and Claude PDF output; terminal-only ChatGPT omits the doctor check.
 WHY: Ubuntu 23.10+ sets `kernel.apparmor_restrict_unprivileged_userns=1`: a program that no AppArmor profile grants `userns,`
 cannot create the user namespace Chrome's sandbox needs. The Chrome for Testing build that Desktop Commander downloads into its
 own cache has no profile and no setuid `chrome-sandbox`, so write_pdf fails with "No usable sandbox!" (#14). Lifting the

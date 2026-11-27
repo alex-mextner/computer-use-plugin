@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 SETTINGS_PAGE = "https://chatgpt.com/plugins"
 PERSONAL_PAGE = "https://chatgpt.com/plugins?view=personal"
+SMOKE_PROMPT = 'ask it to run `start_process` with `command="printf RDC_CONNECTION_OK"`.'
 # OpenAI Help Center "Connecting custom MCP servers in ChatGPT" (checked 2026-11-17): full MCP (write tools, which Desktop
 # Commander needs) is for Business and Enterprise/Edu on ChatGPT web; Pro gets read/fetch only. Keep README's dependency table in
 # step.
@@ -87,7 +88,7 @@ def tunnel_steps() -> list[str]:
         f"Open {SETTINGS_PAGE} in a signed-in ChatGPT web session (web only, not mobile).",
         'Click "+" (plus) -> "Add custom MCP server".',
         "Fill the fields below, tick the risk checkbox, click Create as a plugin.",
-        f"Install the plugin ({PERSONAL_PAGE}), open a new chat, type @ and pick it, and ask it to run `get_config`.",
+        f"Install the plugin ({PERSONAL_PAGE}), open a new chat, type @ and pick it, and {SMOKE_PROMPT}",
     ]
 
 

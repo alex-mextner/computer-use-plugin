@@ -1,6 +1,5 @@
 """write_pdf's Chrome under AppArmor's user-namespace restriction (#14): detection against a scratch /proc file, a scratch
-/etc/apparmor.d and a scratch HOME, and the warning in `computer mcp install`, `computer chatgpt doctor` and
-`computer claude status`."""
+/etc/apparmor.d and a scratch HOME, and the warning in `computer mcp install` and `computer claude status`."""
 
 from __future__ import annotations
 
@@ -11,7 +10,6 @@ import pytest
 
 from computerlib import pdf_sandbox
 from computerlib.cli import main
-from computerlib.targets.chatgpt.commands import doctor
 from tests.fakes import fake_node, fake_npm
 
 README = Path(__file__).resolve().parent.parent / "README.md"
@@ -377,28 +375,3 @@ def test_mcp_install_warns_with_the_fix(host: Path, monkeypatch: pytest.MonkeyPa
     # Also when the install is already there: the restriction and the profiles are not part of the install.
     assert main(["mcp", "install"]) == 0
     assert "already installed" in (again := capsys.readouterr().out) and "warning: write_pdf cannot start Chrome" in again
-
-
-def test_doctor_warns_without_failing(host: Path) -> None:
-    check = doctor._pdf_sandbox()  # pyright: ignore[reportPrivateUsage]
-    assert (check.name, check.ok, check.required) == ("PDF browser sandbox (write_pdf)", False, False)
-    assert "sysctl -w" in check.fix
-    pdf_sandbox.RESTRICTION_FILE.write_text("0\n")
-    assert doctor._pdf_sandbox().ok  # pyright: ignore[reportPrivateUsage]
-
-
-def test_doctor_prints_a_failed_optional_check_as_a_warning_and_exits_0(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    checks = [doctor.Check("needed", True, "fine"), doctor.Check("optional", False, "broken", "do this", required=False)]
-
-    def collect(_ctx: object, _local_only: bool) -> list[doctor.Check]:
-        return checks
-
-    monkeypatch.setattr(doctor, "load_context", lambda: None)
-    monkeypatch.setattr(doctor, "collect", collect)
-    assert main(["chatgpt", "doctor", "--local"]) == 0
-    out = capsys.readouterr().out
-    assert "[warn] optional: broken\n       fix: do this" in out
-    checks.append(doctor.Check("needed too", False, "down", required=True))
-    assert main(["chatgpt", "doctor", "--local"]) == 3

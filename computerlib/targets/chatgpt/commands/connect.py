@@ -223,7 +223,7 @@ def run_tunnel(ctx: Context, args: argparse.Namespace) -> int:
         print(
             "Connected: a tool call came through your tunnel. tunnel-client cannot tell which OpenAI surface sent it, "
             "so this does not by "
-            "itself prove it was ChatGPT; run the smoke prompt in a chat (ask it to run `get_config`) to see it end to end."
+            f"itself prove it was ChatGPT; to check it in a chat, {dialog.SMOKE_PROMPT}"
         )
         return 0
     print("Not connected yet. No tool call has come through the tunnel.")
@@ -271,10 +271,7 @@ def run(args: argparse.Namespace) -> int:
         print("\nstopped waiting", file=sys.stderr)
         return 130
     if checklist.connected:
-        print(
-            "Connected: ChatGPT ran a tool on this PC. "
-            "Smoke prompt for later: ask it to run `get_config` and report the platform."
-        )
+        print(f"Connected: ChatGPT ran a tool on this PC. Smoke prompt for later: {dialog.SMOKE_PROMPT}")
         return 0
     report_timeout(checklist)
     raise DriftError(

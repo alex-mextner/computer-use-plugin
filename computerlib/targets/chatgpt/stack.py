@@ -2,7 +2,8 @@
 
 WHAT: three processes, each described once here and used both by the systemd units (`units.py`) and by `computer chatgpt run`
 (foreground, no systemd, for development and tests):
-  bridge  mcp-auth-proxy (OAuth 2.1 login) whose stdio backend is `computer mcp serve` (the shared, pinned Desktop Commander),
+  bridge  mcp-auth-proxy (OAuth 2.1 login) whose stdio backend is `computer mcp serve --terminal-only`
+          (the shared, pinned Desktop Commander),
           stdout and stderr filtered by `quiet`
   shim    the rules of shim/ in front of the bridge (challenge header, path rewrite, access log)
   tunnel  cloudflared named tunnel to the shim (only when a tunnel name is configured), with its own config/credentials dir
@@ -81,6 +82,7 @@ def bridge(settings: Settings, layout: Layout, launcher: Launcher) -> Process:
             *launcher,
             "mcp",
             "serve",
+            "--terminal-only",
         ),
         env=core_environment(),
         env_files=(layout.password_file,),

@@ -8,10 +8,14 @@ where that browser stays in the foreground the call never returns, as the welcom
 config key that hides the tool (dist/server.js `shouldIncludeTool` drops it only for the client named `desktop-commander-app`,
 which is not ours to claim) and its survey opt-out is a `feedbackGiven` value in its config.json that the model can set back
 with `set_config_value`, so the one place every client passes through, this relay, withholds both (#24).
-INVARIANTS: stdout carries only DC's own messages, in DC's order, plus the local answers below; a DC line that is not the
-tools/list answer or a result carrying the survey goes through byte for byte, and one that must be cleaned but cannot be written
-back is replaced by an error, never passed on uncleaned. Every client line is read as DC's Node reads it before it is
-forwarded: a feedback call is answered here, a line Python cannot read is answered with a parse error, and one nested deeper
+ChatGPT selects the terminal-only profile (#79): only terminal/process tools are advertised, UI attachment metadata/resources
+are withheld, and stale file or UI-origin calls are answered locally without running them. Generic MCP and Claude retain the
+default profile.
+INVARIANTS: stdout carries DC's messages in DC's order, plus the local answers below. An unchanged message passes through byte
+for byte; an answer that must be cleaned but cannot be encoded is replaced by an error, never passed on uncleaned.
+The terminal profile consumes resource notifications and non-message child output.
+Every client line is read as DC's Node reads it before forwarding: a feedback call is answered here, an unreadable line gets
+a parse error, and one nested deeper
 than _MAX_DEPTH with an invalid-request error, rather than handed to a parser that might run it. DC gets the signals this
 process acts on (one it was started ignoring stays ignored and is not passed on), dies with it, and ends it the way DC ended
 (`childexit.exit_like`); stderr is DC's, untouched.
@@ -35,6 +39,34 @@ from typing import cast
 from computerlib.childexit import exit_like
 from computerlib.jsonvalue import as_dict, is_object
 
+# The ChatGPT adapter is intentionally terminal-only. An allowlist also withholds future widget tools by default.
+TERMINAL_TOOLS = frozenset(
+    {
+        "start_process",
+        "read_process_output",
+        "interact_with_process",
+        "force_terminate",
+        "list_sessions",
+        "list_processes",
+        "kill_process",
+    }
+)
+TERMINAL_INSTRUCTIONS = (
+    "This connection provides terminal/process tools only. Use start_process with bounded shell commands for file work; "
+    "use interact_with_process and read_process_output to continue existing processes. Keep each output limited to the "
+    "relevant lines or a concise summary. Direct file tools and interactive UI previews are unavailable. "
+    "Do not retry unavailable file/UI calls. For command calls, use origin='llm' or omit origin. "
+    "Tool schemas, safety annotations and configured command restrictions still apply."
+)
+_TERMINAL_UNAVAILABLE = (
+    "This connection provides terminal/process tools only; direct file tools and UI-origin calls are unavailable. "
+    "Do not retry this file/UI call. Use start_process with bounded shell commands instead."
+)
+_UI_UNAVAILABLE = (
+    "UI-origin terminal calls are unavailable. Do not retry this UI request. "
+    "For command work, call the terminal tool with origin='llm' or omit origin; use bounded shell commands."
+)
+_UI_META_KEYS = frozenset({"ui", "ui/resourceUri", "openai/outputTemplate", "openai/widgetAccessible"})
 FEEDBACK_TOOL = "give_feedback_to_desktop_commander"
 _FEEDBACK_TOOL_BYTES = FEEDBACK_TOOL.encode()
 _SURVEY_MARKER = b"[SYSTEM INSTRUCTION]: "
@@ -148,11 +180,11 @@ def _nests_deeper_than(line: bytes | bytearray, limit: int) -> bool:
     return False
 
 
-def local_answer(line: bytes | bytearray) -> bytes | None:
+def local_answer(line: bytes | bytearray, *, terminal_only: bool = False) -> bytes | None:
     """What the client gets instead of DC seeing `line`, or None to forward it: the answer to a feedback call (nothing for one
-    sent as a notification), or an error for a line that cannot be shown to be no feedback call: one Python cannot read, or
-    one nested deeper than _MAX_DEPTH. Every line is parsed, not searched for the tool's name: a JSON string may spell it with
-    escapes."""
+    sent as a notification), terminal-only profile calls, or an error for a line that cannot be safely forwarded: one Python
+    cannot read, or one nested deeper than _MAX_DEPTH. Every line is parsed, not searched for the tool's name: JSON strings may
+    spell it with escapes."""
     if not line.strip():
         return None
     # Only a line with more brackets than the cap can nest past it; the walks are skipped for every other line.
@@ -166,12 +198,82 @@ def local_answer(line: bytes | bytearray) -> bytes | None:
     message = as_dict(loaded)
     if may_nest_too_deep and _deeper_than(loaded, _MAX_DEPTH):
         return _error(_reply_id(message), -32600, _TOO_DEEP)
+    if terminal_only:
+        if not is_object(loaded):
+            return _error(None, -32600, "Invalid request: the terminal-only profile requires a JSON object")
+        answer = _terminal_answer(message)
+        if answer is not None:
+            return answer
     if message.get("method") != "tools/call" or as_dict(message.get("params")).get("name") != FEEDBACK_TOOL:
         return None
     if "id" not in message:
         return b""
     result: dict[str, object] = {"content": [{"type": "text", "text": WITHHELD_ANSWER}], "isError": True}
     return _encode({"jsonrpc": "2.0", "id": _reply_id(message), "result": result})
+
+
+def _terminal_answer(message: dict[str, object]) -> bytes | None:
+    """Old cached widgets are refused here, even before a client refreshes its tool catalog."""
+    method = message.get("method")
+    if isinstance(method, str) and method.startswith("resources/"):
+        if "id" not in message:
+            return b""
+        if method in ("resources/list", "resources/templates/list"):
+            key = "resources" if method == "resources/list" else "resourceTemplates"
+            return _encode({"jsonrpc": "2.0", "id": _reply_id(message), "result": {key: []}})
+        return _error(_reply_id(message), -32601, "Resources are unavailable in the terminal-only profile")
+    if method != "tools/call":
+        return None
+    params = as_dict(message.get("params"))
+    name = params.get("name")
+    if isinstance(name, str) and name in TERMINAL_TOOLS and as_dict(params.get("arguments")).get("origin") != "ui":
+        return None
+    if "id" not in message:
+        return b""
+    text = _UI_UNAVAILABLE if isinstance(name, str) and name in TERMINAL_TOOLS else _TERMINAL_UNAVAILABLE
+    result: dict[str, object] = {"content": [{"type": "text", "text": text}], "isError": True}
+    return _encode({"jsonrpc": "2.0", "id": _reply_id(message), "result": result})
+
+
+def _without_ui_meta(value: dict[str, object]) -> dict[str, object]:
+    meta = as_dict(value.get("_meta"))
+    if not any(key in meta for key in _UI_META_KEYS):
+        return value
+    kept = {key: item for key, item in meta.items() if key not in _UI_META_KEYS}
+    result = {key: item for key, item in value.items() if key != "_meta"}
+    if kept:
+        result["_meta"] = kept
+    return result
+
+
+def _terminal_tools(tools: list[object]) -> list[object]:
+    kept: list[object] = []
+    for item in tools:
+        tool = as_dict(item)
+        name = tool.get("name")
+        if isinstance(name, str) and name in TERMINAL_TOOLS:
+            cleaned = _without_ui_meta(tool)
+            if name == "start_process":
+                # The pinned public proxy drops initialize.instructions but forwards tool descriptions.
+                original = cleaned.get("description")
+                description = f"{original}\n\n{TERMINAL_INSTRUCTIONS}" if isinstance(original, str) else TERMINAL_INSTRUCTIONS
+                cleaned = {**cleaned, "description": description}
+            kept.append(cleaned)
+    return kept
+
+
+def _terminal_result(result: dict[str, object]) -> dict[str, object]:
+    """Keep original command contracts; remove the preview attachment points, not safety annotations."""
+    replaced = _without_ui_meta(result)
+    tools = replaced.get("tools")
+    if isinstance(tools, list):
+        kept = _terminal_tools(cast("list[object]", tools))
+        if kept != tools:
+            replaced = {**replaced, "tools": kept}
+    if "serverInfo" in replaced and is_object(replaced.get("capabilities")):
+        capabilities = {key: item for key, item in as_dict(replaced["capabilities"]).items() if key != "resources"}
+        replaced = {**replaced, "capabilities": capabilities, "instructions": TERMINAL_INSTRUCTIONS}
+    return replaced
 
 
 def _without_feedback_tool(result: dict[str, object]) -> dict[str, object] | None:
@@ -204,30 +306,38 @@ def _without_survey_content(result: dict[str, object]) -> dict[str, object] | No
     return {**result, "content": kept} if changed else None
 
 
-def filtered_server_line(line: bytes) -> bytes:
-    """`line` from DC as the client may see it: no feedback tool in a tools/list answer, no survey in a tool result. The byte
-    search before parsing is safe on this side: DC writes JSON.stringify output, which never escapes these ASCII characters."""
-    if _FEEDBACK_TOOL_BYTES not in line and _SURVEY_MARKER not in line:
-        return line
+def _filtered_reply(message: dict[str, object], result: dict[str, object]) -> bytes:
     try:
-        loaded = _load(line)
-    except _Unreadable:
-        return line
-    if not is_object(loaded):
-        return line
-    message = as_dict(loaded)
-    if "method" in message or not is_object(message.get("result")):
-        return line
-    result = as_dict(message["result"])
-    replaced = _without_feedback_tool(result) or _without_survey_content(result)
-    if replaced is None:
-        return line
-    try:
-        return _encode({**message, "result": replaced})
+        return _encode({**message, "result": result})
     except RecursionError:
         # Too deep for this interpreter's json to write back: the client gets an error for that answer, never the survey or
         # the tool.
         return _error(_reply_id(message), -32603, "Internal error: the answer is nested too deep to pass on")
+
+
+def filtered_server_line(line: bytes, *, terminal_only: bool = False) -> bytes:
+    """Filter DC's feedback and, when selected, file-widget exposure. The default profile's byte search is safe: DC writes
+    JSON.stringify output, which never escapes these ASCII characters. The terminal profile inspects every message."""
+    if not terminal_only and _FEEDBACK_TOOL_BYTES not in line and _SURVEY_MARKER not in line:
+        return line
+    try:
+        loaded = _load(line)
+    except _Unreadable:
+        return b"" if terminal_only else line
+    if not is_object(loaded):
+        return b"" if terminal_only else line
+    message = as_dict(loaded)
+    method = message.get("method")
+    if terminal_only and isinstance(method, str) and method.startswith("notifications/resources/"):
+        return b""
+    if "method" in message or not is_object(message.get("result")):
+        return line
+    result = as_dict(message["result"])
+    replaced = _terminal_result(result) if terminal_only else result
+    replaced = _without_feedback_tool(replaced) or _without_survey_content(replaced) or replaced
+    if replaced is result:
+        return line
+    return _filtered_reply(message, replaced)
 
 
 def _write_all(fd: int, data: bytes | bytearray) -> None:
@@ -249,12 +359,12 @@ class _Output:
             _write_all(self._fd, data)
 
 
-def _pump_client(source: int, server: int, out: _Output) -> None:
+def _pump_client(source: int, server: int, out: _Output, terminal_only: bool) -> None:
     """Client lines to DC, minus the ones answered here. Reads the raw fd: this thread is still blocked in that read when the
     relay returns, and a buffered stdin's lock held at interpreter exit aborts the process."""
 
     def deliver(line: bytearray) -> None:
-        answer = local_answer(line)
+        answer = local_answer(line, terminal_only=terminal_only)
         if answer is None:
             _write_all(server, line)
         else:
@@ -301,7 +411,7 @@ class _Stop(BaseException):
     (the interrupted write would otherwise be retried and never return)."""
 
 
-def relay(node: Path, args: Sequence[str]) -> int:
+def relay(node: Path, args: Sequence[str], *, terminal_only: bool = False) -> int:
     """Run `node args` as DC with the relay in front of it on this process's stdio; returns DC's exit status."""
     to_server, server_stdin = os.pipe()
     try:
@@ -334,12 +444,12 @@ def relay(node: Path, args: Sequence[str]) -> int:
             signal.signal(signum, forward)
     out = _Output(sys.stdout.fileno())
     # A daemon: a client that keeps stdin open after DC exits must not keep this process alive.
-    threading.Thread(target=_pump_client, args=(sys.stdin.fileno(), server_stdin, out), daemon=True).start()
+    threading.Thread(target=_pump_client, args=(sys.stdin.fileno(), server_stdin, out, terminal_only), daemon=True).start()
     relaying = True
     try:
         try:
             for line in iter(child.stdout.readline, b""):
-                out.write(filtered_server_line(line))
+                out.write(filtered_server_line(line, terminal_only=terminal_only))
         except OSError:
             child.terminate()  # the client closed our stdout: nobody is left to answer
         relaying = False
